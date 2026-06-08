@@ -34,6 +34,10 @@
 #define TEMP_MAX_DEF   110.0f
 #define PID_DT_MS      100
 #define INTEGRAL_MAX   400.0f
+// Feed-forward rampy: moc PWM na kazdy 1 C/min zadanego rate.
+// Wieksza wartosc = mocniejsze wyprzedzanie. 0 = wylaczone (czysty PID).
+// Przy probelach z trzymaniem rate zwieksz; przy przeregulowaniu zmniejsz.
+#define FF_GAIN        3.0f
 
 #define SP_MIN    -15.0f
 #define SP_MAX     100.0f
@@ -153,7 +157,7 @@ String cSt="";
 
 unsigned long tP=0,tD=0,tR=0;
 #define DT_D 200
-#define DT_R 1000
+#define DT_R 200
 
 bool inM=false;int mP=0;
 #define MI 8
@@ -228,7 +232,15 @@ float rdT(){
   lT=s/TF+calOffset;return lT;
 }
 
-void updRamp(){float d=spT-spA;if(abs(d)<0.1f) return;if(d>0) spA=min(spA+rU/60.0f,spT);else spA=max(spA-rD/60.0f,spT);}
+void updRamp(){
+  // Rampa: krok co DT_R ms. Przy DT_R=200ms jest 5 krokow/s = 300 krokow/min.
+  // Krok = rate/300 daje dokladnie rate stopni na minute, ale plynnie (5x gestsze).
+  float stepU=rU/300.0f, stepD=rD/300.0f;
+  float d=spT-spA;
+  if(abs(d)<0.02f){spA=spT;return;}
+  if(d>0) spA=min(spA+stepU,spT);
+  else    spA=max(spA-stepD,spT);
+}
 
 void updSlope(float temp){
   unsigned long now=millis();
@@ -331,6 +343,16 @@ int compPID(float temp){
 
   // Wyjscie PID
   float out=Kp*err+Ki*ig+Kd*dv;
+
+  // ── FEED-FORWARD RAMPY ──────────────────────────────
+  // Podczas rampy dodaj wyprzedzajaca moc ~ do zadanego rate.
+  // Dzieki temu temperatura "goni" setpoint bez opoznienia
+  // zamiast czekac az narosnie blad. Wspolczynnik dobrany empirycznie.
+  if(!atT){
+    float rate=htg?rU:-rD;            // zadany rate [C/min]
+    float ff=rate*FF_GAIN;            // moc wyprzedzajaca
+    out+=ff;
+  }
 
   // OCHRONA STARTU: lagodne ograniczenie tylko w 1szej sekundzie
   // Po starcie pelna moc jest dozwolona
