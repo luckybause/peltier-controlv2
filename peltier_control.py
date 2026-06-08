@@ -233,6 +233,21 @@ class PeltierControl:
         self.last_state = 'MAN'
         self.cur_state = 'MAN'
 
+        # Sledzenie dotarcia do setpointu (statystyki)
+        self.reach_start_t = None    # czas startu dojscia (s)
+        self.reach_start_temp = None # temp na starcie
+        self.reach_target = None     # docelowa temp
+        self.reach_done = False      # czy osiagnieto
+        self.reach_time = None       # ile trwalo dotarcie [s]
+        self.reach_avg_rate = None   # srednia rampa [C/min]
+        self.last_setpoint_target = None
+
+        # Polaryzacja i zakres kalibracji (z urzadzenia)
+        self.dev_pol_swapped = False
+        self.dev_pol_set = False
+        self.dev_cal_min = 50.0
+        self.dev_cal_max = 100.0
+
         # CSV cyklu
         self.log_dir = Path.home() / "PeltierLogi"
         self.log_dir.mkdir(exist_ok=True)
@@ -438,6 +453,19 @@ class PeltierControl:
                 self.dev_cal = (d['CAL'] == '1')
             if 'STATE' in d:
                 self.cur_state = d['STATE']
+            # Polaryzacja
+            if 'POL' in d:
+                self.dev_pol_swapped = (d['POL'] == '1')
+            if 'POLSET' in d:
+                self.dev_pol_set = (d['POLSET'] == '1')
+            # Zakres kalibracji
+            if 'CALMIN' in d:
+                self.dev_cal_min = float(d['CALMIN'])
+            if 'CALMAX' in d:
+                self.dev_cal_max = float(d['CALMAX'])
+            # Zaktualizuj wskaznik polaryzacji w UI jesli istnieje
+            if hasattr(self, '_update_pol_indicator'):
+                self._update_pol_indicator()
         except Exception as e:
             print(f"apply_cfg err: {e}")
 
@@ -652,7 +680,7 @@ class PeltierControl:
         self.s_dot = tk.Canvas(sf, width=14, height=14, bg=C['bg2'], highlightthickness=0)
         self.s_dot.pack(side='left', padx=(0, 8))
         self._draw_dot(C['dim2'], glow=False)
-        self.s_lbl = tk.Label(sf, text="ROZLACZONY", bg=C['bg2'], fg=C['dim'],
+        self.s_lbl = tk.Label(sf, text="DISCONNECTED", bg=C['bg2'], fg=C['dim'],
                               font=(FONT, fsz(10)))
         self.s_lbl.pack(side='left')
 
@@ -684,10 +712,10 @@ class PeltierControl:
         self.connected = connected
         if connected:
             self._draw_dot(C['green'])
-            self.s_lbl.config(text=msg or "POLACZONY", fg=C['green'])
+            self.s_lbl.config(text=msg or "CONNECTED", fg=C['green'])
         else:
             self._draw_dot(C['dim2'], glow=False)
-            self.s_lbl.config(text=msg or "ROZLACZONY", fg=C['dim'])
+            self.s_lbl.config(text=msg or "DISCONNECTED", fg=C['dim'])
         # Aktywuj/dezaktywuj panel
         if hasattr(self, 'btn_start'):
             self._set_panel_enabled(connected)
@@ -763,8 +791,13 @@ class PeltierControl:
 
         hd = tk.Frame(wrap, bg=C['panel'])
         hd.pack(fill='x', padx=14, pady=(10, 4))
-        tk.Label(hd, text="PRZEBIEG W CZASIE", bg=C['panel'], fg=C['dim'],
+        tk.Label(hd, text="LIVE CHART", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(side='left')
+
+        # Statystyki dotarcia do setpointu (prawa strona naglowka)
+        self.reach_lbl = tk.Label(hd, text="", bg=C['panel'], fg=C['green'],
+                                  font=(FONT, fsz(9), 'bold'))
+        self.reach_lbl.pack(side='right')
 
         self.fig = Figure(figsize=(9, 6), facecolor=C['panel'], dpi=110)
         gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.2,
@@ -812,21 +845,21 @@ class PeltierControl:
         inner = tk.Frame(inner, bg=C['bg2'])
         inner.pack(fill='both', expand=True, padx=16, pady=14)
 
-        tk.Label(inner, text="STEROWANIE", bg=C['bg2'], fg=C['text'],
+        tk.Label(inner, text="CONTROL", bg=C['bg2'], fg=C['text'],
                  font=(FONT, fsz(13), 'bold')).pack(anchor='w')
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(8, 12))
 
         # Suwaki nastaw
-        self.sl_sp = SliderField(inner, "TEMP. DOCELOWA", -15, 100, 25.0,
+        self.sl_sp = SliderField(inner, "TARGET", -15, 100, 25.0,
                                  C['orange'], "°C", 1,
                                  on_change=lambda v: self.send(f"SP:{v:.1f}"))
-        self.sl_ru = SliderField(inner, "RAMPA GRZANIA", 0.5, 40, 2.0,
+        self.sl_ru = SliderField(inner, "HEAT RATE", 0.5, 40, 2.0,
                                  C['yellow'], "°C/min", 1,
                                  on_change=lambda v: self.send(f"RU:{v:.1f}"))
-        self.sl_rd = SliderField(inner, "RAMPA CHLODZENIA", 0.5, 40, 2.0,
+        self.sl_rd = SliderField(inner, "COOL RATE", 0.5, 40, 2.0,
                                  C['cyan'], "°C/min", 1,
                                  on_change=lambda v: self.send(f"RD:{v:.1f}"))
-        self.sl_tmax = SliderField(inner, "MAX TEMP (ZABEZP.)", 50, 115, 80,
+        self.sl_tmax = SliderField(inner, "MAX TEMP", 50, 115, 80,
                                    C['red'], "°C", 0,
                                    on_change=lambda v: self.send(f"TMAX:{v:.0f}"))
 
@@ -843,7 +876,7 @@ class PeltierControl:
         # Auto-kalibracja (pelna - wszystkie profile temp x rampa)
         cal_row = tk.Frame(inner, bg=C['bg2'])
         cal_row.pack(fill='x', pady=(0, 8))
-        self.btn_autocal = mk_btn(cal_row, "⚙ AUTO-KALIBRACJA",
+        self.btn_autocal = mk_btn(cal_row, "⚙ AUTO-CAL",
                                   self.do_autocal, C['purple'], fg='#fff')
         self.btn_autocal.pack(fill='x')
         # Status kalibracji - klikalny, otwiera okno postepu
@@ -862,46 +895,54 @@ class PeltierControl:
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
 
         # Kalibracja
-        self.sl_off = SliderField(inner, "OFFSET KALIBRACJI", -20, 20, 0.0,
+        self.sl_off = SliderField(inner, "CAL OFFSET", -20, 20, 0.0,
                                   C['purple'], "°C", 1,
                                   on_change=lambda v: self.send(f"OFFSET:{v:.1f}"))
 
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
 
-        # AUTO badge
+        # AUTO badge + wskaznik polaryzacji
         auto = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
                         highlightbackground=C['green'])
-        auto.pack(fill='x', pady=(0, 12))
-        tk.Label(auto, text="● AUTO: kierunek wg setpointu", bg=C['bg2'],
+        auto.pack(fill='x', pady=(0, 8))
+        tk.Label(auto, text="● AUTO: direction by setpoint", bg=C['bg2'],
                  fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
+
+        # Polaryzacja - wskaznik + re-detekcja
+        pol_frame = tk.Frame(inner, bg=C['bg2'])
+        pol_frame.pack(fill='x', pady=(0, 10))
+        self.pol_indicator = tk.Label(pol_frame, text="POL: ?", bg=C['bg2'],
+                                      fg=C['dim2'], font=(FONT, fsz(9)))
+        self.pol_indicator.pack(side='left')
+        mk_btn_outline(pol_frame, "RE-DETECT", self.do_repol, C['dim']).pack(side='right')
 
         # (START / STOP / E-STOP przeniesione na gorny pasek - obok kafelkow)
 
         # Profile + Flash kompakt
         bf2 = tk.Frame(inner, bg=C['bg2'])
         bf2.pack(fill='x', pady=(8, 6))
-        mk_btn_outline(bf2, "PROFILE", self.open_profiles, C['purple']).pack(
+        mk_btn_outline(bf2, "PROFILES", self.open_profiles, C['purple']).pack(
             side='left', fill='x', expand=True, padx=(0, 3))
-        mk_btn_outline(bf2, "ZAPIS", lambda: self.send("SAVE"), C['green']).pack(
+        mk_btn_outline(bf2, "SAVE", lambda: self.send("SAVE"), C['green']).pack(
             side='left', fill='x', expand=True, padx=3)
-        mk_btn_outline(bf2, "WCZYT", lambda: self.send("LOAD"), C['cyan']).pack(
+        mk_btn_outline(bf2, "LOAD", lambda: self.send("LOAD"), C['cyan']).pack(
             side='left', fill='x', expand=True, padx=(3, 0))
 
         # Kalibracja na dysk PC (trwala kopia)
         bf3 = tk.Frame(inner, bg=C['bg2'])
         bf3.pack(fill='x', pady=(0, 6))
-        mk_btn_outline(bf3, "⤓ ZAPISZ KALIBR. NA PC",
+        mk_btn_outline(bf3, "⤓ SAVE CAL TO PC",
                        lambda: self.dump_calibration_to_pc(silent=False),
                        C['purple']).pack(side='left', fill='x', expand=True, padx=(0, 3))
-        mk_btn_outline(bf3, "⤒ WGRAJ Z PC",
+        mk_btn_outline(bf3, "⤒ LOAD FROM PC",
                        self._manual_load_cal, C['cyan']).pack(
                        side='left', fill='x', expand=True, padx=(3, 0))
 
         # Reset nastaw
-        mk_btn_outline(inner, "↺ RESET NASTAW", self.do_reset, C['dim']).pack(
+        mk_btn_outline(inner, "↺ RESET", self.do_reset, C['dim']).pack(
             fill='x', pady=(0, 8))
 
-        tk.Label(inner, text="▶ START uzywa wartosci z panelu",
+        tk.Label(inner, text="▶ START uses panel values",
                  bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
 
         self._set_panel_enabled(False)
@@ -962,31 +1003,57 @@ class PeltierControl:
                 "Wyczysci wszystkie profile i kalibracje!"):
             self.send("RESET")
 
+    def do_repol(self):
+        """Wymus ponowne wykrycie polaryzacji Peltiera"""
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        if messagebox.askyesno("Re-detect polarity",
+                "Re-detect Peltier polarity?\n\n"
+                "The device will briefly heat to check direction (~4s).\n"
+                "Do not touch the thermocouple during the test.\n"
+                "Result is saved permanently."):
+            self.send("REPOL")
+
+    def _update_pol_indicator(self):
+        """Aktualizuj wskaznik polaryzacji w panelu"""
+        if not hasattr(self, 'pol_indicator'):
+            return
+        if self.dev_pol_set:
+            txt = "POL: SWAPPED" if self.dev_pol_swapped else "POL: NORMAL"
+            col = C['orange'] if self.dev_pol_swapped else C['green']
+            self.pol_indicator.config(text=f"● {txt}", fg=col)
+        else:
+            self.pol_indicator.config(text="POL: not set", fg=C['dim2'])
+
     def do_selftune(self):
-        if not self.connected: return
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
         if messagebox.askyesno("Self-Tune",
-                "Uruchomic auto-strojenie PID?\nTrwa ok. 2 minuty.\n"
-                "Urzadzenie musi byc w trybie pracy (START)."):
+                "Start PID auto-tuning?\nTakes ~2 minutes.\n"
+                "Device must be running (START)."):
             self.send("SELFTUNE")
 
     def do_autocal(self):
-        """Pelna automatyczna kalibracja (temp x rampa)"""
+        """Otworz okno wyboru zakresu auto-kalibracji"""
         if not self.connected:
-            messagebox.showwarning("Brak polaczenia", "Polacz sie z urzadzeniem.")
+            messagebox.showwarning("Not connected", "Connect to the device first.")
             return
-        if messagebox.askyesno("Auto-Kalibracja",
-                "Uruchomic PELNA automatyczna kalibracje?\n\n"
-                "Przejdzie przez wszystkie kombinacje temperatura x rampa\n"
-                "i dostroi PID dla kazdej. Zapisze do pamieci Flash.\n\n"
-                "UWAGA: trwa kilkadziesiat minut!\n"
-                "Mozna przerwac przyciskiem STOP."):
-            self.cal_running = True
-            self.cal_t0 = time.time()
-            self.cal_current = 0
-            self.send("AUTOCAL")
-            self.cal_status.config(text="Kalibracja startuje... (kliknij by zobaczyc postep)")
-            # Otworz okno postepu automatycznie
-            self.root.after(500, self.open_cal_window)
+        CalRangeDialog(self.root, self)
+
+    def start_autocal(self, temp_min, temp_max, ramps):
+        """Uruchom auto-kalibracje z wybranym zakresem"""
+        # Wyslij zakres do urzadzenia
+        self.send(f"CALRANGE:{temp_min:.0f},{temp_max:.0f}")
+        time.sleep(0.1)
+        self.cal_running = True
+        self.cal_t0 = time.time()
+        self.cal_current = 0
+        self.send("AUTOCAL")
+        if hasattr(self, 'cal_status'):
+            self.cal_status.config(text="Calibration starting... (click for progress)")
+        self.root.after(600, self.open_cal_window)
 
     def open_cal_window(self):
         """Otworz okno postepu kalibracji"""
@@ -1036,10 +1103,10 @@ class PeltierControl:
         inner = tk.Frame(card, bg=C['panel'])
         inner.pack(fill='x', padx=20, pady=16)
 
-        tk.Label(inner, text="POLACZENIE SERIAL", bg=C['panel'], fg=C['text'],
+        tk.Label(inner, text="SERIAL CONNECTION", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(anchor='w', pady=(0, 12))
 
-        tk.Label(inner, text="Dostepne porty:", bg=C['panel'], fg=C['dim'],
+        tk.Label(inner, text="Available ports:", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(10))).pack(anchor='w')
 
         lf = tk.Frame(inner, bg=C['panel'])
@@ -1056,10 +1123,10 @@ class PeltierControl:
 
         br = tk.Frame(inner, bg=C['panel'])
         br.pack(fill='x', pady=(8, 0))
-        mk_btn(br, "ODSWIEZ", self.refresh_ports, C['cyan']).pack(side='left', padx=(0, 8))
-        self.conn_btn = mk_btn(br, "POLACZ", self.conn_from_tab, C['green'])
+        mk_btn(br, "REFRESH", self.refresh_ports, C['cyan']).pack(side='left', padx=(0, 8))
+        self.conn_btn = mk_btn(br, "CONNECT", self.conn_from_tab, C['green'])
         self.conn_btn.pack(side='left', padx=(0, 8))
-        mk_btn_outline(br, "ROZLACZ", self.disconnect, C['red']).pack(side='left')
+        mk_btn_outline(br, "DISCONNECT", self.disconnect, C['red']).pack(side='left')
 
         # Info
         info = tk.Frame(wrap, bg=C['panel'])
@@ -1067,7 +1134,7 @@ class PeltierControl:
         tk.Frame(info, bg=C['dim2'], height=3).pack(fill='x')
         ii = tk.Frame(info, bg=C['panel'])
         ii.pack(fill='x', padx=20, pady=16)
-        tk.Label(ii, text="INSTRUKCJA", bg=C['panel'], fg=C['text'],
+        tk.Label(ii, text="INSTRUCTIONS", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(11), 'bold')).pack(anchor='w', pady=(0, 8))
         for line in [
             "1. Podlacz ItsyBitsy (firmware v19 PC MODE) przez USB",
@@ -1104,9 +1171,9 @@ class PeltierControl:
 
         hd = tk.Frame(wrap, bg=C['bg'])
         hd.pack(fill='x', pady=(0, 12))
-        tk.Label(hd, text="ARCHIWUM CYKLI", bg=C['bg'], fg=C['text'],
+        tk.Label(hd, text="CYCLE ARCHIVE", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
-        mk_btn(hd, "ODSWIEZ", self.refresh_arch, C['cyan']).pack(side='right')
+        mk_btn(hd, "REFRESH", self.refresh_arch, C['cyan']).pack(side='right')
 
         body = tk.Frame(wrap, bg=C['bg'])
         body.pack(fill='both', expand=True)
@@ -1116,7 +1183,7 @@ class PeltierControl:
         lf.pack(side='left', fill='y', padx=(0, 12))
         lf.pack_propagate(False)
         tk.Frame(lf, bg=C['purple'], height=3).pack(fill='x')
-        tk.Label(lf, text="ZAPISANE CYKLE", bg=C['panel'], fg=C['dim'],
+        tk.Label(lf, text="SAVED CYCLES", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(anchor='w', padx=12, pady=8)
         sb = tk.Scrollbar(lf)
         sb.pack(side='right', fill='y')
@@ -1166,8 +1233,8 @@ class PeltierControl:
         self.ax_a.clear()
         self.ax_a.set_facecolor(C['panel2'])
         self.ax_a.plot(t, temp, color=C['blue'], lw=2, label='temp')
-        self.ax_a.plot(t, spt, color=C['orange'], lw=1.5, ls='--', label='setpoint')
-        self.ax_a.set_xlabel('czas [s]', color=C['dim'], fontsize=9)
+        self.ax_a.plot(t, spt, color=C['orange'], lw=1.5, ls='--', label='target')
+        self.ax_a.set_xlabel('time [s]', color=C['dim'], fontsize=9)
         self.ax_a.set_ylabel('°C', color=C['dim'], fontsize=9)
         self.ax_a.tick_params(colors=C['dim'], labelsize=8)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
@@ -1202,8 +1269,46 @@ class PeltierControl:
                 # Start cyklu
                 if state == 'AUTO' and prev != 'AUTO' and not self.cyc_on:
                     self._cyc_start(temp)
+                    # Rozpocznij sledzenie dotarcia do setpointu
+                    self.reach_start_t = now2
+                    self.reach_start_temp = temp
+                    self.reach_target = st
+                    self.reach_done = False
+                    self.reach_time = None
+                    self.reach_avg_rate = None
+                    self.last_setpoint_target = st
                 elif self.cyc_on and prev == 'COOLDOWN' and state == 'MAN':
                     self.cyc_stop("done")
+
+                # Wykrywanie zmiany docelowego setpointu podczas pracy (nowe dotarcie)
+                if state == 'AUTO' and self.last_setpoint_target is not None:
+                    if abs(st - self.last_setpoint_target) > 0.5:
+                        # Setpoint zmieniony - zacznij liczyc od nowa
+                        self.reach_start_t = now2
+                        self.reach_start_temp = temp
+                        self.reach_target = st
+                        self.reach_done = False
+                        self.last_setpoint_target = st
+
+                # Sprawdz czy osiagnieto setpoint (w granicach 0.5C, stabilnie)
+                if (state == 'AUTO' and not self.reach_done
+                        and self.reach_target is not None
+                        and self.reach_start_t is not None):
+                    if abs(temp - self.reach_target) <= 0.5:
+                        self.reach_done = True
+                        self.reach_time = now2 - self.reach_start_t
+                        dT = abs(self.reach_target - self.reach_start_temp)
+                        if self.reach_time > 0:
+                            self.reach_avg_rate = dT / (self.reach_time / 60.0)
+                        # Zapisz do CSV cyklu jako komentarz
+                        if self.cyc_on and self.cyc_wr:
+                            try:
+                                self.cyc_wr.writerow([
+                                    f"# REACHED target={self.reach_target:.1f}C",
+                                    f"time={self.reach_time:.1f}s",
+                                    f"avg_rate={self.reach_avg_rate:.2f}C/min", '', '', '', '', '', '', ''])
+                                self.cyc_file.flush()
+                            except: pass
         except Exception as e:
             print(f"tick err: {e}")
 
@@ -1234,15 +1339,35 @@ class PeltierControl:
         acol = C['red'] if diff > 0.3 else (C['cyan'] if diff < -0.3 else C['dim2'])
         self.cards['pwm']['unit_lbl'].config(text=" " + arrow, fg=acol)
 
-    def draw_chart(self):
+        # Statystyki dotarcia do setpointu
+        if hasattr(self, 'reach_lbl'):
+            if self.reach_done and self.reach_time is not None:
+                m = int(self.reach_time // 60); s = int(self.reach_time % 60)
+                tstr = f"{m}m {s}s" if m > 0 else f"{s}s"
+                rate_str = f"{self.reach_avg_rate:.2f}" if self.reach_avg_rate else "?"
+                self.reach_lbl.config(
+                    text=f"✓ REACHED in {tstr} · avg {rate_str}°C/min", fg=C['green'])
+            elif (self.cur_state == 'AUTO' and self.reach_start_t is not None
+                  and not self.reach_done):
+                # W trakcie dochodzenia - pokaz uplyniety czas
+                if self.t:
+                    elapsed = self.t[-1] - self.reach_start_t
+                    m = int(elapsed // 60); s = int(elapsed % 60)
+                    tstr = f"{m}m {s}s" if m > 0 else f"{s}s"
+                    self.reach_lbl.config(
+                        text=f"→ reaching {self.reach_target:.1f}°C · {tstr}", fg=C['yellow'])
+            else:
+                self.reach_lbl.config(text="")
         if not self.t: return
-        t = self.t; temp = self.temp; spt = self.spt; pwm = self.pwm
+        t = self.t; temp = self.temp; spt = self.spt; spa = self.spa; pwm = self.pwm
 
         self.ax1.clear()
         self.ax1.set_facecolor(C['panel2'])
-        # setpoint przerywana
-        self.ax1.plot(t, spt, color=C['orange'], lw=1.5, ls='--', label='setpoint')
-        # temperatura
+        # target final (przerywana pomaranczowa)
+        self.ax1.plot(t, spt, color=C['orange'], lw=1.3, ls='--', label='target', alpha=0.7)
+        # actual setpoint - rampa (kropkowana cyan) - pokazuje jak setpoint pelznie
+        self.ax1.plot(t, spa, color=C['cyan'], lw=1.5, ls=':', label='setpoint (ramp)')
+        # temperatura rzeczywista (gruba niebieska)
         self.ax1.plot(t, temp, color=C['blue'], lw=2.2, label='temp')
         self.ax1.set_ylabel('°C', color=C['dim'], fontsize=9)
         self.ax1.tick_params(colors=C['dim'], labelsize=8, length=0)
@@ -1257,7 +1382,7 @@ class PeltierControl:
         self.ax2.fill_between(t, 0, pwm, color=C['green'], alpha=0.3)
         self.ax2.plot(t, pwm, color=C['green'], lw=1.5)
         self.ax2.set_ylabel('PWM %', color=C['dim'], fontsize=9)
-        self.ax2.set_xlabel('czas [s]', color=C['dim'], fontsize=9)
+        self.ax2.set_xlabel('time [s]', color=C['dim'], fontsize=9)
         self.ax2.set_ylim(-105, 105)
         self.ax2.tick_params(colors=C['dim'], labelsize=8, length=0)
         self.ax2.grid(True, axis='y', alpha=0.35, color=C['grid'])
@@ -1334,6 +1459,117 @@ class PeltierControl:
             if tmp_path.exists(): tmp_path.unlink()
             print("Cykl odrzucony")
         except: pass
+
+
+# ════════════════════════════════════════════════════════
+#  DIALOG WYBORU ZAKRESU AUTO-KALIBRACJI
+# ════════════════════════════════════════════════════════
+class CalRangeDialog:
+    def __init__(self, parent, app):
+        self.app = app
+        self.win = tk.Toplevel(parent)
+        self.win.title("Auto-Calibration Range")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("480x520")
+        self.win.transient(parent)
+        self.win.grab_set()
+
+        tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
+        inner = tk.Frame(self.win, bg=C['bg'])
+        inner.pack(fill='both', expand=True, padx=24, pady=20)
+
+        tk.Label(inner, text="AUTO-CALIBRATION RANGE", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+        tk.Label(inner, text="Select temperature range and ramps to calibrate",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+
+        # Zakres temperatur - suwaki
+        tmin0 = getattr(app, 'dev_cal_min', 50.0)
+        tmax0 = getattr(app, 'dev_cal_max', 100.0)
+
+        self.sl_tmin = SliderField(inner, "TEMP FROM", -10, 100, tmin0,
+                                   C['cyan'], "°C", 0)
+        self.sl_tmax = SliderField(inner, "TEMP TO", 0, 115, tmax0,
+                                   C['orange'], "°C", 0)
+
+        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(4, 12))
+
+        # Krok temperatury (info - firmware uzywa co 10C)
+        tk.Label(inner, text="STEP: 10°C (fixed)", bg=C['bg'], fg=C['dim2'],
+                 font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 12))
+
+        # Lista ramp do zaznaczenia
+        tk.Label(inner, text="RAMPS TO CALIBRATE [°C/min]:", bg=C['bg'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(0, 8))
+
+        ramps_frame = tk.Frame(inner, bg=C['bg'])
+        ramps_frame.pack(fill='x', pady=(0, 12))
+        # Dostepne rampy (zgodne z firmware PR[]={2,5,10,20})
+        self.ramp_vars = {}
+        for r in [2, 5, 10, 20]:
+            var = tk.BooleanVar(value=True)
+            self.ramp_vars[r] = var
+            cb = tk.Checkbutton(ramps_frame, text=f"{r}", variable=var,
+                               bg=C['bg2'], fg=C['text'], font=(FONT, fsz(11), 'bold'),
+                               selectcolor=C['panel'], activebackground=C['bg2'],
+                               activeforeground=C['cyan'], bd=0,
+                               highlightthickness=0, padx=16, pady=8)
+            cb.pack(side='left', padx=4)
+
+        tk.Label(inner, text="Note: firmware calibrates selected ramps.\n"
+                 "More ramps/temps = longer calibration.",
+                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left').pack(
+                 anchor='w', pady=(0, 16))
+
+        # Szacowany czas
+        self.est_lbl = tk.Label(inner, text="", bg=C['bg'], fg=C['yellow'],
+                               font=(FONT, fsz(10), 'bold'))
+        self.est_lbl.pack(anchor='w', pady=(0, 12))
+        self._update_estimate()
+        # Aktualizuj szacunek przy zmianach
+        for r, var in self.ramp_vars.items():
+            var.trace_add('write', lambda *a: self._update_estimate())
+
+        # Przyciski
+        bf = tk.Frame(inner, bg=C['bg'])
+        bf.pack(fill='x')
+        mk_btn(bf, "▶ START CALIBRATION", self.start, C['purple'], fg='#fff').pack(
+            side='left', fill='x', expand=True, padx=(0, 4))
+        mk_btn_outline(bf, "CANCEL", self.win.destroy, C['dim']).pack(
+            side='left', fill='x', expand=True, padx=(4, 0))
+
+    def _update_estimate(self):
+        try:
+            tmin = self.sl_tmin.get(); tmax = self.sl_tmax.get()
+            n_temps = max(1, int((tmax - tmin) / 10) + 1)
+            n_ramps = sum(1 for v in self.ramp_vars.values() if v.get())
+            total = n_temps * n_ramps
+            # Szacunek ~3-5 min na krok
+            est_min = total * 4
+            self.est_lbl.config(
+                text=f"≈ {total} steps · ~{est_min} min total")
+        except: pass
+
+    def start(self):
+        tmin = self.sl_tmin.get(); tmax = self.sl_tmax.get()
+        if tmax <= tmin:
+            messagebox.showerror("Invalid range", "TEMP TO must be greater than TEMP FROM.")
+            return
+        ramps = [r for r, v in self.ramp_vars.items() if v.get()]
+        if not ramps:
+            messagebox.showerror("No ramps", "Select at least one ramp.")
+            return
+        n_temps = int((tmax - tmin) / 10) + 1
+        total = n_temps * len(ramps)
+        if not messagebox.askyesno("Start calibration",
+                f"Start auto-calibration?\n\n"
+                f"Range: {tmin:.0f}-{tmax:.0f}°C (step 10°C)\n"
+                f"Ramps: {', '.join(str(r) for r in ramps)} °C/min\n"
+                f"Total: {total} steps\n\n"
+                "Takes several minutes. Can be stopped with STOP."):
+            return
+        self.app.start_autocal(tmin, tmax, ramps)
+        self.win.destroy()
 
 
 # ════════════════════════════════════════════════════════
