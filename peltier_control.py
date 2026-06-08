@@ -696,14 +696,38 @@ class PeltierControl:
     #  EKRAN LIVE: wykres (lewo) + panel sterowania (prawo)
     # ────────────────────────────────────────────────────
     def build_live(self, parent):
-        # Gorne karty statystyk
-        cards = tk.Frame(parent, bg=C['bg'])
-        cards.pack(fill='x', padx=16, pady=(12, 8))
+        # Gorny pasek: kompaktowe karty statystyk + przyciski START/STOP
+        topbar = tk.Frame(parent, bg=C['bg'])
+        topbar.pack(fill='x', padx=16, pady=(10, 6))
+
+        # Karty (lewa czesc, rozciagane)
+        cards = tk.Frame(topbar, bg=C['bg'])
+        cards.pack(side='left', fill='x', expand=True)
         self.cards = {}
-        self.cards['temp'] = self._stat_card(cards, "TEMPERATURA", "°C", C['blue'])
-        self.cards['sp']   = self._stat_card(cards, "SETPOINT CEL", "°C", C['orange'])
+        self.cards['temp'] = self._stat_card(cards, "TEMP", "°C", C['blue'])
+        self.cards['sp']   = self._stat_card(cards, "SETPOINT", "°C", C['orange'])
         self.cards['rate'] = self._stat_card(cards, "TEMPO", "°C/min", C['yellow'])
-        self.cards['pwm']  = self._stat_card(cards, "MOC PWM", "%", C['green'])
+        self.cards['pwm']  = self._stat_card(cards, "PWM", "%", C['green'])
+
+        # Przyciski START/STOP/E-STOP (prawa czesc paska) - zawsze widoczne
+        ctrl = tk.Frame(topbar, bg=C['bg'])
+        ctrl.pack(side='right', padx=(8, 0))
+        self.btn_start = tk.Button(ctrl, text="▶ START", command=self.do_start,
+                                   bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(13), 'bold'),
+                                   relief='flat', cursor='hand2', bd=0, padx=18, pady=14,
+                                   activebackground=_lighten(C['green'], 0.15))
+        self.btn_start.pack(side='left', padx=(0, 4), fill='y')
+        self.btn_stop = tk.Button(ctrl, text="■ STOP", command=self.do_stop,
+                                  bg=C['bg2'], fg=C['red'], font=(FONT, fsz(13), 'bold'),
+                                  relief='flat', cursor='hand2', bd=0, padx=18, pady=14,
+                                  highlightthickness=2, highlightbackground=C['red'],
+                                  activebackground=C['panel3'])
+        self.btn_stop.pack(side='left', padx=(0, 4), fill='y')
+        self.btn_estop = tk.Button(ctrl, text="⛔", command=self.do_estop,
+                                   bg=C['red'], fg='#fff', font=(FONT, fsz(15), 'bold'),
+                                   relief='flat', cursor='hand2', bd=0, padx=14, pady=14,
+                                   activebackground=_lighten(C['red'], 0.15))
+        self.btn_estop.pack(side='left', fill='y')
 
         # Glowny obszar: wykres + panel
         main = tk.Frame(parent, bg=C['bg'])
@@ -716,20 +740,20 @@ class PeltierControl:
 
     def _stat_card(self, parent, title, unit, color):
         card = tk.Frame(parent, bg=C['panel'])
-        card.pack(side='left', fill='x', expand=True, padx=(0, 8))
+        card.pack(side='left', fill='x', expand=True, padx=(0, 6))
         tk.Frame(card, bg=color, height=3).pack(fill='x')
         inner = tk.Frame(card, bg=C['panel'])
-        inner.pack(fill='both', expand=True, padx=14, pady=10)
+        inner.pack(fill='both', expand=True, padx=10, pady=6)
         tk.Label(inner, text=title, bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(9)), anchor='w').pack(anchor='w')
+                 font=(FONT, fsz(8)), anchor='w').pack(anchor='w')
         vrow = tk.Frame(inner, bg=C['panel'])
-        vrow.pack(anchor='w', pady=(4, 0))
+        vrow.pack(anchor='w', pady=(2, 0))
         val = tk.Label(vrow, text="--", bg=C['panel'], fg=color,
-                       font=(FONT, fsz(26), 'bold'))
+                       font=(FONT, fsz(19), 'bold'))
         val.pack(side='left')
         unit_lbl = tk.Label(vrow, text=" " + unit, bg=C['panel'], fg=C['dim2'],
-                            font=(FONT, fsz(10)))
-        unit_lbl.pack(side='left', pady=(8, 0))
+                            font=(FONT, fsz(8)))
+        unit_lbl.pack(side='left', pady=(5, 0))
         return {'val': val, 'unit': unit, 'unit_lbl': unit_lbl, 'extra': None, 'row': vrow}
 
     def _build_chart(self, parent):
@@ -754,13 +778,38 @@ class PeltierControl:
         self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 8))
 
     def _build_panel(self, parent):
-        """Prawy panel sterowania - waski pasek"""
-        panel = tk.Frame(parent, bg=C['bg2'], width=300)
+        """Prawy panel sterowania - waski pasek z przewijaniem"""
+        panel = tk.Frame(parent, bg=C['bg2'], width=312)
         panel.pack(side='right', fill='y')
         panel.pack_propagate(False)
         tk.Frame(panel, bg=C['red'], width=6).pack(side='left', fill='y')
 
-        inner = tk.Frame(panel, bg=C['bg2'])
+        # Przewijalny obszar - Canvas + Scrollbar (panel moze byc dluzszy niz ekran)
+        scroll_wrap = tk.Frame(panel, bg=C['bg2'])
+        scroll_wrap.pack(side='left', fill='both', expand=True)
+        pcanvas = tk.Canvas(scroll_wrap, bg=C['bg2'], highlightthickness=0,
+                            width=290)
+        psb = tk.Scrollbar(scroll_wrap, orient='vertical', command=pcanvas.yview)
+        pcanvas.configure(yscrollcommand=psb.set)
+        psb.pack(side='right', fill='y')
+        pcanvas.pack(side='left', fill='both', expand=True)
+
+        inner = tk.Frame(pcanvas, bg=C['bg2'])
+        inner_id = pcanvas.create_window((0, 0), window=inner, anchor='nw')
+
+        def _on_inner_config(e):
+            pcanvas.configure(scrollregion=pcanvas.bbox('all'))
+        inner.bind('<Configure>', _on_inner_config)
+        def _on_canvas_config(e):
+            pcanvas.itemconfig(inner_id, width=e.width)
+        pcanvas.bind('<Configure>', _on_canvas_config)
+        # Przewijanie kolkiem myszy
+        def _on_wheel(e):
+            pcanvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+        pcanvas.bind('<Enter>', lambda e: pcanvas.bind_all('<MouseWheel>', _on_wheel))
+        pcanvas.bind('<Leave>', lambda e: pcanvas.unbind_all('<MouseWheel>'))
+
+        inner = tk.Frame(inner, bg=C['bg2'])
         inner.pack(fill='both', expand=True, padx=16, pady=14)
 
         tk.Label(inner, text="STEROWANIE", bg=C['bg2'], fg=C['text'],
@@ -826,21 +875,11 @@ class PeltierControl:
         tk.Label(auto, text="● AUTO: kierunek wg setpointu", bg=C['bg2'],
                  fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
 
-        # START / STOP
-        bf = tk.Frame(inner, bg=C['bg2'])
-        bf.pack(fill='x', pady=(0, 6))
-        self.btn_start = mk_btn(bf, "▶ START", self.do_start, C['green'])
-        self.btn_start.pack(side='left', fill='x', expand=True, padx=(0, 4))
-        self.btn_stop = mk_btn_outline(bf, "■ STOP", self.do_stop, C['red'])
-        self.btn_stop.pack(side='left', fill='x', expand=True, padx=(4, 0))
-
-        # E-STOP (awaryjne natychmiastowe zatrzymanie)
-        self.btn_estop = mk_btn(inner, "⛔ E-STOP (natychmiast)", self.do_estop, C['red'], fg='#fff')
-        self.btn_estop.pack(fill='x', pady=(0, 10))
+        # (START / STOP / E-STOP przeniesione na gorny pasek - obok kafelkow)
 
         # Profile + Flash kompakt
         bf2 = tk.Frame(inner, bg=C['bg2'])
-        bf2.pack(fill='x', pady=(0, 6))
+        bf2.pack(fill='x', pady=(8, 6))
         mk_btn_outline(bf2, "PROFILE", self.open_profiles, C['purple']).pack(
             side='left', fill='x', expand=True, padx=(0, 3))
         mk_btn_outline(bf2, "ZAPIS", lambda: self.send("SAVE"), C['green']).pack(
@@ -868,13 +907,16 @@ class PeltierControl:
         self._set_panel_enabled(False)
 
     def _set_panel_enabled(self, en):
+        # Suwaki zawsze aktywne (mozna ustawic wartosci przed polaczeniem)
+        # START/STOP tez aktywne - sprawdzaja polaczenie w momencie klikniecia
+        # (dezaktywujemy tylko gdy chcemy wyraznie zablokowac)
         for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off']:
             if hasattr(self, sl):
-                getattr(self, sl).set_enabled(en)
-        st = 'normal' if en else 'disabled'
+                getattr(self, sl).set_enabled(True)
+        # Przyciski zawsze klikalnie - reaguja komunikatem jesli brak polaczenia
         for b in ['btn_start', 'btn_stop', 'btn_st', 'btn_autocal', 'btn_estop']:
             if hasattr(self, b):
-                getattr(self, b).config(state=st)
+                getattr(self, b).config(state='normal')
 
 
     # ────────────────────────────────────────────────────
