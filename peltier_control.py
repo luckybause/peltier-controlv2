@@ -7,7 +7,7 @@ Sterowanie z aplikacji: setpoint, rampa, PID, kalibracja, profile.
 Wymaga firmware v19 (PC MODE) na ItsyBitsy M0.
 """
 
-import sys, os, time, csv, threading, queue
+import sys, os, time, csv, json, threading, queue
 from datetime import datetime
 from pathlib import Path
 
@@ -57,6 +57,12 @@ C = {
 FONT      = 'Consolas'
 FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 
+# Globalny mnoznik rozmiaru fontow (ustawiany na starcie wg DPI)
+FS = 1.0
+def fsz(n):
+    """Skaluje rozmiar fontu wg globalnego DPI."""
+    return max(6, int(round(n * FS)))
+
 def _font(size, weight='normal'):
     """Zwraca tuple fontu z fallbackiem"""
     return (FONT, size, weight) if weight != 'normal' else (FONT, size)
@@ -76,7 +82,7 @@ def mk_btn(parent, text, cmd, bg=None, fg='#1a1c1f', **kw):
     """Brutalist button - ostre krawedzie, monospace"""
     bg = bg or C['green']
     b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
-                  font=(FONT, 10, 'bold'), padx=16, pady=8,
+                  font=(FONT, fsz(10), 'bold'), padx=16, pady=8,
                   relief='flat', cursor='hand2', bd=0,
                   activebackground=_lighten(bg, 0.15), activeforeground=fg, **kw)
     def on_enter(e):
@@ -90,7 +96,7 @@ def mk_btn(parent, text, cmd, bg=None, fg='#1a1c1f', **kw):
 def mk_btn_outline(parent, text, cmd, color, **kw):
     """Button z obramowaniem (outline) zamiast wypelnienia"""
     b = tk.Button(parent, text=text, command=cmd, bg=C['bg2'], fg=color,
-                  font=(FONT, 10, 'bold'), padx=14, pady=7,
+                  font=(FONT, fsz(10), 'bold'), padx=14, pady=7,
                   relief='flat', cursor='hand2', bd=0,
                   highlightthickness=2, highlightbackground=color,
                   highlightcolor=color,
@@ -120,10 +126,10 @@ class SliderField:
         top = tk.Frame(self.frame, bg=C['bg2'])
         top.pack(fill='x')
         tk.Label(top, text=label, bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, 9), anchor='w').pack(side='left')
+                 font=(FONT, fsz(9)), anchor='w').pack(side='left')
         if unit:
             tk.Label(top, text=unit, bg=C['bg2'], fg=C['dim2'],
-                     font=(FONT, 8), anchor='e').pack(side='right')
+                     font=(FONT, fsz(8)), anchor='e').pack(side='right')
 
         # Wiersz: suwak + pole
         row = tk.Frame(self.frame, bg=C['bg2'])
@@ -131,7 +137,7 @@ class SliderField:
 
         # Pole liczbowe (Entry) - po prawej
         self.entry = tk.Entry(row, width=7, bg=C['panel'], fg=color,
-                              font=(FONT, 12, 'bold'), justify='center',
+                              font=(FONT, fsz(12), 'bold'), justify='center',
                               relief='flat', bd=0,
                               highlightthickness=1.5, highlightbackground=color,
                               highlightcolor=_lighten(color, 0.2),
@@ -240,6 +246,24 @@ class PeltierControl:
         self.dev_cal = False       # czy urzadzenie ma kalibracje
         self.last_cfg_time = 0
 
+        # Stan kalibracji
+        self.cal_plan = []         # lista (temp, ramp) wszystkich krokow
+        self.cal_total = 0         # liczba krokow
+        self.cal_current = 0       # aktualny krok (1-based)
+        self.cal_cur_temp = None
+        self.cal_cur_ramp = None
+        self.cal_running = False
+        self.cal_t0 = None         # czas startu kalibracji
+        self.cal_step_times = []   # czasy ukonczenia krokow (do ETA)
+        self.cal_win = None        # okno postepu kalibracji
+
+        # Zapis kalibracji na dysku PC
+        self.cal_file = self.log_dir / "kalibracja.json"
+        self._caldump_buf = []     # bufor odbieranych profili
+        self._caldump_active = False
+        self._caldump_purpose = None  # 'save' lub None
+        self._pending_offset = None   # offset do zapisania z dumpem
+
         # Pulsowanie statusu
         self._pulse_state = 0
 
@@ -254,7 +278,7 @@ class PeltierControl:
         except: pass
         st.configure('TNotebook', background=C['bg2'], borderwidth=0, tabmargins=[0,0,0,0])
         st.configure('TNotebook.Tab', background=C['bg2'], foreground=C['dim'],
-                     padding=[20, 10], font=(FONT, 10, 'bold'), borderwidth=0)
+                     padding=[20, 10], font=(FONT, fsz(10), 'bold'), borderwidth=0)
         st.map('TNotebook.Tab',
                background=[('selected', C['bg'])],
                foreground=[('selected', C['text'])])
@@ -278,11 +302,22 @@ class PeltierControl:
             self.set_status(True, f"{port} - 115200")
             self.running = True
             threading.Thread(target=self.reader, daemon=True).start()
-            # Po         konfiguracji startowej
+            # Pobierz konfiguracje startowa
             self.root.after(1500, lambda: self.send("GET"))
+            # Auto-wczytaj zapisana kalibracje z PC (jesli istnieje)
+            self.root.after(2200, self._auto_load_calibration)
         except Exception as e:
             messagebox.showerror("Blad", f"{port}:\n{e}")
             self.set_status(False, "")
+
+    def _auto_load_calibration(self):
+        """Przy polaczeniu - automatycznie wgraj zapisana kalibracje"""
+        if not self.connected:
+            return
+        if self.cal_file.exists():
+            ok = self.load_calibration_from_pc()
+            if ok:
+                print("Auto-wgrano kalibracje z PC przy polaczeniu")
 
     def disconnect(self):
         self.running = False
@@ -314,11 +349,29 @@ class PeltierControl:
                     self._parse_cfg(raw[4:])
                     continue
 
-                # Status kalibracji CALSTAT:5/36,T=40,R=2
+                # Plan kalibracji CALPLAN:24,temps=50/60/70,ramps=2/5/10/20
+                if raw.startswith("CALPLAN:"):
+                    self._parse_calplan(raw[8:])
+                    continue
+
+                # Dump kalibracji - poczatek
+                if raw.startswith("CALDUMP:"):
+                    self._caldump_buf = []
+                    self._caldump_active = True
+                    continue
+                # Pojedynczy profil PROF:idx,KpH,...
+                if raw.startswith("PROF:") and self._caldump_active:
+                    self._caldump_buf.append(raw[5:])
+                    continue
+                # Koniec dumpu
+                if raw == "CALDUMPEND":
+                    self._caldump_active = False
+                    self.root.after(0, self._finish_caldump_save)
+                    continue
+
+                # Status kalibracji CALSTAT:5/24,T=40,R=2
                 if raw.startswith("CALSTAT:"):
-                    txt = raw[8:]
-                    self.root.after(0, lambda t=txt: self.cal_status.config(
-                        text=f"Kalibracja: {t}"))
+                    self._parse_calstat(raw[8:])
                     continue
 
                 # Linia danych CSV (9 pol)
@@ -344,6 +397,11 @@ class PeltierControl:
                 prev = self.last_state
                 self.last_state = state
                 self.cur_state = state
+                # Wykryj koniec kalibracji (CAL/CAL-N -> MAN)
+                if self.cal_running and 'CAL' in prev and state == 'MAN':
+                    self.cal_running = False
+                    self.cal_current = self.cal_total  # ukoncz pasek
+                    self.root.after(0, self._cal_finished)
                 self.data_queue.put((now, d['temp'], d['st'], d['sa'],
                                     d['pwm']*100/255, d['kp'], d['ki'],
                                     d['kd'], state, prev))
@@ -383,6 +441,197 @@ class PeltierControl:
         except Exception as e:
             print(f"apply_cfg err: {e}")
 
+    def _parse_calplan(self, txt):
+        """CALPLAN:24,temps=50/60/70,ramps=2/5/10/20 - buduj liste krokow"""
+        try:
+            d = {}
+            # pierwsza czesc to total
+            parts = txt.split(',')
+            total = int(parts[0])
+            temps, ramps = [], []
+            for part in parts[1:]:
+                if part.startswith('temps='):
+                    temps = [float(x) for x in part[6:].split('/') if x]
+                elif part.startswith('ramps='):
+                    ramps = [float(x) for x in part[6:].split('/') if x]
+            # Buduj plan: dla kazdej temp, wszystkie rampy (kolejnosc jak firmware)
+            plan = []
+            for t in temps:
+                for r in ramps:
+                    plan.append((t, r))
+            self.cal_plan = plan
+            self.cal_total = total or len(plan)
+            self.cal_current = 0
+            self.cal_running = True
+            self.cal_t0 = time.time()
+            self.cal_step_times = []
+            self.root.after(0, self._refresh_cal_view)
+        except Exception as e:
+            print(f"calplan err: {e}")
+
+    def _parse_calstat(self, txt):
+        """CALSTAT:5/24,T=40,R=2 - aktualizuj postep"""
+        try:
+            d = {}
+            parts = txt.split(',')
+            # parts[0] = "5/24"
+            cur, tot = parts[0].split('/')
+            new_current = int(cur)
+            self.cal_total = int(tot)
+            for part in parts[1:]:
+                if part.startswith('T='):
+                    self.cal_cur_temp = float(part[2:])
+                elif part.startswith('R='):
+                    self.cal_cur_ramp = float(part[2:])
+            # Jesli zmienil sie krok - zapisz czas (do ETA)
+            if new_current != self.cal_current:
+                if self.cal_t0:
+                    self.cal_step_times.append(time.time())
+                self.cal_current = new_current
+            self.cal_running = True
+            self.root.after(0, self._refresh_cal_view)
+        except Exception as e:
+            print(f"calstat err: {e}")
+
+    def _cal_eta(self):
+        """Szacowany pozostaly czas kalibracji [s]"""
+        if not self.cal_t0 or self.cal_current < 1 or self.cal_total < 1:
+            return None
+        elapsed = time.time() - self.cal_t0
+        if self.cal_current == 0:
+            return None
+        per_step = elapsed / self.cal_current
+        remaining = (self.cal_total - self.cal_current) * per_step
+        return max(0, remaining)
+
+    def _cal_finished(self):
+        """Kalibracja zakonczona"""
+        self._refresh_cal_view()
+        if hasattr(self, 'cal_status'):
+            self.cal_status.config(text="✓ Kalibracja zakonczona - zapisywanie na PC...")
+        self.dev_cal = True
+        # Pobierz zaktualizowane nastawy
+        self.send("GET")
+        # Automatycznie pobierz profile i zapisz na dysk PC
+        self.root.after(800, lambda: self.dump_calibration_to_pc(silent=False))
+
+    # ────────────────────────────────────────────────────
+    #  KALIBRACJA - ZAPIS/ODCZYT NA DYSKU PC
+    # ────────────────────────────────────────────────────
+    def _manual_load_cal(self):
+        """Reczne wgranie kalibracji z PC (z potwierdzeniem)"""
+        if not self.connected:
+            messagebox.showwarning("Brak polaczenia", "Polacz sie z urzadzeniem.")
+            return
+        if not self.cal_file.exists():
+            messagebox.showinfo("Brak kalibracji",
+                "Nie znaleziono zapisanej kalibracji na PC.\n"
+                "Najpierw wykonaj kalibracje lub zapisz ja przyciskiem\n"
+                "'ZAPISZ KALIBR. NA PC'.")
+            return
+        # Pokaz date zapisu
+        try:
+            with open(self.cal_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            saved = data.get('saved', '?')
+            nvalid = sum(1 for p in data.get('profiles', []) if p.get('valid'))
+        except:
+            saved = '?'; nvalid = 0
+        if messagebox.askyesno("Wgraj kalibracje z PC",
+                f"Wgrac zapisana kalibracje do urzadzenia?\n\n"
+                f"Zapisana: {saved}\n"
+                f"Profili: {nvalid}\n\n"
+                "Nadpisze obecna kalibracje w urzadzeniu."):
+            self.load_calibration_from_pc()
+
+    def dump_calibration_to_pc(self, silent=True):
+        """Poprosi urzadzenie o profile i offset, zapisze do JSON"""
+        if not self.connected:
+            return
+        self._caldump_purpose = 'save'
+        # Zapamietaj offset z aktualnego suwaka
+        try:
+            self._pending_offset = self.sl_off.get()
+        except:
+            self._pending_offset = 0.0
+        self.send("DUMPCAL")
+        if not silent:
+            print("Pobieranie profili z urzadzenia...")
+
+    def _finish_caldump_save(self):
+        """Po odebraniu wszystkich profili - zapisz do pliku JSON"""
+        try:
+            profiles = []
+            for line in self._caldump_buf:
+                parts = line.split(',')
+                if len(parts) >= 8:
+                    profiles.append({
+                        'idx': int(parts[0]),
+                        'KpH': float(parts[1]), 'KiH': float(parts[2]), 'KdH': float(parts[3]),
+                        'KpC': float(parts[4]), 'KiC': float(parts[5]), 'KdC': float(parts[6]),
+                        'valid': parts[7].strip() == '1',
+                    })
+            data = {
+                'version': 1,
+                'saved': datetime.now().isoformat(timespec='seconds'),
+                'offset': self._pending_offset if self._pending_offset is not None else 0.0,
+                'profiles': profiles,
+            }
+            with open(self.cal_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            n_valid = sum(1 for p in profiles if p['valid'])
+            print(f"Kalibracja zapisana: {self.cal_file.name} ({n_valid}/{len(profiles)} profili)")
+            if hasattr(self, 'cal_status'):
+                self.cal_status.config(text=f"✓ Kalibracja zapisana na PC ({n_valid} profili)")
+            if self._caldump_purpose == 'save':
+                try:
+                    messagebox.showinfo("Kalibracja zapisana",
+                        f"Profile PID + offset zapisane na dysku:\n{self.cal_file}\n\n"
+                        f"Zapisano {n_valid} skalibrowanych profili.\n"
+                        "Przy nastepnym polaczeniu zostana automatycznie wgrane.")
+                except: pass
+        except Exception as e:
+            print(f"Blad zapisu kalibracji: {e}")
+        self._caldump_purpose = None
+
+    def load_calibration_from_pc(self):
+        """Wczytaj kalibracje z pliku JSON i wyslij do urzadzenia"""
+        if not self.cal_file.exists():
+            return False
+        try:
+            with open(self.cal_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            profiles = data.get('profiles', [])
+            offset = data.get('offset', 0.0)
+            if not profiles:
+                return False
+            # Wyslij offset
+            self.send(f"OFFSET:{offset:.1f}")
+            # Wyslij kazdy profil (z malym odstepem zeby nie zalac bufora)
+            def send_profiles(i=0):
+                if i >= len(profiles):
+                    # Po wszystkich - oznacz kalibracje jako gotowa
+                    self.send("SETCALDONE:1")
+                    self.dev_cal = True
+                    if hasattr(self, 'cal_status'):
+                        self.cal_status.config(
+                            text=f"✓ Wgrano kalibracje z PC ({len(profiles)} profili)")
+                    print(f"Wgrano {len(profiles)} profili z PC do urzadzenia")
+                    return
+                p = profiles[i]
+                self.send(f"SETPROF:{p['idx']},{p['KpH']:.3f},{p['KiH']:.4f},"
+                         f"{p['KdH']:.3f},{p['KpC']:.3f},{p['KiC']:.4f},"
+                         f"{p['KdC']:.3f},{1 if p['valid'] else 0}")
+                # Nastepny profil za 40ms
+                self.root.after(40, lambda: send_profiles(i + 1))
+            send_profiles(0)
+            saved = data.get('saved', '?')
+            print(f"Ladowanie kalibracji z PC (zapisana: {saved})")
+            return True
+        except Exception as e:
+            print(f"Blad ladowania kalibracji: {e}")
+            return False
+
 
     # ────────────────────────────────────────────────────
     #  BUDOWA UI
@@ -393,9 +642,9 @@ class PeltierControl:
         top.pack(fill='x'); top.pack_propagate(False)
         tk.Frame(top, bg=C['red'], width=6).pack(side='left', fill='y')
         tk.Label(top, text="  PELTIER CONTROL", bg=C['bg2'], fg=C['text'],
-                 font=(FONT, 13, 'bold')).pack(side='left', padx=(8, 0))
+                 font=(FONT, fsz(13), 'bold')).pack(side='left', padx=(8, 0))
         tk.Label(top, text="v6.0", bg=C['bg2'], fg=C['dim2'],
-                 font=(FONT, 9)).pack(side='left', padx=8)
+                 font=(FONT, fsz(9))).pack(side='left', padx=8)
 
         # Status po prawej
         sf = tk.Frame(top, bg=C['bg2'])
@@ -404,7 +653,7 @@ class PeltierControl:
         self.s_dot.pack(side='left', padx=(0, 8))
         self._draw_dot(C['dim2'], glow=False)
         self.s_lbl = tk.Label(sf, text="ROZLACZONY", bg=C['bg2'], fg=C['dim'],
-                              font=(FONT, 10))
+                              font=(FONT, fsz(10)))
         self.s_lbl.pack(side='left')
 
         # Notebook
@@ -472,14 +721,14 @@ class PeltierControl:
         inner = tk.Frame(card, bg=C['panel'])
         inner.pack(fill='both', expand=True, padx=14, pady=10)
         tk.Label(inner, text=title, bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, 9), anchor='w').pack(anchor='w')
+                 font=(FONT, fsz(9)), anchor='w').pack(anchor='w')
         vrow = tk.Frame(inner, bg=C['panel'])
         vrow.pack(anchor='w', pady=(4, 0))
         val = tk.Label(vrow, text="--", bg=C['panel'], fg=color,
-                       font=(FONT, 26, 'bold'))
+                       font=(FONT, fsz(26), 'bold'))
         val.pack(side='left')
         unit_lbl = tk.Label(vrow, text=" " + unit, bg=C['panel'], fg=C['dim2'],
-                            font=(FONT, 10))
+                            font=(FONT, fsz(10)))
         unit_lbl.pack(side='left', pady=(8, 0))
         return {'val': val, 'unit': unit, 'unit_lbl': unit_lbl, 'extra': None, 'row': vrow}
 
@@ -491,9 +740,9 @@ class PeltierControl:
         hd = tk.Frame(wrap, bg=C['panel'])
         hd.pack(fill='x', padx=14, pady=(10, 4))
         tk.Label(hd, text="PRZEBIEG W CZASIE", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, 10, 'bold')).pack(side='left')
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
 
-        self.fig = Figure(figsize=(9, 6), facecolor=C['panel'])
+        self.fig = Figure(figsize=(9, 6), facecolor=C['panel'], dpi=110)
         gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.2,
                                    left=0.07, right=0.97, top=0.97, bottom=0.08)
         self.ax1 = self.fig.add_subplot(gs[0])
@@ -515,7 +764,7 @@ class PeltierControl:
         inner.pack(fill='both', expand=True, padx=16, pady=14)
 
         tk.Label(inner, text="STEROWANIE", bg=C['bg2'], fg=C['text'],
-                 font=(FONT, 13, 'bold')).pack(anchor='w')
+                 font=(FONT, fsz(13), 'bold')).pack(anchor='w')
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(8, 12))
 
         # Suwaki nastaw
@@ -538,19 +787,21 @@ class PeltierControl:
         pid_hd = tk.Frame(inner, bg=C['bg2'])
         pid_hd.pack(fill='x', pady=(0, 8))
         tk.Label(pid_hd, text="PID", bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, 10, 'bold')).pack(side='left')
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
         self.btn_st = mk_btn(pid_hd, "SELF-TUNE", self.do_selftune, C['cyan'])
         self.btn_st.pack(side='right')
 
-        # Auto-kalibracja (pelna - 36 profili)
+        # Auto-kalibracja (pelna - wszystkie profile temp x rampa)
         cal_row = tk.Frame(inner, bg=C['bg2'])
         cal_row.pack(fill='x', pady=(0, 8))
-        self.btn_autocal = mk_btn(cal_row, "⚙ AUTO-KALIBRACJA (36 profili)",
+        self.btn_autocal = mk_btn(cal_row, "⚙ AUTO-KALIBRACJA",
                                   self.do_autocal, C['purple'], fg='#fff')
         self.btn_autocal.pack(fill='x')
+        # Status kalibracji - klikalny, otwiera okno postepu
         self.cal_status = tk.Label(inner, text="", bg=C['bg2'], fg=C['purple'],
-                                   font=(FONT, 8), anchor='w')
+                                   font=(FONT, fsz(8)), anchor='w', cursor='hand2')
         self.cal_status.pack(fill='x', pady=(0, 4))
+        self.cal_status.bind('<Button-1>', lambda e: self.open_cal_window())
 
         self.sl_kp = SliderField(inner, "Kp", 1, 30, 10.0, C['cyan'], "", 1,
                                  on_change=lambda v: self.send(f"KP:{v:.1f}"))
@@ -573,7 +824,7 @@ class PeltierControl:
                         highlightbackground=C['green'])
         auto.pack(fill='x', pady=(0, 12))
         tk.Label(auto, text="● AUTO: kierunek wg setpointu", bg=C['bg2'],
-                 fg=C['green'], font=(FONT, 9)).pack(padx=8, pady=6)
+                 fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
 
         # START / STOP
         bf = tk.Frame(inner, bg=C['bg2'])
@@ -597,12 +848,22 @@ class PeltierControl:
         mk_btn_outline(bf2, "WCZYT", lambda: self.send("LOAD"), C['cyan']).pack(
             side='left', fill='x', expand=True, padx=(3, 0))
 
+        # Kalibracja na dysk PC (trwala kopia)
+        bf3 = tk.Frame(inner, bg=C['bg2'])
+        bf3.pack(fill='x', pady=(0, 6))
+        mk_btn_outline(bf3, "⤓ ZAPISZ KALIBR. NA PC",
+                       lambda: self.dump_calibration_to_pc(silent=False),
+                       C['purple']).pack(side='left', fill='x', expand=True, padx=(0, 3))
+        mk_btn_outline(bf3, "⤒ WGRAJ Z PC",
+                       self._manual_load_cal, C['cyan']).pack(
+                       side='left', fill='x', expand=True, padx=(3, 0))
+
         # Reset nastaw
         mk_btn_outline(inner, "↺ RESET NASTAW", self.do_reset, C['dim']).pack(
             fill='x', pady=(0, 8))
 
         tk.Label(inner, text="▶ START uzywa wartosci z panelu",
-                 bg=C['bg2'], fg=C['green'], font=(FONT, 8)).pack(anchor='w', pady=(4, 0))
+                 bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
 
         self._set_panel_enabled(False)
 
@@ -667,18 +928,54 @@ class PeltierControl:
             self.send("SELFTUNE")
 
     def do_autocal(self):
-        """Pelna automatyczna kalibracja - 36 profili (temp x rampa)"""
+        """Pelna automatyczna kalibracja (temp x rampa)"""
         if not self.connected:
             messagebox.showwarning("Brak polaczenia", "Polacz sie z urzadzeniem.")
             return
         if messagebox.askyesno("Auto-Kalibracja",
                 "Uruchomic PELNA automatyczna kalibracje?\n\n"
-                "Przejdzie przez 36 kombinacji temperatura x rampa\n"
+                "Przejdzie przez wszystkie kombinacje temperatura x rampa\n"
                 "i dostroi PID dla kazdej. Zapisze do pamieci Flash.\n\n"
                 "UWAGA: trwa kilkadziesiat minut!\n"
                 "Mozna przerwac przyciskiem STOP."):
+            self.cal_running = True
+            self.cal_t0 = time.time()
+            self.cal_current = 0
             self.send("AUTOCAL")
-            self.cal_status.config(text="Kalibracja uruchomiona...")
+            self.cal_status.config(text="Kalibracja startuje... (kliknij by zobaczyc postep)")
+            # Otworz okno postepu automatycznie
+            self.root.after(500, self.open_cal_window)
+
+    def open_cal_window(self):
+        """Otworz okno postepu kalibracji"""
+        if not self.cal_plan and not self.cal_running:
+            messagebox.showinfo("Kalibracja",
+                "Kalibracja nie jest uruchomiona.\n"
+                "Kliknij AUTO-KALIBRACJA aby rozpoczac.")
+            return
+        # Jesli okno juz otwarte - tylko podnies
+        if hasattr(self, 'cal_win') and self.cal_win and tk._default_root:
+            try:
+                self.cal_win.win.lift()
+                return
+            except: pass
+        self.cal_win = CalibrationWindow(self.root, self)
+
+    def _refresh_cal_view(self):
+        """Odswiez okno kalibracji jesli otwarte + status w panelu"""
+        # Status w panelu glownym
+        if hasattr(self, 'cal_status'):
+            if self.cal_running and self.cal_total > 0:
+                eta = self._cal_eta()
+                eta_s = f" · ~{int(eta//60)}min" if eta else ""
+                self.cal_status.config(
+                    text=f"Kalibracja {self.cal_current}/{self.cal_total}{eta_s} (klik=szczegoly)")
+            elif self.cal_current >= self.cal_total and self.cal_total > 0:
+                self.cal_status.config(text="✓ Kalibracja zakonczona")
+        # Okno szczegolow
+        if hasattr(self, 'cal_win') and self.cal_win:
+            try: self.cal_win.refresh()
+            except: pass
 
     def open_profiles(self):
         """Okno edycji profili wieloetapowych"""
@@ -698,17 +995,17 @@ class PeltierControl:
         inner.pack(fill='x', padx=20, pady=16)
 
         tk.Label(inner, text="POLACZENIE SERIAL", bg=C['panel'], fg=C['text'],
-                 font=(FONT, 12, 'bold')).pack(anchor='w', pady=(0, 12))
+                 font=(FONT, fsz(12), 'bold')).pack(anchor='w', pady=(0, 12))
 
         tk.Label(inner, text="Dostepne porty:", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, 10)).pack(anchor='w')
+                 font=(FONT, fsz(10))).pack(anchor='w')
 
         lf = tk.Frame(inner, bg=C['panel'])
         lf.pack(fill='x', pady=8)
         sb = tk.Scrollbar(lf)
         sb.pack(side='right', fill='y')
         self.conn_list = tk.Listbox(lf, bg=C['bg2'], fg=C['text'],
-                                    font=(FONT, 10), height=6,
+                                    font=(FONT, fsz(10)), height=6,
                                     selectbackground=C['blue'], borderwidth=0,
                                     highlightthickness=1, highlightbackground=C['border'],
                                     yscrollcommand=sb.set, activestyle='none')
@@ -729,7 +1026,7 @@ class PeltierControl:
         ii = tk.Frame(info, bg=C['panel'])
         ii.pack(fill='x', padx=20, pady=16)
         tk.Label(ii, text="INSTRUKCJA", bg=C['panel'], fg=C['text'],
-                 font=(FONT, 11, 'bold')).pack(anchor='w', pady=(0, 8))
+                 font=(FONT, fsz(11), 'bold')).pack(anchor='w', pady=(0, 8))
         for line in [
             "1. Podlacz ItsyBitsy (firmware v19 PC MODE) przez USB",
             "2. Wybierz port COM z listy i kliknij POLACZ",
@@ -738,7 +1035,7 @@ class PeltierControl:
             "5. Wykres pokazuje przebieg na zywo, dane zapisuja sie do CSV",
         ]:
             tk.Label(ii, text=line, bg=C['panel'], fg=C['dim'],
-                     font=(FONT, 9), anchor='w').pack(anchor='w', pady=1)
+                     font=(FONT, fsz(9)), anchor='w').pack(anchor='w', pady=1)
 
         self.refresh_ports()
 
@@ -766,7 +1063,7 @@ class PeltierControl:
         hd = tk.Frame(wrap, bg=C['bg'])
         hd.pack(fill='x', pady=(0, 12))
         tk.Label(hd, text="ARCHIWUM CYKLI", bg=C['bg'], fg=C['text'],
-                 font=(FONT, 12, 'bold')).pack(side='left')
+                 font=(FONT, fsz(12), 'bold')).pack(side='left')
         mk_btn(hd, "ODSWIEZ", self.refresh_arch, C['cyan']).pack(side='right')
 
         body = tk.Frame(wrap, bg=C['bg'])
@@ -778,11 +1075,11 @@ class PeltierControl:
         lf.pack_propagate(False)
         tk.Frame(lf, bg=C['purple'], height=3).pack(fill='x')
         tk.Label(lf, text="ZAPISANE CYKLE", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, 10, 'bold')).pack(anchor='w', padx=12, pady=8)
+                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', padx=12, pady=8)
         sb = tk.Scrollbar(lf)
         sb.pack(side='right', fill='y')
         self.a_list = tk.Listbox(lf, bg=C['bg2'], fg=C['text'],
-                                font=(FONT, 9), selectbackground=C['purple'],
+                                font=(FONT, fsz(9)), selectbackground=C['purple'],
                                 borderwidth=0, highlightthickness=0,
                                 yscrollcommand=sb.set, activestyle='none')
         self.a_list.pack(side='left', fill='both', expand=True, padx=8, pady=(0, 8))
@@ -793,7 +1090,7 @@ class PeltierControl:
         cf = tk.Frame(body, bg=C['panel'])
         cf.pack(side='left', fill='both', expand=True)
         tk.Frame(cf, bg=C['border2'], height=3).pack(fill='x')
-        self.fig_a = Figure(figsize=(8, 6), facecolor=C['panel'])
+        self.fig_a = Figure(figsize=(8, 6), facecolor=C['panel'], dpi=110)
         self.ax_a = self.fig_a.add_subplot(111)
         self.ax_a.set_facecolor(C['panel2'])
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
@@ -934,11 +1231,14 @@ class PeltierControl:
         self.cyc_on = True
         self.cyc_t0 = time.time()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.cyc_fn = self.log_dir / f"cykl_{ts}.csv"
+        # Plik tymczasowy - nazwe nada uzytkownik po STOP
+        self.cyc_ts = ts
+        self.cyc_fn = self.log_dir / f"_tmp_cykl_{ts}.csv"
         self.cyc_file = open(self.cyc_fn, 'w', newline='', encoding='utf-8')
         self.cyc_wr = csv.writer(self.cyc_file)
         self.cyc_wr.writerow(['czas_s', 'temperatura_C', 'setpoint_aktywny',
                               'setpoint_cel', 'PWM', 'PWM_%', 'Kp', 'Ki', 'Kd', 'stan'])
+        self.cyc_rows = 0
         print(f"CYC START T={temp0:.1f}")
 
     def cyc_log(self, t, temp, sa, st, pwm, kp, ki, kd, state):
@@ -948,17 +1248,268 @@ class PeltierControl:
                                      f"{st:.2f}", pwm, f"{pwm*100/255:.1f}",
                                      f"{kp:.3f}", f"{ki:.4f}", f"{kd:.3f}", state])
                 self.cyc_file.flush()
+                self.cyc_rows += 1
             except: pass
 
     def cyc_stop(self, reason=""):
         if self.cyc_file:
             try: self.cyc_file.close()
             except: pass
+        had_data = self.cyc_on and getattr(self, 'cyc_rows', 0) > 0
+        tmp_path = self.cyc_fn
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
-        print(f"CYC STOP: {reason}")
+        print(f"CYC STOP: {reason} ({getattr(self,'cyc_rows',0)} próbek)")
+        # Zapytaj o nazwe i zapisz do archiwum (w watku GUI)
+        if had_data and tmp_path and tmp_path.exists():
+            self.root.after(0, lambda: self._ask_save_name(tmp_path))
+        elif tmp_path and tmp_path.exists():
+            # Brak danych - usun plik tymczasowy
+            try: tmp_path.unlink()
+            except: pass
+
+    def _ask_save_name(self, tmp_path):
+        """Okno z pytaniem o nazwe cyklu do archiwum"""
+        SaveCycleDialog(self.root, self, tmp_path)
+
+    def save_cycle_as(self, tmp_path, name):
+        """Zapisz cykl pod podana nazwa do archiwum"""
+        import re as _re
+        safe = _re.sub(r'[^\w\-]', '_', name.strip()) or "cykl"
+        ts = getattr(self, 'cyc_ts', datetime.now().strftime("%Y%m%d_%H%M%S"))
+        dest = self.log_dir / f"cykl_{safe}_{ts}.csv"
+        try:
+            tmp_path.rename(dest)
+            print(f"Zapisano cykl: {dest.name}")
+        except Exception as e:
+            print(f"Blad zapisu: {e}")
         if hasattr(self, 'refresh_arch'):
             try: self.refresh_arch()
             except: pass
+
+    def discard_cycle(self, tmp_path):
+        """Odrzuc cykl - usun plik tymczasowy"""
+        try:
+            if tmp_path.exists(): tmp_path.unlink()
+            print("Cykl odrzucony")
+        except: pass
+
+
+# ════════════════════════════════════════════════════════
+#  OKNO POSTĘPU KALIBRACJI
+# ════════════════════════════════════════════════════════
+class CalibrationWindow:
+    def __init__(self, parent, app):
+        self.app = app
+        self.win = tk.Toplevel(parent)
+        self.win.title("Postęp kalibracji")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("560x640")
+        self.win.transient(parent)
+
+        tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
+        inner = tk.Frame(self.win, bg=C['bg'])
+        inner.pack(fill='both', expand=True, padx=20, pady=16)
+
+        tk.Label(inner, text="POSTĘP KALIBRACJI", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+
+        # Pasek postepu
+        self.prog_frame = tk.Frame(inner, bg=C['bg2'], height=32)
+        self.prog_frame.pack(fill='x', pady=(12, 4))
+        self.prog_frame.pack_propagate(False)
+        self.prog_bar = tk.Frame(self.prog_frame, bg=C['purple'], height=32)
+        self.prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
+        self.prog_text = tk.Label(self.prog_frame, text="0 / 0", bg=C['bg2'],
+                                  fg=C['text'], font=(FONT, fsz(11), 'bold'))
+        self.prog_text.place(relx=0.5, rely=0.5, anchor='center')
+
+        # Info: aktualny / nastepny / ETA
+        info = tk.Frame(inner, bg=C['panel'])
+        info.pack(fill='x', pady=(8, 12))
+        ii = tk.Frame(info, bg=C['panel'])
+        ii.pack(fill='x', padx=14, pady=10)
+
+        row1 = tk.Frame(ii, bg=C['panel']); row1.pack(fill='x', pady=2)
+        tk.Label(row1, text="TERAZ:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
+        self.lbl_now = tk.Label(row1, text="—", bg=C['panel'], fg=C['orange'],
+                                font=(FONT, fsz(11), 'bold'), anchor='w')
+        self.lbl_now.pack(side='left')
+
+        row2 = tk.Frame(ii, bg=C['panel']); row2.pack(fill='x', pady=2)
+        tk.Label(row2, text="NASTĘPNY:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
+        self.lbl_next = tk.Label(row2, text="—", bg=C['panel'], fg=C['cyan'],
+                                 font=(FONT, fsz(11)), anchor='w')
+        self.lbl_next.pack(side='left')
+
+        row3 = tk.Frame(ii, bg=C['panel']); row3.pack(fill='x', pady=2)
+        tk.Label(row3, text="POZOSTAŁO:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
+        self.lbl_eta = tk.Label(row3, text="—", bg=C['panel'], fg=C['yellow'],
+                                font=(FONT, fsz(11), 'bold'), anchor='w')
+        self.lbl_eta.pack(side='left')
+
+        # Lista krokow
+        tk.Label(inner, text="WSZYSTKIE KROKI", bg=C['bg'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(4, 4))
+
+        list_wrap = tk.Frame(inner, bg=C['bg2'])
+        list_wrap.pack(fill='both', expand=True)
+        sb = tk.Scrollbar(list_wrap)
+        sb.pack(side='right', fill='y')
+        self.canvas = tk.Canvas(list_wrap, bg=C['bg2'], highlightthickness=0,
+                               yscrollcommand=sb.set)
+        self.canvas.pack(side='left', fill='both', expand=True)
+        sb.config(command=self.canvas.yview)
+        self.steps_frame = tk.Frame(self.canvas, bg=C['bg2'])
+        self.canvas.create_window((0, 0), window=self.steps_frame, anchor='nw')
+        self.steps_frame.bind('<Configure>',
+            lambda e: self.canvas.config(scrollregion=self.canvas.bbox('all')))
+
+        # Przycisk przerwij
+        mk_btn_outline(inner, "■ PRZERWIJ KALIBRACJĘ", self.abort, C['red']).pack(
+            fill='x', pady=(12, 0))
+
+        self.step_widgets = []
+        self.refresh()
+
+    def refresh(self):
+        app = self.app
+        total = app.cal_total or len(app.cal_plan)
+        cur = app.cal_current
+
+        # Pasek
+        frac = (cur / total) if total else 0
+        self.prog_bar.place_configure(relwidth=frac)
+        self.prog_text.config(text=f"{cur} / {total}")
+
+        # Teraz
+        if app.cal_cur_temp is not None and app.cal_cur_ramp is not None:
+            self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C @ {app.cal_cur_ramp:.0f}°C/min")
+        # Nastepny
+        if cur < len(app.cal_plan):
+            nt, nr = app.cal_plan[cur] if cur < len(app.cal_plan) else (None, None)
+            if nt is not None:
+                self.lbl_next.config(text=f"{nt:.0f}°C @ {nr:.0f}°C/min")
+        else:
+            self.lbl_next.config(text="(ostatni krok)")
+        # ETA
+        eta = app._cal_eta()
+        if eta is not None:
+            m = int(eta // 60); s = int(eta % 60)
+            self.lbl_eta.config(text=f"~{m} min {s} s")
+        elif cur >= total and total > 0:
+            self.lbl_eta.config(text="ZAKOŃCZONO ✓")
+
+        # Lista krokow - buduj raz, potem aktualizuj kolory
+        if len(self.step_widgets) != len(app.cal_plan):
+            for w in self.steps_frame.winfo_children():
+                w.destroy()
+            self.step_widgets = []
+            for i, (t, r) in enumerate(app.cal_plan):
+                row = tk.Frame(self.steps_frame, bg=C['bg2'])
+                row.pack(fill='x', pady=1)
+                bar = tk.Frame(row, bg=C['bg2'], width=4)
+                bar.pack(side='left', fill='y')
+                num = tk.Label(row, text=f"{i+1:2d}", bg=C['bg2'], fg=C['dim2'],
+                              font=(FONT, fsz(9)), width=4, anchor='w')
+                num.pack(side='left')
+                txt = tk.Label(row, text=f"{t:.0f}°C  @  {r:.0f}°C/min",
+                              bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(10)), anchor='w')
+                txt.pack(side='left', fill='x', expand=True)
+                stat = tk.Label(row, text="", bg=C['bg2'], fg=C['dim2'],
+                               font=(FONT, fsz(9)), anchor='e', width=12)
+                stat.pack(side='right')
+                self.step_widgets.append((bar, num, txt, stat))
+
+        # Aktualizuj kolory/statusy
+        for i, (bar, num, txt, stat) in enumerate(self.step_widgets):
+            step_no = i + 1
+            if step_no < cur:
+                bar.config(bg=C['green']); txt.config(fg=C['dim2'])
+                num.config(fg=C['green']); stat.config(text="✓ gotowe", fg=C['green'])
+            elif step_no == cur:
+                bar.config(bg=C['orange']); txt.config(fg=C['text'])
+                num.config(fg=C['orange']); stat.config(text="● TERAZ", fg=C['orange'])
+                # Przewin do aktualnego
+                try: self.canvas.yview_moveto(max(0, (i-3))/max(1,len(self.step_widgets)))
+                except: pass
+            else:
+                bar.config(bg=C['bg2']); txt.config(fg=C['dim'])
+                num.config(fg=C['dim2']); stat.config(text="oczekuje", fg=C['dim2'])
+
+    def abort(self):
+        if messagebox.askyesno("Przerwać?", "Przerwać kalibrację?"):
+            self.app.send("AUTOCALSTOP")
+            self.app.send("STOP")
+            self.app.cal_running = False
+            self.win.destroy()
+
+
+# ════════════════════════════════════════════════════════
+#  DIALOG ZAPISU CYKLU
+# ════════════════════════════════════════════════════════
+class SaveCycleDialog:
+    def __init__(self, parent, app, tmp_path):
+        self.app = app
+        self.tmp_path = tmp_path
+        self.win = tk.Toplevel(parent)
+        self.win.title("Zapisz cykl")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("440x230")
+        self.win.transient(parent)
+        self.win.grab_set()  # modalne
+
+        tk.Frame(self.win, bg=C['green'], height=4).pack(fill='x')
+        inner = tk.Frame(self.win, bg=C['bg'])
+        inner.pack(fill='both', expand=True, padx=24, pady=20)
+
+        tk.Label(inner, text="ZAPISZ CYKL DO ARCHIWUM", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(13), 'bold')).pack(anchor='w')
+
+        # Info ile probek
+        rows = getattr(app, 'cyc_rows', 0)
+        tk.Label(inner, text=f"Zarejestrowano {rows} próbek pomiarowych",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(4, 16))
+
+        tk.Label(inner, text="Nazwa cyklu:", bg=C['bg'], fg=C['dim'],
+                 font=(FONT, fsz(10))).pack(anchor='w')
+        self.entry = tk.Entry(inner, bg=C['bg2'], fg=C['text'],
+                              font=(FONT, fsz(12)), relief='flat', bd=0,
+                              insertbackground=C['green'],
+                              highlightthickness=2, highlightbackground=C['green'],
+                              highlightcolor=_lighten(C['green'], 0.2))
+        self.entry.pack(fill='x', ipady=6, pady=(4, 16))
+        # Domyslna nazwa
+        default = datetime.now().strftime("test_%H%M")
+        self.entry.insert(0, default)
+        self.entry.select_range(0, 'end')
+        self.entry.focus()
+        self.entry.bind('<Return>', lambda e: self.save())
+
+        # Przyciski
+        bf = tk.Frame(inner, bg=C['bg'])
+        bf.pack(fill='x')
+        mk_btn(bf, "ZAPISZ", self.save, C['green']).pack(side='left', fill='x',
+                                                          expand=True, padx=(0, 4))
+        mk_btn_outline(bf, "ODRZUĆ", self.discard, C['red']).pack(side='left',
+                                                          fill='x', expand=True, padx=(4, 0))
+
+        self.win.protocol("WM_DELETE_WINDOW", self.save)  # zamkniecie = zapisz
+
+    def save(self):
+        name = self.entry.get().strip()
+        if not name:
+            name = datetime.now().strftime("cykl_%H%M")
+        self.app.save_cycle_as(self.tmp_path, name)
+        self.win.destroy()
+
+    def discard(self):
+        if messagebox.askyesno("Odrzucić?",
+                "Na pewno odrzucić ten cykl?\nDane zostaną bezpowrotnie usunięte."):
+            self.app.discard_cycle(self.tmp_path)
+            self.win.destroy()
 
 
 # ════════════════════════════════════════════════════════
@@ -977,7 +1528,7 @@ class ProfileWindow:
         hd = tk.Frame(self.win, bg=C['bg'])
         hd.pack(fill='x', padx=16, pady=12)
         tk.Label(hd, text="PROFILE WIELOETAPOWE", bg=C['bg'], fg=C['text'],
-                 font=(FONT, 12, 'bold')).pack(side='left')
+                 font=(FONT, fsz(12), 'bold')).pack(side='left')
 
         # Tabela etapow
         self.rows_frame = tk.Frame(self.win, bg=C['bg'])
@@ -988,7 +1539,7 @@ class ProfileWindow:
         h.pack(fill='x', pady=(0, 4))
         for txt, w in [("#", 3), ("TEMP °C", 10), ("RAMPA", 8), ("CZAS min", 10), ("", 6)]:
             tk.Label(h, text=txt, bg=C['bg'], fg=C['dim2'],
-                     font=(FONT, 9), width=w, anchor='w').pack(side='left')
+                     font=(FONT, fsz(9)), width=w, anchor='w').pack(side='left')
 
         self.steps_container = tk.Frame(self.rows_frame, bg=C['bg'])
         self.steps_container.pack(fill='both', expand=True)
@@ -1000,17 +1551,17 @@ class ProfileWindow:
         ai = tk.Frame(addf, bg=C['panel'])
         ai.pack(fill='x', padx=12, pady=10)
         tk.Label(ai, text="DODAJ ETAP:", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, 9)).pack(side='left', padx=(0, 8))
+                 font=(FONT, fsz(9))).pack(side='left', padx=(0, 8))
         self.e_temp = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['orange'],
-                               font=(FONT, 10), justify='center', relief='flat',
+                               font=(FONT, fsz(10)), justify='center', relief='flat',
                                highlightthickness=1, highlightbackground=C['border'])
         self.e_temp.pack(side='left', padx=2); self.e_temp.insert(0, "40")
         self.e_ramp = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['yellow'],
-                               font=(FONT, 10), justify='center', relief='flat',
+                               font=(FONT, fsz(10)), justify='center', relief='flat',
                                highlightthickness=1, highlightbackground=C['border'])
         self.e_ramp.pack(side='left', padx=2); self.e_ramp.insert(0, "2.0")
         self.e_time = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['dim'],
-                               font=(FONT, 10), justify='center', relief='flat',
+                               font=(FONT, fsz(10)), justify='center', relief='flat',
                                highlightthickness=1, highlightbackground=C['border'])
         self.e_time.pack(side='left', padx=2); self.e_time.insert(0, "10")
         mk_btn(ai, "+ DODAJ", self.add_step, C['green']).pack(side='left', padx=(8, 0))
@@ -1046,15 +1597,15 @@ class ProfileWindow:
             r.pack(fill='x', pady=2)
             tk.Frame(r, bg=C['orange'], width=4).pack(side='left', fill='y')
             tk.Label(r, text=str(i+1), bg=C['bg2'], fg=C['text'],
-                     font=(FONT, 10, 'bold'), width=3, anchor='w').pack(side='left', padx=(6,0))
+                     font=(FONT, fsz(10), 'bold'), width=3, anchor='w').pack(side='left', padx=(6,0))
             tk.Label(r, text=f"{s['temp']:.0f}", bg=C['bg2'], fg=C['orange'],
-                     font=(FONT, 10), width=10, anchor='w').pack(side='left')
+                     font=(FONT, fsz(10)), width=10, anchor='w').pack(side='left')
             tk.Label(r, text=f"{s['ramp']:.1f}", bg=C['bg2'], fg=C['yellow'],
-                     font=(FONT, 10), width=8, anchor='w').pack(side='left')
+                     font=(FONT, fsz(10)), width=8, anchor='w').pack(side='left')
             tk.Label(r, text=f"{s['time']:.0f}", bg=C['bg2'], fg=C['dim'],
-                     font=(FONT, 10), width=10, anchor='w').pack(side='left')
+                     font=(FONT, fsz(10)), width=10, anchor='w').pack(side='left')
             tk.Button(r, text="USUN", command=lambda idx=i: self.del_step(idx),
-                      bg=C['bg2'], fg=C['red'], font=(FONT, 8, 'bold'),
+                      bg=C['bg2'], fg=C['red'], font=(FONT, fsz(8), 'bold'),
                       relief='flat', cursor='hand2', bd=0,
                       activebackground=C['panel3']).pack(side='left', padx=4)
 
@@ -1092,8 +1643,50 @@ class ProfileWindow:
 # ════════════════════════════════════════════════════════
 #  MAIN
 # ════════════════════════════════════════════════════════
+def _enable_dpi_awareness():
+    """Wlacz DPI awareness na Windows - eliminuje rozmyty tekst przy skalowaniu 125%/150%."""
+    if sys.platform != 'win32':
+        return 1.0
+    try:
+        import ctypes
+        # Per-Monitor DPI Aware v2 (Windows 10 1703+) - najlepsza ostrosc
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            # Fallback dla starszych Windows
+            ctypes.windll.user32.SetProcessDPIAware()
+        # Odczytaj rzeczywiste skalowanie
+        try:
+            hdc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+            return dpi / 96.0
+        except Exception:
+            return 1.0
+    except Exception:
+        return 1.0
+
+
 def main():
+    # WAZNE: DPI awareness PRZED utworzeniem okna - daje ostry tekst
+    scale = _enable_dpi_awareness()
+
+    # Ustaw globalny mnoznik fontow wg DPI (ostre I czytelne)
+    global FS
+    if scale and scale > 1.05:
+        FS = scale  # np. 1.25 dla 125%, 1.5 dla 150%
+    else:
+        FS = 1.0
+
     root = tk.Tk()
+
+    # Tk scaling dla widgetow ttk (Notebook itp.)
+    try:
+        if scale and scale > 1.05:
+            root.tk.call('tk', 'scaling', scale)
+    except Exception:
+        pass
+
     app = PeltierControl(root)
 
     def on_close():
