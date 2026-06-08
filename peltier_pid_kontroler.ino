@@ -81,7 +81,7 @@ struct Prof {
   float Kp_c,Ki_c,Kd_c;
   bool  valid;
 };
-struct FD { bool cal; Prof p[P_TOT]; float ru,rd,tm; };
+struct FD { bool cal; Prof p[P_TOT]; float ru,rd,tm; bool polSet; bool polSw; float calMin,calMax; };
 FlashStorage(pidFlash,FD);
 
 Adafruit_MAX31856 tc=Adafruit_MAX31856(PIN_CS_TC);
@@ -130,6 +130,7 @@ int slI=0;bool slF=false;unsigned long slT=0;
 String slSt="";
 
 bool polSw=false;
+bool polSet=false;  // czy polaryzacja zostala juz wykryta (zapisana we Flash)
 
 enum St{MAN,AUTO,COOL,RTEST,CAL};
 St sys=MAN;
@@ -201,8 +202,9 @@ void ldProf(float temp,float ramp){
   }
 }
 
-void savF(){FD fd;fd.cal=calDone;for(int i=0;i<P_TOT;i++) fd.p[i]=prof[i];fd.ru=rU;fd.rd=rD;fd.tm=tMax;pidFlash.write(fd);Serial.println("Flash: zapisano.");}
-void ldF(){FD fd;pidFlash.read(fd);if(fd.cal){calDone=true;for(int i=0;i<P_TOT;i++) prof[i]=fd.p[i];rU=fd.ru;rD=fd.rd;tMax=fd.tm;Serial.println("Flash: wczytano.");}}
+void savF(){FD fd;fd.cal=calDone;for(int i=0;i<P_TOT;i++) fd.p[i]=prof[i];fd.ru=rU;fd.rd=rD;fd.tm=tMax;fd.polSet=polSet;fd.polSw=polSw;fd.calMin=cTmn;fd.calMax=cTmx;pidFlash.write(fd);Serial.println("Flash: zapisano.");}
+void ldF(){FD fd;pidFlash.read(fd);if(fd.cal){calDone=true;for(int i=0;i<P_TOT;i++) prof[i]=fd.p[i];rU=fd.ru;rD=fd.rd;tMax=fd.tm;Serial.println("Flash: wczytano.");}if(fd.polSet){polSet=true;polSw=fd.polSw;}if(fd.calMin>=0&&fd.calMin<fd.calMax&&fd.calMax<=115){cTmn=fd.calMin;cTmx=fd.calMax;}}
+void savePol(){FD fd;pidFlash.read(fd);fd.polSet=true;fd.polSw=polSw;pidFlash.write(fd);}
 void rst(){calDone=false;for(int i=0;i<P_TOT;i++) prof[i]={10,0.3f,0.8f,10,0.3f,0.3f,false};Kp_h=Kp_c=Kp=10;Ki_h=Ki_c=Ki=0.3f;Kd_h=0.8f;Kd_c=Kd=0.3f;rU=rD=2;tMax=TEMP_MAX_DEF;ig=0;pe=0;Serial.println("Reset.");}
 
 void wPwm(int o){lPwm=o;int h=o>0?o:0,c=o<0?-o:0;if(!polSw){analogWrite(PIN_M1A,h);analogWrite(PIN_M1B,c);}else{analogWrite(PIN_M1A,c);analogWrite(PIN_M1B,h);}}
@@ -382,6 +384,7 @@ void detPol(){
   polSw=false;analogWrite(PIN_M1A,80);analogWrite(PIN_M1B,0);delay(4000);
   float t1=tc.readThermocoupleTemperature();analogWrite(PIN_M1A,0);analogWrite(PIN_M1B,0);
   float d=t1-t0;if(d>=0.3f) polSw=false;else if(d<=-0.3f) polSw=true;
+  polSet=true; savePol();  // zapisz polaryzacje na zawsze we Flash
   oled.clearBuffer();oled.setFont(u8g2_font_7x13B_tf);
   int nw=oled.getStrWidth(polSw?"SWAPPED":"NORMAL");oled.drawStr((128-nw)/2,28,polSw?"SWAPPED":"NORMAL");
   oled.setFont(u8g2_font_6x10_tf);char b[20];sprintf(b,"dT=%.2fC",d);
@@ -727,8 +730,15 @@ void setup(){
   oled.drawStr(8,48,"BTN2 = start");oled.drawStr(8,60,"hold BTN1 = menu");oled.sendBuffer();delay(1500);
   delay(200);float rt=tc.readThermocoupleTemperature();
   if(!isnan(rt)&&rt>-50&&rt<150){lT=rt;for(int i=0;i<TF;i++) tfB[i]=rt;}
-  detPol();rt=tc.readThermocoupleTemperature();if(!isnan(rt)&&rt>-50&&rt<150) lT=rt;
-  spA=spT=lT;ldF();
+  ldF();  // wczytaj Flash (w tym zapisana polaryzacje) PRZED detPol
+  if(!polSet){
+    // Polaryzacja jeszcze nie wykryta - wykryj raz i zapisz na zawsze
+    detPol();
+    rt=tc.readThermocoupleTemperature();if(!isnan(rt)&&rt>-50&&rt<150) lT=rt;
+  } else {
+    Serial.println(polSw?"Pol:swapped (z Flash)":"Pol:normal (z Flash)");
+  }
+  spA=spT=lT;
   Serial.println("czas_s,temp_C,setpoint_akt,setpoint_cel,PWM,Kp,Ki,Kd,stan");
   Serial.print("Start T=");Serial.println(lT,1);
   Serial.println("PC MODE - sterowanie z aplikacji");
@@ -752,6 +762,10 @@ void sendCfg(){
   Serial.print(",STATE=");
   Serial.print(sys==AUTO?"AUTO":sys==COOL?"COOL":sys==CAL?"CAL":sys==RTEST?"RTEST":"MAN");
   Serial.print(",CAL=");Serial.print(calDone?1:0);
+  Serial.print(",POL=");Serial.print(polSw?1:0);
+  Serial.print(",POLSET=");Serial.print(polSet?1:0);
+  Serial.print(",CALMIN=");Serial.print(cTmn,0);
+  Serial.print(",CALMAX=");Serial.print(cTmx,0);
   Serial.println();
 }
 
@@ -788,10 +802,35 @@ void procCmd(String c){
   else if(key=="SELFTUNE"){ if(sys==AUTO) stStart(); }
   else if(key=="SELFTUNESTOP"){ if(stOn) stStop(); }
   else if(key=="AUTOCAL"){
-    // Pelna automatyczna kalibracja wszystkich profili (36 punktow)
+    // Pelna automatyczna kalibracja wszystkich profili
     sys=CAL; cPh=-1;
     stCalR();  // start kalibracji od razu
     Serial.println("AUTOCAL START");
+  }
+  else if(key=="CALRANGE"){
+    // CALRANGE:30,80 - ustaw zakres kalibracji (temp od, temp do)
+    int cm=val.indexOf(',');
+    if(cm>0){
+      float lo=val.substring(0,cm).toFloat();
+      float hi=val.substring(cm+1).toFloat();
+      lo=constrain(lo,(float)TEMP_MIN_C,100.0f);
+      hi=constrain(hi,lo+10.0f,115.0f);
+      cTmn=lo; cTmx=hi;
+      savF();  // zapisz zakres
+      Serial.print("CALRANGE set: ");Serial.print(cTmn,0);
+      Serial.print("-");Serial.println(cTmx,0);
+    }
+  }
+  else if(key=="REPOL"){
+    // Wymus ponowne wykrycie polaryzacji
+    polSet=false;
+    detPol();
+    Serial.println("Polaryzacja wykryta ponownie");
+  }
+  else if(key=="SETPOL"){
+    // SETPOL:0 lub SETPOL:1 - reczne ustawienie polaryzacji
+    polSw=(val.toInt()>0); polSet=true; savePol();
+    Serial.println(polSw?"Pol:swapped (reczne)":"Pol:normal (reczne)");
   }
   else if(key=="AUTOCALSTOP"){
     if(sys==CAL){ stpPel(); sys=MAN; Serial.println("AUTOCAL ABORTED"); }
