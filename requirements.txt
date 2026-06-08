@@ -1,23 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
+# Zaleznosci PeltierControl
+# tkinter jest wbudowany w Pythona (Windows/macOS) - nie wymaga instalacji
+# Na Linux: sudo apt install python3-tk
 
-# PyInstaller
-build/
-dist/
-*.spec
-
-# Logi aplikacji
-PeltierLogi/
-cykl_*.csv
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
+pyserial>=3.5
+matplotlib>=3.5
