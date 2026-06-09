@@ -61,6 +61,12 @@
 
 // Cooldown
 #define CD_TARGET   10.0f
+// FREEZE: utrzymanie galu w stanie stalym do wymiany probki.
+// Gal (galinstan) topi sie ~30C; trzymamy 20C z marginesem.
+#define FREEZE_TARGET   20.0f   // docelowa temp galu (stan staly)
+#define FREEZE_RAMP     6.0f    // lagodna rampa zejscia [C/min] (~2-3 min z 36->20)
+#define FREEZE_TOL      0.8f    // tolerancja "stabilny" [C]
+#define FREEZE_STABLE_MS 8000   // ile ms w tolerancji = "gal staly, gotowy"
 #define CD_RAMP      5.0f
 #define CD_TIMEOUT  120000UL
 
@@ -138,7 +144,9 @@ String slSt="";
 bool polSw=false;
 bool polSet=false;  // czy polaryzacja zostala juz wykryta (zapisana we Flash)
 
-enum St{MAN,AUTO,COOL,RTEST,CAL};
+enum St{MAN,AUTO,COOL,RTEST,CAL,FREEZE};
+unsigned long frzStableT=0;  // od kiedy gal jest stabilny
+bool frzReady=false;          // czy gal osiagnal staly stan
 St sys=MAN;
 
 // Test rampy
@@ -626,6 +634,7 @@ void drwMain(float temp){
   oled.setFont(u8g2_font_6x10_tf);
   if(sys==AUTO){ oled.drawBox(106,0,22,11); oled.setDrawColor(0); oled.drawStr(109,9,"ON"); oled.setDrawColor(1); }
   else if(sys==COOL){ oled.drawFrame(100,0,28,11); oled.drawStr(102,9,"CLD"); }
+  else if(sys==FREEZE){ if(frzReady){oled.drawBox(94,0,34,11);oled.setDrawColor(0);oled.drawStr(96,9,"SOLID");oled.setDrawColor(1);}else{oled.drawFrame(96,0,32,11);oled.drawStr(98,9,"FRZ");} }
   else { oled.drawFrame(104,0,24,11); oled.drawStr(107,9,"OFF"); }
 
   // ── TEMPERATURA (y=12-32): duza czcionka, wlasna linia ──
@@ -766,7 +775,7 @@ void sendCfg(){
   Serial.print(",KD=");Serial.print(Kd,3);
   Serial.print(",OFFSET=");Serial.print(calOffset,2);
   Serial.print(",STATE=");
-  Serial.print(sys==AUTO?"AUTO":sys==COOL?"COOL":sys==CAL?"CAL":sys==RTEST?"RTEST":"MAN");
+  Serial.print(sys==AUTO?"AUTO":sys==COOL?"COOL":sys==CAL?"CAL":sys==RTEST?"RTEST":sys==FREEZE?"FREEZE":"MAN");
   Serial.print(",CAL=");Serial.print(calDone?1:0);
   Serial.print(",POL=");Serial.print(polSw?1:0);
   Serial.print(",POLSET=");Serial.print(polSet?1:0);
@@ -805,6 +814,17 @@ void procCmd(String c){
     else { stpPel();sys=MAN;Serial.println("STOP"); }
   }
   else if(key=="ESTOP"){ wPwm(0);stpPel();sys=MAN;stOn=false;Serial.println("E-STOP"); }
+  else if(key=="FREEZE"){
+    // Tryb zamrazania galu - lagodne zejscie do FREEZE_TARGET i AKTYWNE utrzymanie.
+    // Nie wylacza Peltiera (zapobiega odbiciu ciepla i ponownemu stopieniu galu).
+    sys=FREEZE; spT=FREEZE_TARGET; spA=lT; ig=0; pe=0; slT=0;
+    rU=rD=FREEZE_RAMP; stOn=false; frzReady=false; frzStableT=0;
+    Serial.print("FREEZE START -> target ");Serial.print(FREEZE_TARGET,0);
+    Serial.println("C (gal solid)");
+  }
+  else if(key=="FREEZESTOP"){
+    if(sys==FREEZE){ stpPel();sys=MAN;frzReady=false;Serial.println("FREEZE stopped"); }
+  }
   else if(key=="SELFTUNE"){ if(sys==AUTO) stStart(); }
   else if(key=="SELFTUNESTOP"){ if(stOn) stStop(); }
   else if(key=="AUTOCAL"){
@@ -969,6 +989,30 @@ void loop(){
         Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
         Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);Serial.println(",COOLDOWN");
         break;
+      case FREEZE: {
+        // Lagodna rampa setpointu w dol do FREEZE_TARGET
+        updRamp();
+        // AKTYWNE utrzymanie - PID caly czas pracuje, NIE wylaczamy Peltiera.
+        // To kluczowe: po wylaczeniu cieplo z radiatora odbilo by gal do plynnego.
+        setPwr(compPID(temp));
+        // Wykryj czy gal jest stabilnie zimny (gotowy do wymiany probki)
+        if(fabs(temp-FREEZE_TARGET)<=FREEZE_TOL){
+          if(frzStableT==0) frzStableT=now;
+          else if(!frzReady && (now-frzStableT)>=FREEZE_STABLE_MS){
+            frzReady=true;
+            Serial.println("FREEZE READY - gal solid, mozna wymienic probke");
+          }
+        } else {
+          frzStableT=0;  // wyszlo z tolerancji - reset licznika
+          if(frzReady){ frzReady=false; }
+        }
+        Serial.print(now/1000.0f,1);Serial.print(",");Serial.print(temp,2);Serial.print(",");
+        Serial.print(spA,2);Serial.print(",");Serial.print(FREEZE_TARGET,1);Serial.print(",");
+        Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
+        Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);
+        Serial.println(frzReady?",FREEZE_READY":",FREEZE");
+        break;
+      }
       case MAN:
         stpPel();
         // Wysylaj dane nawet w trybie MAN - logger widzi temperature na zywo
