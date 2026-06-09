@@ -76,6 +76,12 @@
 const float PT[PT_N]={20,30,40,50,60,70,80,90,100};
 const float PR[PR_N]={2,5,10,20};
 
+// Konfigurowalna lista ramp do kalibracji (ustawiana z aplikacji).
+// Domyslnie = PR. Maksymalnie 10 ramp.
+#define CAL_RAMP_MAX 10
+float calRamps[CAL_RAMP_MAX]={2,5,10,20};
+int   calRampN=4;  // ile ramp aktywnych
+
 struct Prof {
   float Kp_h,Ki_h,Kd_h;
   float Kp_c,Ki_c,Kd_c;
@@ -405,25 +411,25 @@ void stCalR(){
   bldCP();cTi=cRi=cPh=cIt=0;cPT=millis();cBH=cBC=999;
   cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;
   for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;cLI=0;ig=0;pe=0;
-  spT=cTP[0];spA=lT;rU=rD=PR[cRi];int tot=cTN*PR_N;char b[24];sprintf(b,"Start 1/%d",tot);cSt=String(b);
+  spT=cTP[0];spA=lT;rU=rD=calRamps[cRi];int tot=cTN*calRampN;char b[24];sprintf(b,"Start 1/%d",tot);cSt=String(b);
   Serial.println("=== KAL. START ===");
   // Wyslij plan kalibracji dla aplikacji: CALPLAN:tot,temps=...,ramps=...
   Serial.print("CALPLAN:");Serial.print(tot);
   Serial.print(",temps=");
   for(int i=0;i<cTN;i++){Serial.print(cTP[i],0);if(i<cTN-1)Serial.print("/");}
   Serial.print(",ramps=");
-  for(int i=0;i<PR_N;i++){Serial.print(PR[i],0);if(i<PR_N-1)Serial.print("/");}
+  for(int i=0;i<calRampN;i++){Serial.print(calRamps[i],0);if(i<calRampN-1)Serial.print("/");}
   Serial.println();
 }
-void savCP(){int ti=nTi(cTP[cTi]),idx=pi_(ti,cRi);prof[idx]={cKpH,cKiH,cKdH,cKpC,cKiC,cKdC,true};
-  Serial.print("Prof T=");Serial.print(cTP[cTi],0);Serial.print(" R=");Serial.print(PR[cRi],0);Serial.print(" Kph=");Serial.println(cKpH,1);}
+void savCP(){int ti=nTi(cTP[cTi]),idx=pi_(ti,nRi(calRamps[cRi]));prof[idx]={cKpH,cKiH,cKdH,cKpC,cKiC,cKdC,true};
+  Serial.print("Prof T=");Serial.print(cTP[cTi],0);Serial.print(" R=");Serial.print(calRamps[cRi],0);Serial.print(" Kph=");Serial.println(cKpH,1);}
 void nxtCS(){
-  savCP();cRi++;if(cRi>=PR_N){cRi=0;cTi++;}
-  int tot=cTN*PR_N,done=cTi*PR_N+cRi;
+  savCP();cRi++;if(cRi>=calRampN){cRi=0;cTi++;}
+  int tot=cTN*calRampN,done=cTi*calRampN+cRi;
   if(cTi>=cTN){calDone=true;savF();sys=MAN;stpPel();char b[24];sprintf(b,"DONE %d/%d",tot,tot);cSt=String(b);Serial.println("=== KAL. ZAKONCZONA ===");return;}
   cPh=0;cPT=millis();cIt=0;cBH=cBC=999;cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;
   for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;cLI=0;
-  spT=cTP[cTi];rU=rD=PR[cRi];spA=lT;ig=0;pe=0;
+  spT=cTP[cTi];rU=rD=calRamps[cRi];spA=lT;ig=0;pe=0;
   char b[24];sprintf(b,"Krok %d/%d",done+1,tot);cSt=String(b);
 }
 // ── KALIBRACJA ────────────────────────────────────────────
@@ -463,7 +469,7 @@ void runCal(float temp){
       cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;
       for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;
       ig=0;pe=0;
-      rU=rD=PR[cRi];
+      rU=rD=calRamps[cRi];
       // Cel: +10C w gore (lub -10C jesli za blisko tMax)
       if(cTP[cTi]+10<=tMax-5) spT=cTP[cTi]+10;
       else spT=cTP[cTi]-10;
@@ -537,14 +543,14 @@ void runCal(float temp){
         if(ae<cBC){cBC=ae;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;}
       }
 
-      int tot=cTN*PR_N,done=cTi*PR_N+cRi+1;
+      int tot=cTN*calRampN,done=cTi*calRampN+cRi+1;
       char b[32];
       sprintf(b,"%d/%d i%d e%.1f",done,tot,cIt,err);
       cSt=String(b);
       // Status kalibracji dla aplikacji PC
       Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
       Serial.print(tot);Serial.print(",T=");Serial.print(cTP[cTi],0);
-      Serial.print(",R=");Serial.println(PR[cRi],0);
+      Serial.print(",R=");Serial.println(calRamps[cRi],0);
 
       // Log CSV
       Serial.print(now/1000.0f,1);Serial.print(",");
@@ -677,14 +683,14 @@ void drwCalR(){
 void drwCal(float temp){
   if(cPh==-1){drwCalR();return;}
   oled.clearBuffer();oled.setFont(u8g2_font_6x10_tf);
-  int tot=cTN*PR_N,done=cTi*PR_N+cRi;oled.drawStr(0,9,"CALIBRATION");
+  int tot=cTN*calRampN,done=cTi*calRampN+cRi;oled.drawStr(0,9,"CALIBRATION");
   int pg=(tot>0)?done*56/tot:0;oled.drawFrame(70,2,58,8);if(pg>0) oled.drawBox(71,3,min(pg,56),6);
   oled.drawHLine(0,12,128);
   // Temp duza (y=16-36)
   oled.setFont(u8g2_font_10x20_tf);oled.drawStr(0,36,(fts(temp,1)+"C").c_str());
   // Cel T/R - prawa strona, ponizej paska (y=28)
   oled.setFont(u8g2_font_6x10_tf);
-  if(cTi<cTN){char b[24];sprintf(b,"T%.0f R%.0f",cTP[cTi],PR[cRi]);
+  if(cTi<cTN){char b[24];sprintf(b,"T%.0f R%.0f",cTP[cTi],calRamps[cRi]);
     int bw=oled.getStrWidth(b);oled.drawStr(128-bw,28,b);}
   oled.drawStr(0,49,cSt.c_str());
   String ps=String(htg?"H":"C")+" Kp"+fts(Kp,1)+" Ki"+fts(Ki,2);oled.drawStr(0,61,ps.c_str());
@@ -820,6 +826,23 @@ void procCmd(String c){
       Serial.print("CALRANGE set: ");Serial.print(cTmn,0);
       Serial.print("-");Serial.println(cTmx,0);
     }
+  }
+  else if(key=="SETCALRAMPS"){
+    // SETCALRAMPS:5,10,15,20 - ustaw liste ramp do kalibracji
+    int n=0;
+    String rest=val;
+    while(n<CAL_RAMP_MAX && rest.length()>0){
+      int cm=rest.indexOf(',');
+      String tok=(cm>=0)?rest.substring(0,cm):rest;
+      float r=tok.toFloat();
+      if(r>=RAMP_MIN && r<=RAMP_MAX){ calRamps[n++]=r; }
+      if(cm<0) break;
+      rest=rest.substring(cm+1);
+    }
+    if(n>0){ calRampN=n; }
+    Serial.print("CALRAMPS set: ");Serial.print(calRampN);Serial.print(" ramps: ");
+    for(int i=0;i<calRampN;i++){Serial.print(calRamps[i],0);if(i<calRampN-1)Serial.print(",");}
+    Serial.println();
   }
   else if(key=="REPOL"){
     // Wymus ponowne wykrycie polaryzacji
