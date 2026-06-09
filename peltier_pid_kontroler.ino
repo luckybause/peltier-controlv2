@@ -24,6 +24,8 @@
 #define PIN_CS_TC  9
 #define PIN_M1A    11
 #define PIN_M1B    10
+#define PIN_M2A    12   // wentylatory + (PWM predkosc)
+#define PIN_M2B    7    // wentylatory -
 #define PIN_POT1   A0
 #define PIN_POT2   A1
 #define PIN_BTN1   A4
@@ -147,6 +149,10 @@ bool polSet=false;  // czy polaryzacja zostala juz wykryta (zapisana we Flash)
 enum St{MAN,AUTO,COOL,RTEST,CAL,FREEZE};
 unsigned long frzStableT=0;  // od kiedy gal jest stabilny
 bool frzReady=false;          // czy gal osiagnal staly stan
+
+// Wentylatory (kanal M2: M2A=+, M2B=-)
+int  fanSpeed=100;   // ustawiona predkosc w % (0-100)
+bool fanOn=false;    // czy wentylatory wlaczone
 St sys=MAN;
 
 // Test rampy
@@ -222,6 +228,14 @@ void savePol(){FD fd;pidFlash.read(fd);fd.polSet=true;fd.polSw=polSw;pidFlash.wr
 void rst(){calDone=false;for(int i=0;i<P_TOT;i++) prof[i]={10,0.3f,0.8f,10,0.3f,0.3f,false};Kp_h=Kp_c=Kp=10;Ki_h=Ki_c=Ki=0.3f;Kd_h=0.8f;Kd_c=Kd=0.3f;rU=rD=2;tMax=TEMP_MAX_DEF;ig=0;pe=0;Serial.println("Reset.");}
 
 void wPwm(int o){lPwm=o;int h=o>0?o:0,c=o<0?-o:0;if(!polSw){analogWrite(PIN_M1A,h);analogWrite(PIN_M1B,c);}else{analogWrite(PIN_M1A,c);analogWrite(PIN_M1B,h);}}
+
+// Wentylatory: M2A=+ dostaje PWM, M2B=- zawsze 0 (jeden kierunek obrotow)
+void fanApply(){
+  int pwm = fanOn ? (int)(fanSpeed*2.55f) : 0;  // % -> 0-255
+  pwm = constrain(pwm,0,255);
+  analogWrite(PIN_M2A, pwm);
+  analogWrite(PIN_M2B, 0);
+}
 void stpPel(){analogWrite(PIN_M1A,0);analogWrite(PIN_M1B,0);lPwm=0;ssA=false;ssPwm=0;}
 void setPwr(int o){
   o=constrain(o,-PWM_MAX,PWM_MAX);
@@ -732,6 +746,7 @@ void drwMenu(){
 void setup(){
   Serial.begin(115200);analogReadResolution(12);
   pinMode(PIN_M1A,OUTPUT);pinMode(PIN_M1B,OUTPUT);analogWrite(PIN_M1A,0);analogWrite(PIN_M1B,0);
+  pinMode(PIN_M2A,OUTPUT);pinMode(PIN_M2B,OUTPUT);analogWrite(PIN_M2A,0);analogWrite(PIN_M2B,0);
   pinMode(PIN_BTN1,INPUT_PULLUP);pinMode(PIN_BTN2,INPUT_PULLUP);
   if(!tc.begin()) Serial.println("ERROR: MAX31856!");
   tc.setThermocoupleType(MAX31856_TCTYPE_K);
@@ -781,6 +796,7 @@ void sendCfg(){
   Serial.print(",POLSET=");Serial.print(polSet?1:0);
   Serial.print(",CALMIN=");Serial.print(cTmn,0);
   Serial.print(",CALMAX=");Serial.print(cTmx,0);
+  Serial.print(",FAN=");Serial.print(fanOn?fanSpeed:0);
   Serial.println();
 }
 
@@ -824,6 +840,22 @@ void procCmd(String c){
   }
   else if(key=="FREEZESTOP"){
     if(sys==FREEZE){ stpPel();sys=MAN;frzReady=false;Serial.println("FREEZE stopped"); }
+  }
+  else if(key=="FAN"){
+    // FAN:0-100 - ustaw predkosc wentylatorow w %
+    fanSpeed=constrain((int)fv,0,100);
+    if(fanSpeed>0) fanOn=true;        // ustawienie >0 wlacza
+    if(fanSpeed==0) fanOn=false;      // 0 wylacza
+    fanApply();
+    Serial.print("FAN ");Serial.print(fanOn?"ON ":"OFF ");Serial.print(fanSpeed);Serial.println("%");
+  }
+  else if(key=="FANON"){
+    fanOn=true; if(fanSpeed==0) fanSpeed=100; fanApply();
+    Serial.print("FAN ON ");Serial.print(fanSpeed);Serial.println("%");
+  }
+  else if(key=="FANOFF"){
+    fanOn=false; fanApply();
+    Serial.println("FAN OFF");
   }
   else if(key=="SELFTUNE"){ if(sys==AUTO) stStart(); }
   else if(key=="SELFTUNESTOP"){ if(stOn) stStop(); }
