@@ -248,6 +248,10 @@ class PeltierControl:
         self.dev_cal_min = 50.0
         self.dev_cal_max = 100.0
 
+        # Sterowanie wykresem live
+        self.chart_paused = False      # pauza przewijania (do zoomu)
+        self.chart_window = 0          # 0 = caly przebieg, >0 = ostatnie N sekund
+
         # CSV cyklu
         self.log_dir = Path.home() / "PeltierLogi"
         self.log_dir.mkdir(exist_ok=True)
@@ -322,7 +326,7 @@ class PeltierControl:
             # Auto-wczytaj zapisana kalibracje z PC (jesli istnieje)
             self.root.after(2200, self._auto_load_calibration)
         except Exception as e:
-            messagebox.showerror("Blad", f"{port}:\n{e}")
+            messagebox.showerror("Error", f"{port}:\n{e}")
             self.set_status(False, "")
 
     def _auto_load_calibration(self):
@@ -536,7 +540,7 @@ class PeltierControl:
         """Kalibracja zakonczona"""
         self._refresh_cal_view()
         if hasattr(self, 'cal_status'):
-            self.cal_status.config(text="✓ Kalibracja zakonczona - zapisywanie na PC...")
+            self.cal_status.config(text="✓ Calibration done - saving to PC...")
         self.dev_cal = True
         # Pobierz zaktualizowane nastawy
         self.send("GET")
@@ -549,13 +553,13 @@ class PeltierControl:
     def _manual_load_cal(self):
         """Reczne wgranie kalibracji z PC (z potwierdzeniem)"""
         if not self.connected:
-            messagebox.showwarning("Brak polaczenia", "Polacz sie z urzadzeniem.")
+            messagebox.showwarning("Not connected", "Connect to the device first.")
             return
         if not self.cal_file.exists():
-            messagebox.showinfo("Brak kalibracji",
-                "Nie znaleziono zapisanej kalibracji na PC.\n"
-                "Najpierw wykonaj kalibracje lub zapisz ja przyciskiem\n"
-                "'ZAPISZ KALIBR. NA PC'.")
+            messagebox.showinfo("No calibration",
+                "No saved calibration found on PC.\n"
+                "Run calibration first, or save it with\n"
+                "the 'SAVE CAL TO PC' button.")
             return
         # Pokaz date zapisu
         try:
@@ -565,11 +569,11 @@ class PeltierControl:
             nvalid = sum(1 for p in data.get('profiles', []) if p.get('valid'))
         except:
             saved = '?'; nvalid = 0
-        if messagebox.askyesno("Wgraj kalibracje z PC",
-                f"Wgrac zapisana kalibracje do urzadzenia?\n\n"
-                f"Zapisana: {saved}\n"
-                f"Profili: {nvalid}\n\n"
-                "Nadpisze obecna kalibracje w urzadzeniu."):
+        if messagebox.askyesno("Load calibration from PC",
+                f"Load saved calibration to the device?\n\n"
+                f"Saved: {saved}\n"
+                f"Profiles: {nvalid}\n\n"
+                "This will overwrite the current calibration."):
             self.load_calibration_from_pc()
 
     def dump_calibration_to_pc(self, silent=True):
@@ -610,13 +614,13 @@ class PeltierControl:
             n_valid = sum(1 for p in profiles if p['valid'])
             print(f"Kalibracja zapisana: {self.cal_file.name} ({n_valid}/{len(profiles)} profili)")
             if hasattr(self, 'cal_status'):
-                self.cal_status.config(text=f"✓ Kalibracja zapisana na PC ({n_valid} profili)")
+                self.cal_status.config(text=f"✓ Calibration saved to PC ({n_valid} profiles)")
             if self._caldump_purpose == 'save':
                 try:
-                    messagebox.showinfo("Kalibracja zapisana",
-                        f"Profile PID + offset zapisane na dysku:\n{self.cal_file}\n\n"
-                        f"Zapisano {n_valid} skalibrowanych profili.\n"
-                        "Przy nastepnym polaczeniu zostana automatycznie wgrane.")
+                    messagebox.showinfo("Calibration saved",
+                        f"PID profiles + offset saved to disk:\n{self.cal_file}\n\n"
+                        f"Saved {n_valid} calibrated profiles.\n"
+                        "They will be auto-loaded on next connection.")
                 except: pass
         except Exception as e:
             print(f"Blad zapisu kalibracji: {e}")
@@ -643,7 +647,7 @@ class PeltierControl:
                     self.dev_cal = True
                     if hasattr(self, 'cal_status'):
                         self.cal_status.config(
-                            text=f"✓ Wgrano kalibracje z PC ({len(profiles)} profili)")
+                            text=f"✓ Loaded calibration from PC ({len(profiles)} profiles)")
                     print(f"Wgrano {len(profiles)} profili z PC do urzadzenia")
                     return
                 p = profiles[i]
@@ -808,7 +812,57 @@ class PeltierControl:
             ax.set_facecolor(C['panel2'])
 
         self.cv = FigureCanvasTkAgg(self.fig, master=wrap)
-        self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 8))
+        self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
+
+        # Pasek narzedzi wykresu: pauza, okno czasu, zoom matplotlib
+        toolbar_row = tk.Frame(wrap, bg=C['panel'])
+        toolbar_row.pack(fill='x', padx=8, pady=(0, 8))
+
+        # Przycisk PAUSE - zatrzymuje przewijanie zeby przyblizyc
+        self.btn_pause = tk.Button(toolbar_row, text="⏸ PAUSE", command=self.toggle_pause,
+                                   bg=C['bg2'], fg=C['yellow'], font=(FONT, fsz(9), 'bold'),
+                                   relief='flat', cursor='hand2', bd=0, padx=12, pady=6,
+                                   highlightthickness=1, highlightbackground=C['yellow'],
+                                   activebackground=C['panel3'])
+        self.btn_pause.pack(side='left', padx=(0, 6))
+
+        # Wybor okna czasu (ile ostatnich sekund pokazac)
+        tk.Label(toolbar_row, text="WINDOW:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(8))).pack(side='left', padx=(8, 4))
+        for label, secs in [("ALL", 0), ("5m", 300), ("2m", 120), ("1m", 60)]:
+            b = tk.Button(toolbar_row, text=label,
+                         command=lambda s=secs: self.set_chart_window(s),
+                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(8)),
+                         relief='flat', cursor='hand2', bd=0, padx=10, pady=5,
+                         activebackground=C['panel3'])
+            b.pack(side='left', padx=2)
+
+        # Matplotlib toolbar (zoom, pan, save) - kompaktowy
+        tb_frame = tk.Frame(toolbar_row, bg=C['panel'])
+        tb_frame.pack(side='right')
+        try:
+            self.mpl_toolbar = NavigationToolbar2Tk(self.cv, tb_frame, pack_toolbar=False)
+            self.mpl_toolbar.config(bg=C['panel'])
+            self.mpl_toolbar.update()
+            self.mpl_toolbar.pack(side='right')
+        except Exception as e:
+            print(f"toolbar err: {e}")
+
+    def toggle_pause(self):
+        """Pauza/wznow przewijanie wykresu (do przyblizania)"""
+        self.chart_paused = not self.chart_paused
+        if not hasattr(self, 'btn_pause'):
+            return
+        if self.chart_paused:
+            self.btn_pause.config(text="▶ RESUME", fg=C['green'],
+                                 highlightbackground=C['green'])
+        else:
+            self.btn_pause.config(text="⏸ PAUSE", fg=C['yellow'],
+                                 highlightbackground=C['yellow'])
+
+    def set_chart_window(self, secs):
+        """Ustaw okno czasowe wykresu (0=wszystko)"""
+        self.chart_window = secs
 
     def _build_panel(self, parent):
         """Prawy panel sterowania - waski pasek z przewijaniem"""
@@ -966,7 +1020,7 @@ class PeltierControl:
     def do_start(self):
         """START - wyslij wszystkie nastawy z panelu, potem uruchom"""
         if not self.connected:
-            messagebox.showwarning("Brak polaczenia", "Najpierw polacz sie z urzadzeniem.")
+            messagebox.showwarning("Not connected", "Connect to the device first.")
             return
         # Wyslij komplet nastaw z panelu
         self.send(f"SP:{self.sl_sp.get():.1f}")
@@ -996,7 +1050,7 @@ class PeltierControl:
     def do_reset(self):
         """Reset nastaw do domyslnych"""
         if not self.connected:
-            messagebox.showwarning("Brak polaczenia", "Polacz sie z urzadzeniem.")
+            messagebox.showwarning("Not connected", "Connect to the device first.")
             return
         if messagebox.askyesno("Reset nastaw",
                 "Przywrocic domyslne nastawy?\n"
@@ -1043,9 +1097,13 @@ class PeltierControl:
         CalRangeDialog(self.root, self)
 
     def start_autocal(self, temp_min, temp_max, ramps):
-        """Uruchom auto-kalibracje z wybranym zakresem"""
-        # Wyslij zakres do urzadzenia
+        """Uruchom auto-kalibracje z wybranym zakresem i listą ramp"""
+        # Wyslij zakres temp
         self.send(f"CALRANGE:{temp_min:.0f},{temp_max:.0f}")
+        time.sleep(0.1)
+        # Wyslij liste ramp (KLUCZOWE - to definiuje przez co przejdzie kalibracja)
+        ramps_str = ",".join(f"{r:.0f}" for r in ramps)
+        self.send(f"SETCALRAMPS:{ramps_str}")
         time.sleep(0.1)
         self.cal_running = True
         self.cal_t0 = time.time()
@@ -1058,9 +1116,9 @@ class PeltierControl:
     def open_cal_window(self):
         """Otworz okno postepu kalibracji"""
         if not self.cal_plan and not self.cal_running:
-            messagebox.showinfo("Kalibracja",
-                "Kalibracja nie jest uruchomiona.\n"
-                "Kliknij AUTO-KALIBRACJA aby rozpoczac.")
+            messagebox.showinfo("Calibration",
+                "Calibration is not running.\n"
+                "Click AUTO-CAL to start.")
             return
         # Jesli okno juz otwarte - tylko podnies
         if hasattr(self, 'cal_win') and self.cal_win and tk._default_root:
@@ -1080,7 +1138,7 @@ class PeltierControl:
                 self.cal_status.config(
                     text=f"Kalibracja {self.cal_current}/{self.cal_total}{eta_s} (klik=szczegoly)")
             elif self.cal_current >= self.cal_total and self.cal_total > 0:
-                self.cal_status.config(text="✓ Kalibracja zakonczona")
+                self.cal_status.config(text="✓ Calibration done")
         # Okno szczegolow
         if hasattr(self, 'cal_win') and self.cal_win:
             try: self.cal_win.refresh()
@@ -1137,11 +1195,11 @@ class PeltierControl:
         tk.Label(ii, text="INSTRUCTIONS", bg=C['panel'], fg=C['text'],
                  font=(FONT, fsz(11), 'bold')).pack(anchor='w', pady=(0, 8))
         for line in [
-            "1. Podlacz ItsyBitsy (firmware v19 PC MODE) przez USB",
-            "2. Wybierz port COM z listy i kliknij POLACZ",
-            "3. Suwaki zsynchronizuja sie automatycznie z urzadzeniem",
-            "4. Ustaw parametry i kliknij START",
-            "5. Wykres pokazuje przebieg na zywo, dane zapisuja sie do CSV",
+            "1. Connect ItsyBitsy (firmware v19 PC MODE) via USB",
+            "2. Select COM port from the list and click CONNECT",
+            "3. Sliders sync automatically with the device",
+            "4. Set parameters and click START",
+            "5. Chart shows live data, samples are logged to CSV",
         ]:
             tk.Label(ii, text=line, bg=C['panel'], fg=C['dim'],
                      font=(FONT, fsz(9)), anchor='w').pack(anchor='w', pady=1)
@@ -1224,16 +1282,41 @@ class PeltierControl:
         except Exception as e:
             print(f"load err: {e}"); return
         if not data: return
-        try:
-            t = [float(r['czas_s']) for r in data]
-            temp = [float(r['temperatura_C']) for r in data]
-            spt = [float(r['setpoint_cel']) for r in data]
-        except: return
+
+        # Parsuj wiersze pomijajac komentarze i bledne (odporne na stare pliki)
+        t, temp, spt, pwm = [], [], [], []
+        for r in data:
+            cz = r.get('czas_s', '')
+            if not cz or cz.startswith('#'):
+                continue
+            try:
+                tt = float(cz)
+                tm = float(r.get('temperatura_C', 'nan'))
+                sp = float(r.get('setpoint_cel', 'nan'))
+            except (ValueError, TypeError):
+                continue
+            t.append(tt); temp.append(tm); spt.append(sp)
+            # PWM% opcjonalny
+            try:
+                pwm.append(float(r.get('PWM_%', r.get('PWM', 0))))
+            except:
+                pwm.append(0)
+        if not t:
+            print("Brak poprawnych danych w pliku")
+            return
+
+        # Statystyki cyklu
+        tmin, tmax = min(temp), max(temp)
+        duration = t[-1] - t[0] if len(t) > 1 else 0
+        # Srednia rampa narastania (od startu do max)
+        idx_max = temp.index(tmax)
+        rise_time = t[idx_max] - t[0] if idx_max > 0 else 0
+        avg_rise = (tmax - temp[0]) / (rise_time / 60.0) if rise_time > 5 else 0
 
         self.ax_a.clear()
         self.ax_a.set_facecolor(C['panel2'])
+        self.ax_a.plot(t, spt, color=C['orange'], lw=1.3, ls='--', label='target', alpha=0.7)
         self.ax_a.plot(t, temp, color=C['blue'], lw=2, label='temp')
-        self.ax_a.plot(t, spt, color=C['orange'], lw=1.5, ls='--', label='target')
         self.ax_a.set_xlabel('time [s]', color=C['dim'], fontsize=9)
         self.ax_a.set_ylabel('°C', color=C['dim'], fontsize=9)
         self.ax_a.tick_params(colors=C['dim'], labelsize=8)
@@ -1242,6 +1325,11 @@ class PeltierControl:
         self.ax_a.grid(True, alpha=0.3, color=C['grid'])
         for sp in self.ax_a.spines.values():
             sp.set_color(C['border'])
+        # Tytul ze statystykami
+        m = int(duration // 60); s2 = int(duration % 60)
+        self.ax_a.set_title(
+            f"{path.stem}  ·  {tmin:.1f}-{tmax:.1f}°C  ·  {m}m{s2}s  ·  avg rise {avg_rise:.2f}°C/min",
+            color=C['dim'], fontsize=9, loc='left')
         self.fig_a.tight_layout()
         self.cv_a.draw()
 
@@ -1297,18 +1385,19 @@ class PeltierControl:
                     if abs(temp - self.reach_target) <= 0.5:
                         self.reach_done = True
                         self.reach_time = now2 - self.reach_start_t
-                        dT = abs(self.reach_target - self.reach_start_temp)
+                        delta = self.reach_target - self.reach_start_temp
+                        dT = abs(delta)
                         if self.reach_time > 0:
                             self.reach_avg_rate = dT / (self.reach_time / 60.0)
-                        # Zapisz do CSV cyklu jako komentarz
-                        if self.cyc_on and self.cyc_wr:
-                            try:
-                                self.cyc_wr.writerow([
-                                    f"# REACHED target={self.reach_target:.1f}C",
-                                    f"time={self.reach_time:.1f}s",
-                                    f"avg_rate={self.reach_avg_rate:.2f}C/min", '', '', '', '', '', '', ''])
-                                self.cyc_file.flush()
-                            except: pass
+                        # Kierunek przejscia: grzanie czy chlodzenie
+                        self.reach_dir = "HEAT" if delta > 0 else "COOL"
+                        # Zapamietaj statystyki dotarcia dla tego cyklu
+                        self._last_reach_summary = {
+                            'target': self.reach_target,
+                            'time_s': self.reach_time,
+                            'avg_rate': self.reach_avg_rate,
+                            'dir': self.reach_dir,
+                        }
         except Exception as e:
             print(f"tick err: {e}")
 
@@ -1345,8 +1434,10 @@ class PeltierControl:
                 m = int(self.reach_time // 60); s = int(self.reach_time % 60)
                 tstr = f"{m}m {s}s" if m > 0 else f"{s}s"
                 rate_str = f"{self.reach_avg_rate:.2f}" if self.reach_avg_rate else "?"
+                d = getattr(self, 'reach_dir', '')
+                dcol = C['red'] if d == 'HEAT' else C['cyan']
                 self.reach_lbl.config(
-                    text=f"✓ REACHED in {tstr} · avg {rate_str}°C/min", fg=C['green'])
+                    text=f"✓ {d} REACHED in {tstr} · avg {rate_str}°C/min", fg=dcol)
             elif (self.cur_state == 'AUTO' and self.reach_start_t is not None
                   and not self.reach_done):
                 # W trakcie dochodzenia - pokaz uplyniety czas
@@ -1359,7 +1450,23 @@ class PeltierControl:
             else:
                 self.reach_lbl.config(text="")
         if not self.t: return
+        # Pauza - nie odswiezaj (pozwala przyblizyc/obejrzec zatrzymany wykres)
+        if self.chart_paused:
+            return
         t = self.t; temp = self.temp; spt = self.spt; spa = self.spa; pwm = self.pwm
+
+        # Okno czasowe - pokaz tylko ostatnie N sekund jesli ustawione
+        if self.chart_window > 0 and len(t) > 1:
+            t_now = t[-1]
+            cutoff = t_now - self.chart_window
+            # Znajdz indeks od ktorego pokazac
+            i0 = 0
+            for i in range(len(t) - 1, -1, -1):
+                if t[i] < cutoff:
+                    i0 = i
+                    break
+            t = t[i0:]; temp = temp[i0:]; spt = spt[i0:]
+            spa = spa[i0:]; pwm = pwm[i0:]
 
         self.ax1.clear()
         self.ax1.set_facecolor(C['panel2'])
@@ -1492,43 +1599,45 @@ class CalRangeDialog:
         self.sl_tmax = SliderField(inner, "TEMP TO", 0, 115, tmax0,
                                    C['orange'], "°C", 0)
 
-        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(4, 12))
+        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(4, 8))
 
         # Krok temperatury (info - firmware uzywa co 10C)
-        tk.Label(inner, text="STEP: 10°C (fixed)", bg=C['bg'], fg=C['dim2'],
+        tk.Label(inner, text="TEMP STEP: 10°C (fixed)", bg=C['bg'], fg=C['dim2'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 12))
 
-        # Lista ramp do zaznaczenia
-        tk.Label(inner, text="RAMPS TO CALIBRATE [°C/min]:", bg=C['bg'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(0, 8))
+        # MAX RATE - suwak
+        self.sl_maxrate = SliderField(inner, "MAX RATE", 5, 40, 20,
+                                      C['yellow'], "°C/min", 0,
+                                      on_change=lambda v: self._update_estimate())
 
-        ramps_frame = tk.Frame(inner, bg=C['bg'])
-        ramps_frame.pack(fill='x', pady=(0, 12))
-        # Dostepne rampy (zgodne z firmware PR[]={2,5,10,20})
-        self.ramp_vars = {}
-        for r in [2, 5, 10, 20]:
-            var = tk.BooleanVar(value=True)
-            self.ramp_vars[r] = var
-            cb = tk.Checkbutton(ramps_frame, text=f"{r}", variable=var,
-                               bg=C['bg2'], fg=C['text'], font=(FONT, fsz(11), 'bold'),
-                               selectcolor=C['panel'], activebackground=C['bg2'],
-                               activeforeground=C['cyan'], bd=0,
-                               highlightthickness=0, padx=16, pady=8)
-            cb.pack(side='left', padx=4)
+        # KROK RATE - wybor 5/10/20/40
+        tk.Label(inner, text="RATE STEP [°C/min]:", bg=C['bg'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(8, 6))
 
-        tk.Label(inner, text="Note: firmware calibrates selected ramps.\n"
-                 "More ramps/temps = longer calibration.",
-                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left').pack(
-                 anchor='w', pady=(0, 16))
+        self.rate_step = 5  # domyslny krok
+        self.step_btns = {}
+        step_frame = tk.Frame(inner, bg=C['bg'])
+        step_frame.pack(fill='x', pady=(0, 12))
+        for st in [5, 10, 20, 40]:
+            b = tk.Button(step_frame, text=f"{st}",
+                         command=lambda s=st: self._set_step(s),
+                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(12), 'bold'),
+                         relief='flat', cursor='hand2', bd=0, padx=18, pady=10,
+                         activebackground=C['panel3'])
+            b.pack(side='left', padx=4, fill='x', expand=True)
+            self.step_btns[st] = b
+        self._set_step(5)  # zaznacz domyslny
+
+        # Podglad generowanej listy ramp
+        self.ramps_preview = tk.Label(inner, text="", bg=C['bg'], fg=C['cyan'],
+                                     font=(FONT, fsz(10)))
+        self.ramps_preview.pack(anchor='w', pady=(0, 8))
 
         # Szacowany czas
         self.est_lbl = tk.Label(inner, text="", bg=C['bg'], fg=C['yellow'],
                                font=(FONT, fsz(10), 'bold'))
         self.est_lbl.pack(anchor='w', pady=(0, 12))
         self._update_estimate()
-        # Aktualizuj szacunek przy zmianach
-        for r, var in self.ramp_vars.items():
-            var.trace_add('write', lambda *a: self._update_estimate())
 
         # Przyciski
         bf = tk.Frame(inner, bg=C['bg'])
@@ -1538,32 +1647,62 @@ class CalRangeDialog:
         mk_btn_outline(bf, "CANCEL", self.win.destroy, C['dim']).pack(
             side='left', fill='x', expand=True, padx=(4, 0))
 
+    def _set_step(self, step):
+        """Ustaw krok rate i podswietl przycisk"""
+        self.rate_step = step
+        for s, b in self.step_btns.items():
+            if s == step:
+                b.config(bg=C['cyan'], fg='#1a1c1f')
+            else:
+                b.config(bg=C['bg2'], fg=C['dim'])
+        self._update_estimate()
+
+    def _gen_ramps(self):
+        """Generuj liste ramp z max + krok. Np. max=20 krok=5 -> [5,10,15,20]"""
+        try:
+            maxr = self.sl_maxrate.get()
+        except:
+            maxr = 20
+        step = self.rate_step
+        ramps = []
+        r = step
+        while r <= maxr + 0.01 and len(ramps) < 10:
+            ramps.append(int(round(r)))
+            r += step
+        if not ramps:  # gdy max < krok, uzyj samego max
+            ramps = [int(round(maxr))]
+        return ramps
+
     def _update_estimate(self):
         try:
             tmin = self.sl_tmin.get(); tmax = self.sl_tmax.get()
             n_temps = max(1, int((tmax - tmin) / 10) + 1)
-            n_ramps = sum(1 for v in self.ramp_vars.values() if v.get())
+            ramps = self._gen_ramps()
+            n_ramps = len(ramps)
             total = n_temps * n_ramps
-            # Szacunek ~3-5 min na krok
-            est_min = total * 4
-            self.est_lbl.config(
-                text=f"≈ {total} steps · ~{est_min} min total")
-        except: pass
+            est_min = total * 4  # ~4 min/krok
+            # Podglad listy ramp
+            if hasattr(self, 'ramps_preview'):
+                self.ramps_preview.config(
+                    text=f"Ramps: {', '.join(str(r) for r in ramps)} °C/min")
+            self.est_lbl.config(text=f"≈ {total} steps · ~{est_min} min total")
+        except Exception as e:
+            print(f"est err: {e}")
 
     def start(self):
         tmin = self.sl_tmin.get(); tmax = self.sl_tmax.get()
         if tmax <= tmin:
             messagebox.showerror("Invalid range", "TEMP TO must be greater than TEMP FROM.")
             return
-        ramps = [r for r, v in self.ramp_vars.items() if v.get()]
+        ramps = self._gen_ramps()
         if not ramps:
-            messagebox.showerror("No ramps", "Select at least one ramp.")
+            messagebox.showerror("No ramps", "Invalid rate settings.")
             return
         n_temps = int((tmax - tmin) / 10) + 1
         total = n_temps * len(ramps)
         if not messagebox.askyesno("Start calibration",
                 f"Start auto-calibration?\n\n"
-                f"Range: {tmin:.0f}-{tmax:.0f}°C (step 10°C)\n"
+                f"Temp range: {tmin:.0f}-{tmax:.0f}°C (step 10°C)\n"
                 f"Ramps: {', '.join(str(r) for r in ramps)} °C/min\n"
                 f"Total: {total} steps\n\n"
                 "Takes several minutes. Can be stopped with STOP."):
@@ -1579,7 +1718,7 @@ class CalibrationWindow:
     def __init__(self, parent, app):
         self.app = app
         self.win = tk.Toplevel(parent)
-        self.win.title("Postęp kalibracji")
+        self.win.title("Calibration progress")
         self.win.configure(bg=C['bg'])
         self.win.geometry("560x640")
         self.win.transient(parent)
@@ -1588,7 +1727,7 @@ class CalibrationWindow:
         inner = tk.Frame(self.win, bg=C['bg'])
         inner.pack(fill='both', expand=True, padx=20, pady=16)
 
-        tk.Label(inner, text="POSTĘP KALIBRACJI", bg=C['bg'], fg=C['text'],
+        tk.Label(inner, text="CALIBRATION PROGRESS", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(14), 'bold')).pack(anchor='w')
 
         # Pasek postepu
@@ -1608,28 +1747,28 @@ class CalibrationWindow:
         ii.pack(fill='x', padx=14, pady=10)
 
         row1 = tk.Frame(ii, bg=C['panel']); row1.pack(fill='x', pady=2)
-        tk.Label(row1, text="TERAZ:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(row1, text="NOW:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
         self.lbl_now = tk.Label(row1, text="—", bg=C['panel'], fg=C['orange'],
                                 font=(FONT, fsz(11), 'bold'), anchor='w')
         self.lbl_now.pack(side='left')
 
         row2 = tk.Frame(ii, bg=C['panel']); row2.pack(fill='x', pady=2)
-        tk.Label(row2, text="NASTĘPNY:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(row2, text="NEXT:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
         self.lbl_next = tk.Label(row2, text="—", bg=C['panel'], fg=C['cyan'],
                                  font=(FONT, fsz(11)), anchor='w')
         self.lbl_next.pack(side='left')
 
         row3 = tk.Frame(ii, bg=C['panel']); row3.pack(fill='x', pady=2)
-        tk.Label(row3, text="POZOSTAŁO:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(row3, text="REMAINING:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
         self.lbl_eta = tk.Label(row3, text="—", bg=C['panel'], fg=C['yellow'],
                                 font=(FONT, fsz(11), 'bold'), anchor='w')
         self.lbl_eta.pack(side='left')
 
         # Lista krokow
-        tk.Label(inner, text="WSZYSTKIE KROKI", bg=C['bg'], fg=C['dim'],
+        tk.Label(inner, text="ALL STEPS", bg=C['bg'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(4, 4))
 
         list_wrap = tk.Frame(inner, bg=C['bg2'])
@@ -1646,7 +1785,7 @@ class CalibrationWindow:
             lambda e: self.canvas.config(scrollregion=self.canvas.bbox('all')))
 
         # Przycisk przerwij
-        mk_btn_outline(inner, "■ PRZERWIJ KALIBRACJĘ", self.abort, C['red']).pack(
+        mk_btn_outline(inner, "■ ABORT CALIBRATION", self.abort, C['red']).pack(
             fill='x', pady=(12, 0))
 
         self.step_widgets = []
@@ -1671,14 +1810,14 @@ class CalibrationWindow:
             if nt is not None:
                 self.lbl_next.config(text=f"{nt:.0f}°C @ {nr:.0f}°C/min")
         else:
-            self.lbl_next.config(text="(ostatni krok)")
+            self.lbl_next.config(text="(last step)")
         # ETA
         eta = app._cal_eta()
         if eta is not None:
             m = int(eta // 60); s = int(eta % 60)
             self.lbl_eta.config(text=f"~{m} min {s} s")
         elif cur >= total and total > 0:
-            self.lbl_eta.config(text="ZAKOŃCZONO ✓")
+            self.lbl_eta.config(text="FINISHED ✓")
 
         # Lista krokow - buduj raz, potem aktualizuj kolory
         if len(self.step_widgets) != len(app.cal_plan):
@@ -1706,19 +1845,19 @@ class CalibrationWindow:
             step_no = i + 1
             if step_no < cur:
                 bar.config(bg=C['green']); txt.config(fg=C['dim2'])
-                num.config(fg=C['green']); stat.config(text="✓ gotowe", fg=C['green'])
+                num.config(fg=C['green']); stat.config(text="✓ done", fg=C['green'])
             elif step_no == cur:
                 bar.config(bg=C['orange']); txt.config(fg=C['text'])
-                num.config(fg=C['orange']); stat.config(text="● TERAZ", fg=C['orange'])
+                num.config(fg=C['orange']); stat.config(text="● NOW", fg=C['orange'])
                 # Przewin do aktualnego
                 try: self.canvas.yview_moveto(max(0, (i-3))/max(1,len(self.step_widgets)))
                 except: pass
             else:
                 bar.config(bg=C['bg2']); txt.config(fg=C['dim'])
-                num.config(fg=C['dim2']); stat.config(text="oczekuje", fg=C['dim2'])
+                num.config(fg=C['dim2']); stat.config(text="waiting", fg=C['dim2'])
 
     def abort(self):
-        if messagebox.askyesno("Przerwać?", "Przerwać kalibrację?"):
+        if messagebox.askyesno("Abort?", "Abort calibration?"):
             self.app.send("AUTOCALSTOP")
             self.app.send("STOP")
             self.app.cal_running = False
@@ -1733,7 +1872,7 @@ class SaveCycleDialog:
         self.app = app
         self.tmp_path = tmp_path
         self.win = tk.Toplevel(parent)
-        self.win.title("Zapisz cykl")
+        self.win.title("Save cycle")
         self.win.configure(bg=C['bg'])
         self.win.geometry("440x230")
         self.win.transient(parent)
@@ -1743,15 +1882,15 @@ class SaveCycleDialog:
         inner = tk.Frame(self.win, bg=C['bg'])
         inner.pack(fill='both', expand=True, padx=24, pady=20)
 
-        tk.Label(inner, text="ZAPISZ CYKL DO ARCHIWUM", bg=C['bg'], fg=C['text'],
+        tk.Label(inner, text="SAVE CYCLE TO ARCHIVE", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(13), 'bold')).pack(anchor='w')
 
         # Info ile probek
         rows = getattr(app, 'cyc_rows', 0)
-        tk.Label(inner, text=f"Zarejestrowano {rows} próbek pomiarowych",
+        tk.Label(inner, text=f"Recorded {rows} data samples",
                  bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(4, 16))
 
-        tk.Label(inner, text="Nazwa cyklu:", bg=C['bg'], fg=C['dim'],
+        tk.Label(inner, text="Cycle name:", bg=C['bg'], fg=C['dim'],
                  font=(FONT, fsz(10))).pack(anchor='w')
         self.entry = tk.Entry(inner, bg=C['bg2'], fg=C['text'],
                               font=(FONT, fsz(12)), relief='flat', bd=0,
@@ -1769,9 +1908,9 @@ class SaveCycleDialog:
         # Przyciski
         bf = tk.Frame(inner, bg=C['bg'])
         bf.pack(fill='x')
-        mk_btn(bf, "ZAPISZ", self.save, C['green']).pack(side='left', fill='x',
+        mk_btn(bf, "SAVE", self.save, C['green']).pack(side='left', fill='x',
                                                           expand=True, padx=(0, 4))
-        mk_btn_outline(bf, "ODRZUĆ", self.discard, C['red']).pack(side='left',
+        mk_btn_outline(bf, "DISCARD", self.discard, C['red']).pack(side='left',
                                                           fill='x', expand=True, padx=(4, 0))
 
         self.win.protocol("WM_DELETE_WINDOW", self.save)  # zamkniecie = zapisz
@@ -1784,8 +1923,8 @@ class SaveCycleDialog:
         self.win.destroy()
 
     def discard(self):
-        if messagebox.askyesno("Odrzucić?",
-                "Na pewno odrzucić ten cykl?\nDane zostaną bezpowrotnie usunięte."):
+        if messagebox.askyesno("Discard?",
+                "Discard this cycle?\nData will be permanently deleted."):
             self.app.discard_cycle(self.tmp_path)
             self.win.destroy()
 
@@ -1797,7 +1936,7 @@ class ProfileWindow:
     def __init__(self, parent, app):
         self.app = app
         self.win = tk.Toplevel(parent)
-        self.win.title("Profile wieloetapowe")
+        self.win.title("Multi-step profiles")
         self.win.configure(bg=C['bg'])
         self.win.geometry("520x480")
         self.win.transient(parent)
@@ -1805,7 +1944,7 @@ class ProfileWindow:
         tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
         hd = tk.Frame(self.win, bg=C['bg'])
         hd.pack(fill='x', padx=16, pady=12)
-        tk.Label(hd, text="PROFILE WIELOETAPOWE", bg=C['bg'], fg=C['text'],
+        tk.Label(hd, text="MULTI-STEP PROFILES", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
 
         # Tabela etapow
@@ -1815,7 +1954,7 @@ class ProfileWindow:
         # Naglowki
         h = tk.Frame(self.rows_frame, bg=C['bg'])
         h.pack(fill='x', pady=(0, 4))
-        for txt, w in [("#", 3), ("TEMP °C", 10), ("RAMPA", 8), ("CZAS min", 10), ("", 6)]:
+        for txt, w in [("#", 3), ("TEMP °C", 10), ("RATE", 8), ("TIME min", 10), ("", 6)]:
             tk.Label(h, text=txt, bg=C['bg'], fg=C['dim2'],
                      font=(FONT, fsz(9)), width=w, anchor='w').pack(side='left')
 
@@ -1828,7 +1967,7 @@ class ProfileWindow:
         tk.Frame(addf, bg=C['green'], height=3).pack(fill='x')
         ai = tk.Frame(addf, bg=C['panel'])
         ai.pack(fill='x', padx=12, pady=10)
-        tk.Label(ai, text="DODAJ ETAP:", bg=C['panel'], fg=C['dim'],
+        tk.Label(ai, text="ADD STEP:", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9))).pack(side='left', padx=(0, 8))
         self.e_temp = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['orange'],
                                font=(FONT, fsz(10)), justify='center', relief='flat',
@@ -1842,12 +1981,12 @@ class ProfileWindow:
                                font=(FONT, fsz(10)), justify='center', relief='flat',
                                highlightthickness=1, highlightbackground=C['border'])
         self.e_time.pack(side='left', padx=2); self.e_time.insert(0, "10")
-        mk_btn(ai, "+ DODAJ", self.add_step, C['green']).pack(side='left', padx=(8, 0))
+        mk_btn(ai, "+ ADD", self.add_step, C['green']).pack(side='left', padx=(8, 0))
 
         # Uruchom
         rf = tk.Frame(self.win, bg=C['bg'])
         rf.pack(fill='x', padx=16, pady=(0, 12))
-        mk_btn(rf, "▶ URUCHOM PROFIL", self.run_profile, C['purple'], fg='#fff').pack(
+        mk_btn(rf, "▶ RUN PROFILE", self.run_profile, C['purple'], fg='#fff').pack(
             fill='x')
 
         self.refresh_steps()
@@ -1860,7 +1999,7 @@ class ProfileWindow:
             self.app.profile_steps.append({'temp': temp, 'ramp': ramp, 'time': tmin})
             self.refresh_steps()
         except ValueError:
-            messagebox.showerror("Blad", "Wpisz poprawne liczby.")
+            messagebox.showerror("Error", "Wpisz poprawne liczby.")
 
     def del_step(self, idx):
         if 0 <= idx < len(self.app.profile_steps):
@@ -1882,7 +2021,7 @@ class ProfileWindow:
                      font=(FONT, fsz(10)), width=8, anchor='w').pack(side='left')
             tk.Label(r, text=f"{s['time']:.0f}", bg=C['bg2'], fg=C['dim'],
                      font=(FONT, fsz(10)), width=10, anchor='w').pack(side='left')
-            tk.Button(r, text="USUN", command=lambda idx=i: self.del_step(idx),
+            tk.Button(r, text="DEL", command=lambda idx=i: self.del_step(idx),
                       bg=C['bg2'], fg=C['red'], font=(FONT, fsz(8), 'bold'),
                       relief='flat', cursor='hand2', bd=0,
                       activebackground=C['panel3']).pack(side='left', padx=4)
@@ -1890,14 +2029,14 @@ class ProfileWindow:
     def run_profile(self):
         """Wykonaj profil - sekwencyjnie wysylaj etapy z opoznieniem"""
         if not self.app.connected:
-            messagebox.showwarning("Brak polaczenia", "Polacz sie z urzadzeniem.")
+            messagebox.showwarning("Not connected", "Connect to the device first.")
             return
         if not self.app.profile_steps:
-            messagebox.showinfo("Pusty profil", "Dodaj przynajmniej jeden etap.")
+            messagebox.showinfo("Empty profile", "Add at least one step.")
             return
-        if not messagebox.askyesno("Uruchom profil",
-                f"Wykonac profil z {len(self.app.profile_steps)} etapami?\n"
-                "Etapy beda wykonywane sekwencyjnie."):
+        if not messagebox.askyesno("Run profile",
+                f"Run profile with {len(self.app.profile_steps)} steps?\n"
+                "Steps will run sequentially."):
             return
         threading.Thread(target=self._run_profile_thread, daemon=True).start()
         self.win.destroy()
