@@ -757,6 +757,13 @@ class PeltierControl:
                                   highlightthickness=2, highlightbackground=C['red'],
                                   activebackground=C['panel3'])
         self.btn_stop.pack(side='left', padx=(0, 4), fill='y')
+        # FREEZE - zamroz gal do wymiany probki
+        self.btn_freeze = tk.Button(ctrl, text="❄ FREEZE", command=self.do_freeze,
+                                    bg=C['bg2'], fg=C['cyan'], font=(FONT, fsz(13), 'bold'),
+                                    relief='flat', cursor='hand2', bd=0, padx=16, pady=14,
+                                    highlightthickness=2, highlightbackground=C['cyan'],
+                                    activebackground=C['panel3'])
+        self.btn_freeze.pack(side='left', padx=(0, 4), fill='y')
         self.btn_estop = tk.Button(ctrl, text="⛔", command=self.do_estop,
                                    bg=C['red'], fg='#fff', font=(FONT, fsz(15), 'bold'),
                                    relief='flat', cursor='hand2', bd=0, padx=14, pady=14,
@@ -1061,7 +1068,7 @@ class PeltierControl:
             if hasattr(self, sl):
                 getattr(self, sl).set_enabled(True)
         # Przyciski zawsze klikalnie - reaguja komunikatem jesli brak polaczenia
-        for b in ['btn_start', 'btn_stop', 'btn_st', 'btn_autocal', 'btn_estop']:
+        for b in ['btn_start', 'btn_stop', 'btn_st', 'btn_autocal', 'btn_estop', 'btn_freeze']:
             if hasattr(self, b):
                 getattr(self, b).config(state='normal')
 
@@ -1099,14 +1106,29 @@ class PeltierControl:
         if hasattr(self, 'cal_status'):
             self.cal_status.config(text="")
 
+    def do_freeze(self):
+        """Zamroz gal do stanu stalego (wymiana probki)"""
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        if messagebox.askyesno("Freeze gal",
+                "Cool the gal to solid state for sample swap?\n\n"
+                "Gently ramps down to 20°C and HOLDS it there\n"
+                "(keeps cooling active to prevent re-melting).\n\n"
+                "You'll see 'GAL SOLID' when ready.\n"
+                "Press STOP when done swapping the sample."):
+            self.send("FREEZE")
+            if hasattr(self, 'reach_lbl'):
+                self.reach_lbl.config(text="❄ Freezing gal...", fg=C['cyan'])
+
     def do_reset(self):
         """Reset nastaw do domyslnych"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
-        if messagebox.askyesno("Reset nastaw",
-                "Przywrocic domyslne nastawy?\n"
-                "Wyczysci wszystkie profile i kalibracje!"):
+        if messagebox.askyesno("Reset settings",
+                "Restore default settings?\n"
+                "This clears all profiles and calibration!"):
             self.send("RESET")
 
     def do_repol(self):
@@ -1573,9 +1595,14 @@ class PeltierControl:
         acol = C['red'] if diff > 0.3 else (C['cyan'] if diff < -0.3 else C['dim2'])
         self.cards['pwm']['unit_lbl'].config(text=" " + arrow, fg=acol)
 
-        # Statystyki dotarcia do setpointu
+        # Statystyki dotarcia / status FREEZE
         if hasattr(self, 'reach_lbl'):
-            if self.reach_done and self.reach_time is not None:
+            # FREEZE - priorytet (najwazniejszy komunikat dla usera)
+            if self.cur_state == 'FREEZE_READY':
+                self.reach_lbl.config(text="❄ GAL SOLID — ready to swap sample", fg=C['cyan'])
+            elif self.cur_state == 'FREEZE':
+                self.reach_lbl.config(text=f"❄ Freezing gal → hold 20°C", fg=C['cyan'])
+            elif self.reach_done and self.reach_time is not None:
                 m = int(self.reach_time // 60); s = int(self.reach_time % 60)
                 tstr = f"{m}m {s}s" if m > 0 else f"{s}s"
                 rate_str = f"{self.reach_avg_rate:.2f}" if self.reach_avg_rate else "?"
