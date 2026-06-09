@@ -691,12 +691,14 @@ class PeltierControl:
         # Notebook
         nb = ttk.Notebook(self.root)
         nb.pack(fill='both', expand=True, padx=0, pady=0)
-        t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='STEROWANIE')
-        t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='ARCHIWUM')
-        t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='POLACZENIE')
+        t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='CONTROL')
+        t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='ADVANCED')
+        t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='ARCHIVE')
+        t4 = tk.Frame(nb, bg=C['bg']); nb.add(t4, text='CONNECTION')
         self.build_live(t1)
-        self.build_arch(t2)
-        self.build_conn(t3)
+        self.build_advanced(t2)
+        self.build_arch(t3)
+        self.build_conn(t4)
 
     def _draw_dot(self, color, glow=True):
         self.s_dot.delete('all')
@@ -738,7 +740,7 @@ class PeltierControl:
         self.cards = {}
         self.cards['temp'] = self._stat_card(cards, "TEMP", "°C", C['blue'])
         self.cards['sp']   = self._stat_card(cards, "SETPOINT", "°C", C['orange'])
-        self.cards['rate'] = self._stat_card(cards, "TEMPO", "°C/min", C['yellow'])
+        self.cards['rate'] = self._stat_card(cards, "AVG RATE", "°C/min", C['yellow'])
         self.cards['pwm']  = self._stat_card(cards, "PWM", "%", C['green'])
 
         # Przyciski START/STOP/E-STOP (prawa czesc paska) - zawsze widoczne
@@ -919,87 +921,137 @@ class PeltierControl:
 
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
 
-        # PID
-        pid_hd = tk.Frame(inner, bg=C['bg2'])
-        pid_hd.pack(fill='x', pady=(0, 8))
-        tk.Label(pid_hd, text="PID", bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(side='left')
-        self.btn_st = mk_btn(pid_hd, "SELF-TUNE", self.do_selftune, C['cyan'])
-        self.btn_st.pack(side='right')
+        # AUTO badge - kierunek wyznaczany automatycznie
+        auto = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
+                        highlightbackground=C['green'])
+        auto.pack(fill='x', pady=(0, 10))
+        tk.Label(auto, text="● AUTO: direction by setpoint", bg=C['bg2'],
+                 fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
 
-        # Auto-kalibracja (pelna - wszystkie profile temp x rampa)
-        cal_row = tk.Frame(inner, bg=C['bg2'])
-        cal_row.pack(fill='x', pady=(0, 8))
-        self.btn_autocal = mk_btn(cal_row, "⚙ AUTO-CAL",
-                                  self.do_autocal, C['purple'], fg='#fff')
-        self.btn_autocal.pack(fill='x')
-        # Status kalibracji - klikalny, otwiera okno postepu
+        # Profile wieloetapowe
+        mk_btn_outline(inner, "PROFILES", self.open_profiles, C['purple']).pack(
+            fill='x', pady=(0, 8))
+
+        # Status kalibracji - klikalny (gdy kalibracja trwa, pokazuje postep)
         self.cal_status = tk.Label(inner, text="", bg=C['bg2'], fg=C['purple'],
                                    font=(FONT, fsz(8)), anchor='w', cursor='hand2')
         self.cal_status.pack(fill='x', pady=(0, 4))
         self.cal_status.bind('<Button-1>', lambda e: self.open_cal_window())
 
-        self.sl_kp = SliderField(inner, "Kp", 1, 30, 10.0, C['cyan'], "", 1,
+        tk.Label(inner, text="▶ START uses panel values",
+                 bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
+        tk.Label(inner, text="PID tuning & calibration → ADVANCED tab",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(2, 0))
+
+        self._set_panel_enabled(False)
+
+    def build_advanced(self, parent):
+        """Zakladka ADVANCED - PID, kalibracja, polaryzacja, Flash, reset"""
+        wrap = tk.Frame(parent, bg=C['bg'])
+        wrap.pack(fill='both', expand=True, padx=20, pady=16)
+
+        # Przewijalny obszar (duzo opcji)
+        acanvas = tk.Canvas(wrap, bg=C['bg'], highlightthickness=0)
+        asb = tk.Scrollbar(wrap, orient='vertical', command=acanvas.yview)
+        acanvas.configure(yscrollcommand=asb.set)
+        asb.pack(side='right', fill='y')
+        acanvas.pack(side='left', fill='both', expand=True)
+        col = tk.Frame(acanvas, bg=C['bg'])
+        cid = acanvas.create_window((0, 0), window=col, anchor='nw')
+        col.bind('<Configure>', lambda e: acanvas.configure(scrollregion=acanvas.bbox('all')))
+        acanvas.bind('<Configure>', lambda e: acanvas.itemconfig(cid, width=e.width))
+        acanvas.bind('<Enter>', lambda e: acanvas.bind_all('<MouseWheel>',
+                     lambda ev: acanvas.yview_scroll(int(-ev.delta/120), 'units')))
+        acanvas.bind('<Leave>', lambda e: acanvas.unbind_all('<MouseWheel>'))
+
+        # Ograniczenie szerokosci dla czytelnosci
+        inner = tk.Frame(col, bg=C['bg'])
+        inner.pack(fill='x', padx=4, pady=4)
+        inner.configure(width=560)
+
+        tk.Label(inner, text="ADVANCED — PID & CALIBRATION", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+        tk.Label(inner, text="Tuning, calibration and device memory",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+
+        # ── PID TUNING ──
+        sec1 = self._adv_section(inner, "PID TUNING", C['cyan'])
+        pid_hd = tk.Frame(sec1, bg=C['bg2'])
+        pid_hd.pack(fill='x', pady=(0, 8))
+        tk.Label(pid_hd, text="Manual PID gains", bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(side='left')
+        self.btn_st = mk_btn(pid_hd, "SELF-TUNE", self.do_selftune, C['cyan'])
+        self.btn_st.pack(side='right')
+        self.sl_kp = SliderField(sec1, "Kp", 1, 30, 10.0, C['cyan'], "", 1,
                                  on_change=lambda v: self.send(f"KP:{v:.1f}"))
-        self.sl_ki = SliderField(inner, "Ki", 0, 3, 0.3, C['cyan'], "", 2,
+        self.sl_ki = SliderField(sec1, "Ki", 0, 3, 0.3, C['cyan'], "", 2,
                                  on_change=lambda v: self.send(f"KI:{v:.2f}"))
-        self.sl_kd = SliderField(inner, "Kd", 0, 3, 0.8, C['cyan'], "", 2,
+        self.sl_kd = SliderField(sec1, "Kd", 0, 3, 0.8, C['cyan'], "", 2,
                                  on_change=lambda v: self.send(f"KD:{v:.2f}"))
 
-        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
+        # ── AUTO-CALIBRATION ──
+        sec2 = self._adv_section(inner, "AUTO-CALIBRATION", C['purple'])
+        self.btn_autocal = mk_btn(sec2, "⚙ AUTO-CAL (select range)",
+                                  self.do_autocal, C['purple'], fg='#fff')
+        self.btn_autocal.pack(fill='x', pady=(0, 6))
+        tk.Label(sec2, text="Calibrates PID for temp × ramp grid, saves to Flash",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w')
 
-        # Kalibracja
-        self.sl_off = SliderField(inner, "CAL OFFSET", -20, 20, 0.0,
+        # ── THERMOCOUPLE OFFSET ──
+        sec3 = self._adv_section(inner, "THERMOCOUPLE", C['purple'])
+        self.sl_off = SliderField(sec3, "CAL OFFSET", -20, 20, 0.0,
                                   C['purple'], "°C", 1,
                                   on_change=lambda v: self.send(f"OFFSET:{v:.1f}"))
 
-        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
-
-        # AUTO badge + wskaznik polaryzacji
-        auto = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
-                        highlightbackground=C['green'])
-        auto.pack(fill='x', pady=(0, 8))
-        tk.Label(auto, text="● AUTO: direction by setpoint", bg=C['bg2'],
-                 fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
-
-        # Polaryzacja - wskaznik + re-detekcja
-        pol_frame = tk.Frame(inner, bg=C['bg2'])
-        pol_frame.pack(fill='x', pady=(0, 10))
+        # ── PELTIER POLARITY ──
+        sec4 = self._adv_section(inner, "PELTIER POLARITY", C['orange'])
+        pol_frame = tk.Frame(sec4, bg=C['bg2'])
+        pol_frame.pack(fill='x')
         self.pol_indicator = tk.Label(pol_frame, text="POL: ?", bg=C['bg2'],
-                                      fg=C['dim2'], font=(FONT, fsz(9)))
+                                      fg=C['dim2'], font=(FONT, fsz(10), 'bold'))
         self.pol_indicator.pack(side='left')
         mk_btn_outline(pol_frame, "RE-DETECT", self.do_repol, C['dim']).pack(side='right')
+        tk.Label(sec4, text="Detected once, saved permanently",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(6, 0))
 
-        # (START / STOP / E-STOP przeniesione na gorny pasek - obok kafelkow)
-
-        # Profile + Flash kompakt
-        bf2 = tk.Frame(inner, bg=C['bg2'])
-        bf2.pack(fill='x', pady=(8, 6))
-        mk_btn_outline(bf2, "PROFILES", self.open_profiles, C['purple']).pack(
-            side='left', fill='x', expand=True, padx=(0, 3))
+        # ── DEVICE FLASH MEMORY ──
+        sec5 = self._adv_section(inner, "DEVICE FLASH", C['green'])
+        bf2 = tk.Frame(sec5, bg=C['bg2'])
+        bf2.pack(fill='x')
         mk_btn_outline(bf2, "SAVE", lambda: self.send("SAVE"), C['green']).pack(
-            side='left', fill='x', expand=True, padx=3)
+            side='left', fill='x', expand=True, padx=(0, 3))
         mk_btn_outline(bf2, "LOAD", lambda: self.send("LOAD"), C['cyan']).pack(
             side='left', fill='x', expand=True, padx=(3, 0))
+        tk.Label(sec5, text="Save/load settings to device internal memory",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(6, 0))
 
-        # Kalibracja na dysk PC (trwala kopia)
-        bf3 = tk.Frame(inner, bg=C['bg2'])
-        bf3.pack(fill='x', pady=(0, 6))
-        mk_btn_outline(bf3, "⤓ SAVE CAL TO PC",
+        # ── PC CALIBRATION BACKUP ──
+        sec6 = self._adv_section(inner, "PC CALIBRATION BACKUP", C['purple'])
+        bf3 = tk.Frame(sec6, bg=C['bg2'])
+        bf3.pack(fill='x')
+        mk_btn_outline(bf3, "⤓ SAVE TO PC",
                        lambda: self.dump_calibration_to_pc(silent=False),
                        C['purple']).pack(side='left', fill='x', expand=True, padx=(0, 3))
         mk_btn_outline(bf3, "⤒ LOAD FROM PC",
                        self._manual_load_cal, C['cyan']).pack(
                        side='left', fill='x', expand=True, padx=(3, 0))
+        tk.Label(sec6, text="Backup profiles to a file (auto-loaded on connect)",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(6, 0))
 
-        # Reset nastaw
-        mk_btn_outline(inner, "↺ RESET", self.do_reset, C['dim']).pack(
-            fill='x', pady=(0, 8))
+        # ── RESET ──
+        sec7 = self._adv_section(inner, "RESET", C['red'])
+        mk_btn_outline(sec7, "↺ RESET ALL SETTINGS", self.do_reset, C['red']).pack(fill='x')
 
-        tk.Label(inner, text="▶ START uses panel values",
-                 bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
-
-        self._set_panel_enabled(False)
+    def _adv_section(self, parent, title, color):
+        """Pomocnicza - ramka sekcji w zakladce ADVANCED"""
+        tk.Frame(parent, bg=color, height=2).pack(fill='x', pady=(12, 0))
+        tk.Label(parent, text=title, bg=C['bg'], fg=color,
+                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(4, 6))
+        box = tk.Frame(parent, bg=C['bg2'])
+        box.pack(fill='x')
+        inner = tk.Frame(box, bg=C['bg2'])
+        inner.pack(fill='x', padx=12, pady=10)
+        return inner
 
     def _set_panel_enabled(self, en):
         # Suwaki zawsze aktywne (mozna ustawic wartosci przed polaczeniem)
@@ -1261,9 +1313,94 @@ class PeltierControl:
         self.ax_a = self.fig_a.add_subplot(111)
         self.ax_a.set_facecolor(C['panel2'])
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
-        self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=8)
+        self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
+
+        # Pasek narzedzi pod wykresem archiwum
+        atb = tk.Frame(cf, bg=C['panel'])
+        atb.pack(fill='x', padx=8, pady=(0, 8))
+
+        # Toolbar matplotlib (zoom, pan, zapis PNG)
+        tbf = tk.Frame(atb, bg=C['panel'])
+        tbf.pack(side='left')
+        try:
+            self.mpl_toolbar_a = NavigationToolbar2Tk(self.cv_a, tbf, pack_toolbar=False)
+            self.mpl_toolbar_a.config(bg=C['panel'])
+            self.mpl_toolbar_a.update()
+            self.mpl_toolbar_a.pack(side='left')
+        except Exception as e:
+            print(f"arch toolbar err: {e}")
+
+        # Przyciski eksportu (prawa strona)
+        mk_btn_outline(atb, "⤓ EXPORT CSV", self.export_arch_csv, C['green']).pack(
+            side='right', padx=(4, 0))
+        mk_btn_outline(atb, "⤓ SAVE CHART", self.save_arch_chart, C['cyan']).pack(
+            side='right', padx=(4, 0))
+        mk_btn_outline(atb, "📁 OPEN FOLDER", self.open_log_folder, C['dim']).pack(
+            side='right', padx=(4, 0))
 
         self.refresh_arch()
+
+    def _selected_arch_path(self):
+        """Zwroc sciezke aktualnie zaznaczonego cyklu w archiwum"""
+        s = self.a_list.curselection()
+        if not s: return None
+        fs = sorted(self.log_dir.glob("cykl_*.csv"), reverse=True)
+        if s[0] >= len(fs): return None
+        return fs[s[0]]
+
+    def export_arch_csv(self):
+        """Eksportuj zaznaczony cykl CSV do wybranego miejsca"""
+        path = self._selected_arch_path()
+        if not path:
+            messagebox.showinfo("No selection", "Select a cycle from the list first.")
+            return
+        try:
+            from tkinter import filedialog
+            dest = filedialog.asksaveasfilename(
+                title="Export cycle CSV",
+                defaultextension=".csv",
+                initialfile=path.name,
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+            if dest:
+                import shutil
+                shutil.copy(path, dest)
+                messagebox.showinfo("Exported", f"Cycle exported to:\n{dest}")
+        except Exception as e:
+            messagebox.showerror("Export error", str(e))
+
+    def save_arch_chart(self):
+        """Zapisz wykres zaznaczonego cyklu jako PNG"""
+        path = self._selected_arch_path()
+        if not path:
+            messagebox.showinfo("No selection", "Select a cycle from the list first.")
+            return
+        try:
+            from tkinter import filedialog
+            dest = filedialog.asksaveasfilename(
+                title="Save chart as image",
+                defaultextension=".png",
+                initialfile=f"{path.stem}.png",
+                filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
+            if dest:
+                self.fig_a.savefig(dest, dpi=150, facecolor=C['panel'],
+                                   bbox_inches='tight')
+                messagebox.showinfo("Saved", f"Chart saved to:\n{dest}")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
+
+    def open_log_folder(self):
+        """Otworz folder z logami w eksploratorze"""
+        try:
+            import subprocess
+            p = str(self.log_dir)
+            if sys.platform == 'win32':
+                os.startfile(p)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', p])
+            else:
+                subprocess.run(['xdg-open', p])
+        except Exception as e:
+            messagebox.showinfo("Folder", f"Logs are in:\n{self.log_dir}")
 
     def refresh_arch(self):
         self.a_list.delete(0, 'end')
@@ -1414,12 +1551,20 @@ class PeltierControl:
         temp = self.temp[-1]; spt = self.spt[-1]; pwm = self.pwm[-1]
         self.cards['temp']['val'].config(text=f"{temp:.2f}")
         self.cards['sp']['val'].config(text=f"{spt:.1f}")
-        # Tempo - srednia z ostatnich probek
-        rate = 0.0
-        if len(self.temp) > 10:
-            dt = self.t[-1] - self.t[-10]
-            if dt > 0: rate = (self.temp[-1] - self.temp[-10]) / dt * 60
-        self.cards['rate']['val'].config(text=f"{rate:+.1f}")
+        # AVG RATE - srednie tempo przejscia (od startu dochodzenia do teraz)
+        # Bardziej uzyteczne niz chwilowe - pokazuje realna srednia rampe
+        avg_rate = 0.0
+        if (self.reach_start_t is not None and self.reach_start_temp is not None
+                and self.t and self.cur_state == 'AUTO'):
+            elapsed = self.t[-1] - self.reach_start_t
+            if elapsed > 2:  # min 2s zeby uniknac dzielenia przez male liczby
+                avg_rate = (temp - self.reach_start_temp) / (elapsed / 60.0)
+        # Po dotarciu pokaz finalna srednia
+        if self.reach_done and self.reach_avg_rate is not None:
+            d = getattr(self, 'reach_dir', '')
+            sign = 1 if d == 'HEAT' else -1
+            avg_rate = sign * self.reach_avg_rate
+        self.cards['rate']['val'].config(text=f"{avg_rate:+.1f}")
         # PWM + kierunek (HEAT/COOL/HOLD widoczny w jednostce)
         diff = spt - temp
         arrow = "% ▲HEAT" if diff > 0.3 else ("% ▼COOL" if diff < -0.3 else "% ●HOLD")
@@ -1577,9 +1722,17 @@ class CalRangeDialog:
         self.win = tk.Toplevel(parent)
         self.win.title("Auto-Calibration Range")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("480x520")
+        self.win.geometry("560x680")
+        self.win.minsize(540, 640)
         self.win.transient(parent)
         self.win.grab_set()
+        # Wycentruj wzgledem rodzica
+        self.win.update_idletasks()
+        try:
+            px = parent.winfo_rootx() + parent.winfo_width()//2 - 280
+            py = parent.winfo_rooty() + parent.winfo_height()//2 - 340
+            self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
+        except: pass
 
         tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
         inner = tk.Frame(self.win, bg=C['bg'])
@@ -1720,8 +1873,15 @@ class CalibrationWindow:
         self.win = tk.Toplevel(parent)
         self.win.title("Calibration progress")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("560x640")
+        self.win.geometry("620x760")
+        self.win.minsize(580, 680)
         self.win.transient(parent)
+        self.win.update_idletasks()
+        try:
+            px = parent.winfo_rootx() + parent.winfo_width()//2 - 310
+            py = parent.winfo_rooty() + parent.winfo_height()//2 - 380
+            self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
+        except: pass
 
         tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
         inner = tk.Frame(self.win, bg=C['bg'])
