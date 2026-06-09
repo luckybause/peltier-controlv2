@@ -467,6 +467,19 @@ class PeltierControl:
                 self.dev_cal_min = float(d['CALMIN'])
             if 'CALMAX' in d:
                 self.dev_cal_max = float(d['CALMAX'])
+            # Stan wentylatorow
+            if 'FAN' in d:
+                fan_val = int(float(d['FAN']))
+                self.fan_on = (fan_val > 0)
+                if hasattr(self, 'sl_fan') and fan_val > 0:
+                    self.sl_fan.set(fan_val, silent=True)
+                if hasattr(self, 'btn_fan'):
+                    if fan_val > 0:
+                        self.btn_fan.config(text="● ON", fg=C['green'],
+                                           highlightbackground=C['green'])
+                    else:
+                        self.btn_fan.config(text="○ OFF", fg=C['dim2'],
+                                           highlightbackground=C['dim'])
             # Zaktualizuj wskaznik polaryzacji w UI jesli istnieje
             if hasattr(self, '_update_pol_indicator'):
                 self._update_pol_indicator()
@@ -928,6 +941,24 @@ class PeltierControl:
 
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
 
+        # WENTYLATORY - przycisk on/off + suwak predkosci
+        fan_hd = tk.Frame(inner, bg=C['bg2'])
+        fan_hd.pack(fill='x', pady=(0, 4))
+        tk.Label(fan_hd, text="FANS", bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+        self.fan_on = False
+        self.btn_fan = tk.Button(fan_hd, text="○ OFF", command=self.toggle_fan,
+                                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9), 'bold'),
+                                 relief='flat', cursor='hand2', bd=0, padx=12, pady=4,
+                                 highlightthickness=1, highlightbackground=C['dim'],
+                                 activebackground=C['panel3'])
+        self.btn_fan.pack(side='right')
+        self.sl_fan = SliderField(inner, "FAN SPEED", 0, 100, 100,
+                                  C['blue'], "%", 0,
+                                  on_change=lambda v: self.set_fan_speed(v))
+
+        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
+
         # AUTO badge - kierunek wyznaczany automatycznie
         auto = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
                         highlightbackground=C['green'])
@@ -1064,11 +1095,11 @@ class PeltierControl:
         # Suwaki zawsze aktywne (mozna ustawic wartosci przed polaczeniem)
         # START/STOP tez aktywne - sprawdzaja polaczenie w momencie klikniecia
         # (dezaktywujemy tylko gdy chcemy wyraznie zablokowac)
-        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off']:
+        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off', 'sl_fan']:
             if hasattr(self, sl):
                 getattr(self, sl).set_enabled(True)
         # Przyciski zawsze klikalnie - reaguja komunikatem jesli brak polaczenia
-        for b in ['btn_start', 'btn_stop', 'btn_st', 'btn_autocal', 'btn_estop', 'btn_freeze']:
+        for b in ['btn_start', 'btn_stop', 'btn_st', 'btn_autocal', 'btn_estop', 'btn_freeze', 'btn_fan']:
             if hasattr(self, b):
                 getattr(self, b).config(state='normal')
 
@@ -1105,6 +1136,34 @@ class PeltierControl:
         self.send("AUTOCALSTOP")
         if hasattr(self, 'cal_status'):
             self.cal_status.config(text="")
+
+    def toggle_fan(self):
+        """Wlacz/wylacz wentylatory"""
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        self.fan_on = not self.fan_on
+        if self.fan_on:
+            spd = int(self.sl_fan.get()) if hasattr(self, 'sl_fan') else 100
+            if spd == 0: spd = 100; self.sl_fan.set(100, silent=True)
+            self.send(f"FAN:{spd}")
+            self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+        else:
+            self.send("FANOFF")
+            self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+
+    def set_fan_speed(self, v):
+        """Ustaw predkosc wentylatorow (suwak)"""
+        spd = int(v)
+        self.send(f"FAN:{spd}")
+        # Suwak na 0 = wylacz, >0 = wlacz
+        if hasattr(self, 'btn_fan'):
+            if spd > 0:
+                self.fan_on = True
+                self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+            else:
+                self.fan_on = False
+                self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
 
     def do_freeze(self):
         """Zamroz gal do stanu stalego (wymiana probki)"""
