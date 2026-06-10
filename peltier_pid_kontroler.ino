@@ -359,46 +359,69 @@ int compPID(float temp){
     else   {Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;}
   }
 
-  // Dystans do celu finalnego
-  float distToTgt=abs(spT-temp);
-  bool atT=(abs(spA-spT)<0.5f);
+  // Dystans rampy do celu finalnego
+  float spDistTgt=fabs(spT-spA);     // ile setpoint ma jeszcze do celu
+  bool atT=(spDistTgt<0.5f);          // setpoint dobil do celu
 
-  // BEZ anti-windup brake – nie hamujemy przed celem
-  // Akceptujemy male przeregulowanie (1-2C)
-  // Integracja z anti-windup
-  ig=constrain(ig+err*dt,-INTEGRAL_MAX,INTEGRAL_MAX);
+  // ── WSPOLCZYNNIK PRZEJSCIA (0..1) ──────────────────────
+  // Plynne wygaszanie feed-forward i mocy w poblizu celu.
+  // Zamiast binarnego ciecia (skok!), moc maleje stopniowo
+  // gdy setpoint zbliza sie do celu w ostatnich BLEND_C stopniach.
+  const float BLEND_C=4.0f;
+  float blend=1.0f;
+  if(spDistTgt<BLEND_C) blend=spDistTgt/BLEND_C;  // liniowo 1->0
+
+  // ── MIEKKI START RAMPY (0..1) ──────────────────────────
+  // Feed-forward narasta przez pierwsze RAMP_RISE_MS od startu rampy,
+  // zamiast wskakiwac od razu (likwiduje schodki na starcie).
+  float soft=1.0f;
+  unsigned long sinceRamp=millis()-tR;
+  const unsigned long RAMP_RISE_MS=3000;
+  if(sinceRamp<RAMP_RISE_MS) soft=(float)sinceRamp/RAMP_RISE_MS;
+
+  // ── ANTI-WINDUP ────────────────────────────────────────
+  // Integruj tylko gdy nie nasycamy wyjscia w te sama strone.
+  // Zapobiega przeladowaniu integratora podczas dlugiej rampy,
+  // ktory przy dojsciu do celu powodowal przestrzelenie i skok w dol.
+  float igLim = INTEGRAL_MAX * (atT ? 1.0f : 0.5f); // mniejszy limit na rampie
+  float igNew = ig + err*dt;
+  igNew = constrain(igNew, -igLim, igLim);
 
   // Derywata
   float dv=(err-pe)/dt;pe=err;
 
-  // Wyjscie PID
-  float out=Kp*err+Ki*ig+Kd*dv;
-
-  // ── FEED-FORWARD RAMPY ──────────────────────────────
-  // Podczas rampy dodaj wyprzedzajaca moc ~ do zadanego rate.
-  // Dzieki temu temperatura "goni" setpoint bez opoznienia
-  // zamiast czekac az narosnie blad. Wspolczynnik dobrany empirycznie.
+  // ── FEED-FORWARD (plynny) ──────────────────────────────
+  float ff=0;
   if(!atT){
-    float rate=htg?rU:-rD;            // zadany rate [C/min]
-    float ff=rate*FF_GAIN;            // moc wyprzedzajaca
-    out+=ff;
+    float rate=htg?rU:-rD;
+    ff = rate*FF_GAIN*blend*soft;  // wygaszany przy celu i na starcie
   }
 
-  // OCHRONA STARTU: lagodne ograniczenie tylko w 1szej sekundzie
-  // Po starcie pelna moc jest dozwolona
-  float spDist=abs(spA-temp);
-  if(spDist<0.5f && htg && out>PWM_MAX*0.7f) {
-    out=PWM_MAX*0.7f; // max 70% na start
-  } else if(spDist<0.5f && !htg && out<-PWM_MAX*0.7f) {
-    out=-PWM_MAX*0.7f;
-  }
+  // Wyjscie PID + FF
+  float pidOut = Kp*err + Ki*igNew + Kd*dv;
+  float out = pidOut + ff;
 
-  // Jednostronne sterowanie podczas rampy
-  if(!atT){
-    if(htg) out=constrain(out,0,PWM_MAX);
-    else    out=constrain(out,-PWM_MAX,0);
+  // Anti-windup: cofnij integracje jesli wyjscie nasycone
+  if((out>PWM_MAX && err>0) || (out<-PWM_MAX && err<0)){
+    // nie powiekszaj integratora gdy juz na maksie
   } else {
-    // Przy celu – pelna moc obydwa kierunki
+    ig = igNew;  // akceptuj integracje tylko gdy nie nasycone
+  }
+
+  // ── MIEKKIE OGRANICZENIE MOCY PRZY CELU ────────────────
+  // W strefie przejscia ogranicz max moc proporcjonalnie,
+  // zeby nie bylo gwaltownego ruchu gdy temp dochodzi do celu.
+  float maxOut = PWM_MAX;
+  if(spDistTgt<BLEND_C && fabs(err)<2.0f){
+    // blisko celu i maly blad - ogranicz moc plynnie
+    maxOut = PWM_MAX*(0.4f + 0.6f*blend);
+  }
+
+  // Jednostronne sterowanie podczas rampy, dwustronne przy celu
+  if(!atT){
+    if(htg) out=constrain(out,0,maxOut);
+    else    out=constrain(out,-maxOut,0);
+  } else {
     out=constrain(out,-PWM_MAX,PWM_MAX);
   }
 
