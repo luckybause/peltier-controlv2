@@ -1364,29 +1364,44 @@ class PeltierControl:
         hd.pack(fill='x', pady=(0, 12))
         tk.Label(hd, text="CYCLE ARCHIVE", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
+        tk.Label(hd, text="  tip: tick boxes to overlay & compare cycles",
+                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8))).pack(side='left', padx=(8, 0))
         mk_btn(hd, "REFRESH", self.refresh_arch, C['cyan']).pack(side='right')
 
         body = tk.Frame(wrap, bg=C['bg'])
         body.pack(fill='both', expand=True)
 
-        # Lista plikow
-        lf = tk.Frame(body, bg=C['panel'], width=280)
+        # Lista cykli z checkboxami (do porownywania)
+        lf = tk.Frame(body, bg=C['panel'], width=300)
         lf.pack(side='left', fill='y', padx=(0, 12))
         lf.pack_propagate(False)
         tk.Frame(lf, bg=C['purple'], height=3).pack(fill='x')
-        tk.Label(lf, text="SAVED CYCLES", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', padx=12, pady=8)
-        sb = tk.Scrollbar(lf)
-        sb.pack(side='right', fill='y')
-        self.a_list = tk.Listbox(lf, bg=C['bg2'], fg=C['text'],
-                                font=(FONT, fsz(9)), selectbackground=C['purple'],
-                                borderwidth=0, highlightthickness=0,
-                                yscrollcommand=sb.set, activestyle='none')
-        self.a_list.pack(side='left', fill='both', expand=True, padx=8, pady=(0, 8))
-        sb.config(command=self.a_list.yview)
-        self.a_list.bind('<<ListboxSelect>>', self.load_arch)
+        lhd = tk.Frame(lf, bg=C['panel'])
+        lhd.pack(fill='x', padx=12, pady=8)
+        tk.Label(lhd, text="SAVED CYCLES", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+        mk_btn_outline(lhd, "CLEAR", self._arch_clear_sel, C['dim']).pack(side='right')
 
-        # Wykres archiwum
+        # Przewijalna lista checkboxow
+        list_wrap = tk.Frame(lf, bg=C['bg2'])
+        list_wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+        asb = tk.Scrollbar(list_wrap)
+        asb.pack(side='right', fill='y')
+        self.arch_canvas = tk.Canvas(list_wrap, bg=C['bg2'], highlightthickness=0,
+                                    yscrollcommand=asb.set)
+        self.arch_canvas.pack(side='left', fill='both', expand=True)
+        asb.config(command=self.arch_canvas.yview)
+        self.arch_items = tk.Frame(self.arch_canvas, bg=C['bg2'])
+        self.arch_canvas.create_window((0, 0), window=self.arch_items, anchor='nw')
+        self.arch_items.bind('<Configure>',
+            lambda e: self.arch_canvas.config(scrollregion=self.arch_canvas.bbox('all')))
+        self.arch_canvas.bind('<Enter>', lambda e: self.arch_canvas.bind_all(
+            '<MouseWheel>', lambda ev: self.arch_canvas.yview_scroll(int(-ev.delta/120), 'units')))
+        self.arch_canvas.bind('<Leave>', lambda e: self.arch_canvas.unbind_all('<MouseWheel>'))
+
+        self.arch_vars = {}   # {path: BooleanVar}
+
+        # Wykres
         cf = tk.Frame(body, bg=C['panel'])
         cf.pack(side='left', fill='both', expand=True)
         tk.Frame(cf, bg=C['border2'], height=3).pack(fill='x')
@@ -1396,11 +1411,9 @@ class PeltierControl:
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
         self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
 
-        # Pasek narzedzi pod wykresem archiwum
+        # Pasek narzedzi
         atb = tk.Frame(cf, bg=C['panel'])
         atb.pack(fill='x', padx=8, pady=(0, 8))
-
-        # Toolbar matplotlib (zoom, pan, zapis PNG)
         tbf = tk.Frame(atb, bg=C['panel'])
         tbf.pack(side='left')
         try:
@@ -1411,97 +1424,61 @@ class PeltierControl:
         except Exception as e:
             print(f"arch toolbar err: {e}")
 
-        # Przyciski eksportu (prawa strona)
-        mk_btn_outline(atb, "⤓ EXPORT CSV", self.export_arch_csv, C['green']).pack(
+        mk_btn_outline(atb, "⤓ CSV", self.export_arch_csv, C['green']).pack(
             side='right', padx=(4, 0))
-        mk_btn_outline(atb, "⤓ SAVE CHART", self.save_arch_chart, C['cyan']).pack(
+        mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(
             side='right', padx=(4, 0))
-        mk_btn_outline(atb, "📁 OPEN FOLDER", self.open_log_folder, C['dim']).pack(
+        mk_btn_outline(atb, "📁", self.open_log_folder, C['dim']).pack(
             side='right', padx=(4, 0))
+        # Tryb osi X: czas absolutny vs znormalizowany (do porownania)
+        self.arch_align = tk.BooleanVar(value=True)
+        tk.Checkbutton(atb, text="align from t=0", variable=self.arch_align,
+                      command=self._redraw_arch, bg=C['panel'], fg=C['dim'],
+                      selectcolor=C['bg2'], activebackground=C['panel'],
+                      font=(FONT, fsz(8)), bd=0, highlightthickness=0).pack(side='right', padx=8)
 
         self.refresh_arch()
 
-    def _selected_arch_path(self):
-        """Zwroc sciezke aktualnie zaznaczonego cyklu w archiwum"""
-        s = self.a_list.curselection()
-        if not s: return None
-        fs = sorted(self.log_dir.glob("cykl_*.csv"), reverse=True)
-        if s[0] >= len(fs): return None
-        return fs[s[0]]
-
-    def export_arch_csv(self):
-        """Eksportuj zaznaczony cykl CSV do wybranego miejsca"""
-        path = self._selected_arch_path()
-        if not path:
-            messagebox.showinfo("No selection", "Select a cycle from the list first.")
-            return
-        try:
-            from tkinter import filedialog
-            dest = filedialog.asksaveasfilename(
-                title="Export cycle CSV",
-                defaultextension=".csv",
-                initialfile=path.name,
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-            if dest:
-                import shutil
-                shutil.copy(path, dest)
-                messagebox.showinfo("Exported", f"Cycle exported to:\n{dest}")
-        except Exception as e:
-            messagebox.showerror("Export error", str(e))
-
-    def save_arch_chart(self):
-        """Zapisz wykres zaznaczonego cyklu jako PNG"""
-        path = self._selected_arch_path()
-        if not path:
-            messagebox.showinfo("No selection", "Select a cycle from the list first.")
-            return
-        try:
-            from tkinter import filedialog
-            dest = filedialog.asksaveasfilename(
-                title="Save chart as image",
-                defaultextension=".png",
-                initialfile=f"{path.stem}.png",
-                filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
-            if dest:
-                self.fig_a.savefig(dest, dpi=150, facecolor=C['panel'],
-                                   bbox_inches='tight')
-                messagebox.showinfo("Saved", f"Chart saved to:\n{dest}")
-        except Exception as e:
-            messagebox.showerror("Save error", str(e))
-
-    def open_log_folder(self):
-        """Otworz folder z logami w eksploratorze"""
-        try:
-            import subprocess
-            p = str(self.log_dir)
-            if sys.platform == 'win32':
-                os.startfile(p)
-            elif sys.platform == 'darwin':
-                subprocess.run(['open', p])
-            else:
-                subprocess.run(['xdg-open', p])
-        except Exception as e:
-            messagebox.showinfo("Folder", f"Logs are in:\n{self.log_dir}")
-
     def refresh_arch(self):
-        self.a_list.delete(0, 'end')
-        for f in sorted(self.log_dir.glob("cykl_*.csv"), reverse=True):
-            self.a_list.insert('end', f"  {f.stem}")
+        # Wyczysc liste checkboxow
+        for w in self.arch_items.winfo_children():
+            w.destroy()
+        self.arch_vars = {}
+        files = sorted(self.log_dir.glob("cykl_*.csv"), reverse=True)
+        # Paleta kolorow dla porownania
+        self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
+                            C['cyan'], C['purple'], C['yellow'], '#ff8fab']
+        for i, f in enumerate(files):
+            row = tk.Frame(self.arch_items, bg=C['bg2'])
+            row.pack(fill='x', pady=1)
+            var = tk.BooleanVar(value=False)
+            self.arch_vars[str(f)] = var
+            # Kolorowy kwadracik (kolor na wykresie)
+            col = self._arch_colors[i % len(self._arch_colors)]
+            dot = tk.Frame(row, bg=col, width=10, height=10)
+            dot.pack(side='left', padx=(4, 4))
+            dot.pack_propagate(False)
+            cb = tk.Checkbutton(row, text=f.stem.replace('cykl_', ''),
+                               variable=var, command=self._redraw_arch,
+                               bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
+                               activebackground=C['bg2'], activeforeground=col,
+                               font=(FONT, fsz(9)), bd=0, highlightthickness=0,
+                               anchor='w')
+            cb.pack(side='left', fill='x', expand=True)
 
-    def load_arch(self, evt=None):
-        s = self.a_list.curselection()
-        if not s: return
-        fs = sorted(self.log_dir.glob("cykl_*.csv"), reverse=True)
-        if s[0] >= len(fs): return
-        path = fs[s[0]]
+    def _arch_clear_sel(self):
+        """Odznacz wszystkie cykle"""
+        for v in self.arch_vars.values():
+            v.set(False)
+        self._redraw_arch()
+
+    def _load_cycle_data(self, path):
+        """Wczytaj dane cyklu z CSV (odporne na komentarze). Zwraca (t,temp,spt,pwm) lub None"""
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = list(csv.DictReader(f))
-        except Exception as e:
-            print(f"load err: {e}"); return
-        if not data: return
-
-        # Parsuj wiersze pomijajac komentarze i bledne (odporne na stare pliki)
+        except Exception:
+            return None
         t, temp, spt, pwm = [], [], [], []
         for r in data:
             cz = r.get('czas_s', '')
@@ -1514,42 +1491,143 @@ class PeltierControl:
             except (ValueError, TypeError):
                 continue
             t.append(tt); temp.append(tm); spt.append(sp)
-            # PWM% opcjonalny
             try:
                 pwm.append(float(r.get('PWM_%', r.get('PWM', 0))))
             except:
                 pwm.append(0)
         if not t:
-            print("Brak poprawnych danych w pliku")
-            return
+            return None
+        return t, temp, spt, pwm
 
-        # Statystyki cyklu
-        tmin, tmax = min(temp), max(temp)
-        duration = t[-1] - t[0] if len(t) > 1 else 0
-        # Srednia rampa narastania (od startu do max)
-        idx_max = temp.index(tmax)
-        rise_time = t[idx_max] - t[0] if idx_max > 0 else 0
-        avg_rise = (tmax - temp[0]) / (rise_time / 60.0) if rise_time > 5 else 0
-
+    def _redraw_arch(self):
+        """Narysuj wszystkie zaznaczone cykle (porownanie)"""
+        selected = [(p, v) for p, v in self.arch_vars.items() if v.get()]
         self.ax_a.clear()
         self.ax_a.set_facecolor(C['panel2'])
-        self.ax_a.plot(t, spt, color=C['orange'], lw=1.3, ls='--', label='target', alpha=0.7)
-        self.ax_a.plot(t, temp, color=C['blue'], lw=2, label='temp')
-        self.ax_a.set_xlabel('time [s]', color=C['dim'], fontsize=9)
+
+        if not selected:
+            self.ax_a.text(0.5, 0.5, "Tick one or more cycles to display",
+                          ha='center', va='center', color=C['dim2'],
+                          fontsize=11, transform=self.ax_a.transAxes)
+            self.cv_a.draw()
+            return
+
+        files = sorted(self.log_dir.glob("cykl_*.csv"), reverse=True)
+        file_order = {str(f): i for i, f in enumerate(files)}
+        align = self.arch_align.get()
+
+        multi = len(selected) > 1
+        for path, _ in selected:
+            d = self._load_cycle_data(path)
+            if not d: continue
+            t, temp, spt, pwm = d
+            ci = file_order.get(path, 0) % len(self._arch_colors)
+            col = self._arch_colors[ci]
+            # Os X: od zera (align) albo absolutna
+            t0 = t[0] if align else 0
+            tx = [x - t0 for x in t]
+            from pathlib import Path as _P
+            name = _P(path).stem.replace('cykl_', '')
+            # Przy jednym cyklu pokaz tez target; przy wielu tylko temp (czytelniej)
+            if not multi:
+                self.ax_a.plot(tx, spt, color=C['orange'], lw=1.2, ls='--',
+                              label='target', alpha=0.6)
+                self.ax_a.plot(tx, temp, color=col, lw=2, label=name)
+            else:
+                self.ax_a.plot(tx, temp, color=col, lw=1.8, label=name)
+
+        self.ax_a.set_xlabel('time [s]' + ('  (aligned from 0)' if align else ''),
+                            color=C['dim'], fontsize=9)
         self.ax_a.set_ylabel('°C', color=C['dim'], fontsize=9)
         self.ax_a.tick_params(colors=C['dim'], labelsize=8)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
-                        labelcolor=C['dim'], fontsize=9)
+                        labelcolor=C['dim'], fontsize=8, loc='best')
         self.ax_a.grid(True, alpha=0.3, color=C['grid'])
         for sp in self.ax_a.spines.values():
             sp.set_color(C['border'])
-        # Tytul ze statystykami
-        m = int(duration // 60); s2 = int(duration % 60)
-        self.ax_a.set_title(
-            f"{path.stem}  ·  {tmin:.1f}-{tmax:.1f}°C  ·  {m}m{s2}s  ·  avg rise {avg_rise:.2f}°C/min",
-            color=C['dim'], fontsize=9, loc='left')
+
+        # Tytul: statystyki (jeden cykl) lub liczba porownywanych
+        if not multi:
+            d = self._load_cycle_data(selected[0][0])
+            if d:
+                t, temp, spt, pwm = d
+                tmin, tmax = min(temp), max(temp)
+                dur = t[-1] - t[0] if len(t) > 1 else 0
+                idx_max = temp.index(tmax)
+                rise_time = t[idx_max] - t[0] if idx_max > 0 else 0
+                avg_rise = (tmax - temp[0]) / (rise_time / 60.0) if rise_time > 5 else 0
+                m = int(dur // 60); s2 = int(dur % 60)
+                self.ax_a.set_title(
+                    f"{tmin:.1f}-{tmax:.1f}°C · {m}m{s2}s · avg rise {avg_rise:.2f}°C/min",
+                    color=C['dim'], fontsize=9, loc='left')
+        else:
+            self.ax_a.set_title(f"Comparing {len(selected)} cycles",
+                              color=C['dim'], fontsize=9, loc='left')
         self.fig_a.tight_layout()
         self.cv_a.draw()
+
+    def _selected_arch_path(self):
+        """Pierwszy zaznaczony cykl (do eksportu)"""
+        for p, v in self.arch_vars.items():
+            if v.get():
+                from pathlib import Path as _P
+                return _P(p)
+        return None
+
+    def export_arch_csv(self):
+        """Eksportuj zaznaczony cykl CSV"""
+        path = self._selected_arch_path()
+        if not path:
+            messagebox.showinfo("No selection", "Tick a cycle in the list first.")
+            return
+        try:
+            from tkinter import filedialog
+            dest = filedialog.asksaveasfilename(
+                title="Export cycle CSV", defaultextension=".csv",
+                initialfile=path.name,
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+            if dest:
+                import shutil
+                shutil.copy(path, dest)
+                messagebox.showinfo("Exported", f"Cycle exported to:\n{dest}")
+        except Exception as e:
+            messagebox.showerror("Export error", str(e))
+
+    def save_arch_chart(self):
+        """Zapisz aktualny wykres (z porownaniem) jako obraz"""
+        if not any(v.get() for v in self.arch_vars.values()):
+            messagebox.showinfo("No selection", "Tick at least one cycle first.")
+            return
+        try:
+            from tkinter import filedialog
+            dest = filedialog.asksaveasfilename(
+                title="Save chart as image", defaultextension=".png",
+                initialfile="comparison.png",
+                filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
+            if dest:
+                self.fig_a.savefig(dest, dpi=150, facecolor=C['panel'],
+                                   bbox_inches='tight')
+                messagebox.showinfo("Saved", f"Chart saved to:\n{dest}")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
+
+    def open_log_folder(self):
+        """Otworz folder z logami"""
+        try:
+            import subprocess
+            p = str(self.log_dir)
+            if sys.platform == 'win32':
+                os.startfile(p)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', p])
+            else:
+                subprocess.run(['xdg-open', p])
+        except Exception:
+            messagebox.showinfo("Folder", f"Logs are in:\n{self.log_dir}")
+
+    def load_arch(self, evt=None):
+        """Zachowane dla kompatybilnosci - przekierowuje do redraw"""
+        self._redraw_arch()
 
 
     # ────────────────────────────────────────────────────
