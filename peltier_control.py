@@ -278,6 +278,7 @@ class PeltierControl:
 
         # Zapis kalibracji na dysku PC
         self.cal_file = self.log_dir / "kalibracja.json"
+        self.presets_file = self.log_dir / "presety.json"
         self._caldump_buf = []     # bufor odbieranych profili
         self._caldump_active = False
         self._caldump_purpose = None  # 'save' lub None
@@ -967,8 +968,13 @@ class PeltierControl:
                  fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
 
         # Profile wieloetapowe
-        mk_btn_outline(inner, "PROFILES", self.open_profiles, C['purple']).pack(
-            fill='x', pady=(0, 8))
+        # Profile + Presety
+        bf_pp = tk.Frame(inner, bg=C['bg2'])
+        bf_pp.pack(fill='x', pady=(0, 8))
+        mk_btn_outline(bf_pp, "PROFILES", self.open_profiles, C['purple']).pack(
+            side='left', fill='x', expand=True, padx=(0, 3))
+        mk_btn_outline(bf_pp, "PRESETS", self.open_presets, C['green']).pack(
+            side='left', fill='x', expand=True, padx=(3, 0))
 
         # Status kalibracji - klikalny (gdy kalibracja trwa, pokazuje postep)
         self.cal_status = tk.Label(inner, text="", bg=C['bg2'], fg=C['purple'],
@@ -1282,6 +1288,67 @@ class PeltierControl:
         ProfileWindow(self.root, self)
 
     # ────────────────────────────────────────────────────
+    #  PRESETY - zapisywalne zestawy nastaw
+    # ────────────────────────────────────────────────────
+    def _gather_settings(self):
+        """Zbierz wszystkie aktualne nastawy z suwakow"""
+        s = {}
+        for key, attr in [('sp','sl_sp'),('ru','sl_ru'),('rd','sl_rd'),
+                          ('tmax','sl_tmax'),('kp','sl_kp'),('ki','sl_ki'),
+                          ('kd','sl_kd'),('off','sl_off'),('fan','sl_fan')]:
+            if hasattr(self, attr):
+                try: s[key] = getattr(self, attr).get()
+                except: pass
+        return s
+
+    def _load_presets(self):
+        """Wczytaj presety z pliku JSON"""
+        if not self.presets_file.exists():
+            return {}
+        try:
+            with open(self.presets_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def _save_presets(self, presets):
+        """Zapisz presety do pliku JSON"""
+        try:
+            with open(self.presets_file, 'w', encoding='utf-8') as f:
+                json.dump(presets, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"presets save err: {e}")
+            return False
+
+    def open_presets(self):
+        """Otworz okno zarzadzania presetami"""
+        PresetWindow(self.root, self)
+
+    def apply_preset(self, settings):
+        """Zastosuj preset - ustaw suwaki i wyslij do urzadzenia"""
+        mapping = [('sp','sl_sp','SP',1),('ru','sl_ru','RU',1),('rd','sl_rd','RD',1),
+                   ('tmax','sl_tmax','TMAX',0),('kp','sl_kp','KP',1),('ki','sl_ki','KI',2),
+                   ('kd','sl_kd','KD',2),('off','sl_off','OFFSET',1),('fan','sl_fan','FAN',0)]
+        for key, attr, cmd, dec in mapping:
+            if key in settings and hasattr(self, attr):
+                val = settings[key]
+                try:
+                    getattr(self, attr).set(val, silent=True)
+                    if self.connected:
+                        self.send(f"{cmd}:{val:.{dec}f}")
+                except Exception as e:
+                    print(f"apply preset {key}: {e}")
+        # Aktualizuj stan wentylatora wg fan
+        if 'fan' in settings and hasattr(self, 'btn_fan'):
+            fv = settings['fan']
+            self.fan_on = (fv > 0)
+            if fv > 0:
+                self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
+            else:
+                self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+
+    # ────────────────────────────────────────────────────
     #  ZAKLADKA POLACZENIE
     # ────────────────────────────────────────────────────
     def build_conn(self, parent):
@@ -1411,33 +1478,42 @@ class PeltierControl:
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
         self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
 
-        # Pasek narzedzi
-        atb = tk.Frame(cf, bg=C['panel'])
-        atb.pack(fill='x', padx=8, pady=(0, 8))
-        tbf = tk.Frame(atb, bg=C['panel'])
-        tbf.pack(side='left')
+        # Pasek narzedzi - toolbar matplotlib w OSOBNYM wierszu (pełna szerokość)
+        # Osobny wiersz zapobiega kolizji z przyciskami po prawej
+        tbf = tk.Frame(cf, bg=C['panel'])
+        tbf.pack(fill='x', padx=8, pady=(4, 0))
         try:
             self.mpl_toolbar_a = NavigationToolbar2Tk(self.cv_a, tbf, pack_toolbar=False)
             self.mpl_toolbar_a.config(bg=C['panel'])
             self.mpl_toolbar_a.update()
-            self.mpl_toolbar_a.pack(side='left')
+            self.mpl_toolbar_a.pack(side='left', fill='x')
         except Exception as e:
             print(f"arch toolbar err: {e}")
+
+        # Przyciski eksportu - wiersz pod toolbarem
+        atb = tk.Frame(cf, bg=C['panel'])
+        atb.pack(fill='x', padx=8, pady=(2, 8))
 
         mk_btn_outline(atb, "⤓ CSV", self.export_arch_csv, C['green']).pack(
             side='right', padx=(4, 0))
         mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(
             side='right', padx=(4, 0))
+        mk_btn_outline(atb, "📄 PDF", self.export_arch_pdf, C['orange']).pack(
+            side='right', padx=(4, 0))
+        mk_btn_outline(atb, "📊 STATS", self.show_arch_stats, C['purple']).pack(
+            side='right', padx=(4, 0))
         mk_btn_outline(atb, "📁", self.open_log_folder, C['dim']).pack(
             side='right', padx=(4, 0))
-        # Tryb osi X: czas absolutny vs znormalizowany (do porownania)
+        # Tryb osi X
         self.arch_align = tk.BooleanVar(value=True)
         tk.Checkbutton(atb, text="align from t=0", variable=self.arch_align,
                       command=self._redraw_arch, bg=C['panel'], fg=C['dim'],
                       selectcolor=C['bg2'], activebackground=C['panel'],
-                      font=(FONT, fsz(8)), bd=0, highlightthickness=0).pack(side='right', padx=8)
+                      font=(FONT, fsz(8)), bd=0, highlightthickness=0).pack(side='left')
 
         self.refresh_arch()
+        # Narysuj pusty wykres od razu - inicjalizuje canvas i toolbar
+        self._redraw_arch()
 
     def refresh_arch(self):
         # Wyczysc liste checkboxow
@@ -1498,6 +1574,59 @@ class PeltierControl:
         if not t:
             return None
         return t, temp, spt, pwm
+
+    def _compute_stats(self, data):
+        """Oblicz pelne statystyki przebiegu. data=(t,temp,spt,pwm). Zwraca dict."""
+        import statistics
+        t, temp, spt, pwm = data
+        st = {}
+        st['tmin'] = min(temp)
+        st['tmax'] = max(temp)
+        st['duration'] = t[-1] - t[0] if len(t) > 1 else 0
+        st['target'] = spt[-1] if spt else 0
+
+        # Srednie tempo narastania (start -> max)
+        idx_max = temp.index(st['tmax'])
+        rise_time = t[idx_max] - t[0] if idx_max > 0 else 0
+        st['avg_rise'] = (st['tmax'] - temp[0]) / (rise_time/60.0) if rise_time > 5 else 0
+
+        # Overshoot - ile temp przekroczyla target (w fazie ustalonej)
+        target = st['target']
+        st['overshoot'] = max(0, st['tmax'] - target) if target else 0
+
+        # Czas ustalania - kiedy temp weszla i zostala w +/-1C od target
+        st['settle_time'] = None
+        if target:
+            band = 1.0
+            for i, tm in enumerate(temp):
+                if abs(tm - target) <= band:
+                    # sprawdz czy zostala w pasie do konca (lub przez 80% reszty)
+                    rest = temp[i:]
+                    in_band = sum(1 for x in rest if abs(x-target) <= band)
+                    if in_band >= len(rest)*0.8:
+                        st['settle_time'] = t[i] - t[0]
+                        break
+
+        # Blad ustalony - srednie odchylenie w ostatnich 20% probek
+        n = len(temp)
+        tail = temp[int(n*0.8):] if n > 5 else temp
+        if target and tail:
+            st['steady_error'] = statistics.mean(abs(x - target) for x in tail)
+        else:
+            st['steady_error'] = 0
+
+        # Max odchylenie od setpointu (rampy) - jak dobrze nadazal
+        devs = [abs(temp[i] - spt[i]) for i in range(len(temp))]
+        st['max_dev'] = max(devs) if devs else 0
+
+        # Odchylenie standardowe szumu - w fazie ustalonej (ostatnie 20%)
+        # To miara jakosci pomiaru (szum termopary)
+        if len(tail) > 2:
+            st['noise_std'] = statistics.stdev(tail)
+        else:
+            st['noise_std'] = 0
+
+        return st
 
     def _redraw_arch(self):
         """Narysuj wszystkie zaznaczone cykle (porownanie)"""
@@ -1628,6 +1757,162 @@ class PeltierControl:
     def load_arch(self, evt=None):
         """Zachowane dla kompatybilnosci - przekierowuje do redraw"""
         self._redraw_arch()
+
+    def show_arch_stats(self):
+        """Pokaz okno ze statystykami zaznaczonego cyklu"""
+        path = self._selected_arch_path()
+        if not path:
+            messagebox.showinfo("No selection", "Tick a cycle in the list first.")
+            return
+        data = self._load_cycle_data(path)
+        if not data:
+            messagebox.showerror("Error", "Could not load cycle data.")
+            return
+        st = self._compute_stats(data)
+
+        win = tk.Toplevel(self.root)
+        win.title("Cycle statistics")
+        win.configure(bg=C['bg'])
+        win.geometry("440x520")
+        win.transient(self.root)
+        tk.Frame(win, bg=C['purple'], height=4).pack(fill='x')
+        inner = tk.Frame(win, bg=C['bg'])
+        inner.pack(fill='both', expand=True, padx=24, pady=20)
+
+        from pathlib import Path as _P
+        tk.Label(inner, text="CYCLE STATISTICS", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+        tk.Label(inner, text=_P(path).stem.replace('cykl_', ''), bg=C['bg'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+
+        def settle_str():
+            return f"{st['settle_time']:.0f} s" if st['settle_time'] is not None else "not reached"
+
+        rows = [
+            ("Temperature range", f"{st['tmin']:.1f} – {st['tmax']:.1f} °C", C['blue']),
+            ("Target", f"{st['target']:.1f} °C", C['orange']),
+            ("Duration", f"{int(st['duration']//60)}m {int(st['duration']%60)}s", C['text']),
+            ("Avg rise rate", f"{st['avg_rise']:.2f} °C/min", C['cyan']),
+            ("─", "", None),
+            ("Overshoot", f"{st['overshoot']:.2f} °C", C['red'] if st['overshoot']>1 else C['green']),
+            ("Settling time (±1°C)", settle_str(), C['text']),
+            ("Steady-state error", f"{st['steady_error']:.3f} °C", C['text']),
+            ("Max deviation from ramp", f"{st['max_dev']:.2f} °C", C['text']),
+            ("─", "", None),
+            ("Noise σ (measurement quality)", f"±{st['noise_std']:.3f} °C", 
+             C['green'] if st['noise_std']<0.2 else C['yellow'] if st['noise_std']<0.5 else C['red']),
+        ]
+        for label, val, col in rows:
+            if label == "─":
+                tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=8)
+                continue
+            r = tk.Frame(inner, bg=C['bg2'])
+            r.pack(fill='x', pady=2)
+            tk.Label(r, text=label, bg=C['bg2'], fg=C['dim'],
+                     font=(FONT, fsz(9)), anchor='w').pack(side='left', padx=10, pady=6)
+            tk.Label(r, text=val, bg=C['bg2'], fg=col or C['text'],
+                     font=(FONT, fsz(10), 'bold'), anchor='e').pack(side='right', padx=10)
+
+        # Interpretacja szumu
+        noise = st['noise_std']
+        interp = ("Excellent - low noise" if noise < 0.2 else
+                  "Moderate noise" if noise < 0.5 else
+                  "High noise - check shielding/grounding")
+        tk.Label(inner, text=f"Noise: {interp}", bg=C['bg'],
+                 fg=C['dim2'], font=(FONT, fsz(8)), wraplength=380,
+                 justify='left').pack(anchor='w', pady=(12, 0))
+
+    def export_arch_pdf(self):
+        """Generuj raport PDF: wykres + statystyki + nastawy + data"""
+        path = self._selected_arch_path()
+        if not path:
+            messagebox.showinfo("No selection", "Tick a cycle in the list first.")
+            return
+        data = self._load_cycle_data(path)
+        if not data:
+            messagebox.showerror("Error", "Could not load cycle data.")
+            return
+
+        try:
+            from tkinter import filedialog
+            from pathlib import Path as _P
+            dest = filedialog.asksaveasfilename(
+                title="Save PDF report", defaultextension=".pdf",
+                initialfile=f"{_P(path).stem}_report.pdf",
+                filetypes=[("PDF report", "*.pdf")])
+            if not dest:
+                return
+            self._build_pdf_report(path, data, dest)
+            messagebox.showinfo("Report saved", f"PDF report saved to:\n{dest}")
+        except Exception as e:
+            messagebox.showerror("PDF error", f"Could not create report:\n{e}")
+
+    def _build_pdf_report(self, path, data, dest):
+        """Zbuduj raport PDF za pomoca matplotlib (bez dodatkowych bibliotek)"""
+        from matplotlib.backends.backend_pdf import PdfPages
+        from matplotlib.figure import Figure
+        from pathlib import Path as _P
+        import datetime
+
+        t, temp, spt, pwm = data
+        st = self._compute_stats(data)
+        # Os czasu od zera
+        t0 = t[0]
+        tx = [x - t0 for x in t]
+
+        with PdfPages(dest) as pdf:
+            fig = Figure(figsize=(8.27, 11.69))  # A4 pionowo
+            fig.patch.set_facecolor('white')
+
+            # Naglowek
+            fig.text(0.5, 0.96, "Peltier Control - Cycle Report", ha='center',
+                     fontsize=16, fontweight='bold')
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            fig.text(0.5, 0.935, f"{_P(path).stem.replace('cykl_','')}  ·  generated {ts}",
+                     ha='center', fontsize=9, color='gray')
+
+            # Wykres temperatury (gorna polowa)
+            ax1 = fig.add_axes([0.1, 0.55, 0.82, 0.32])
+            ax1.plot(tx, spt, color='#e8833a', lw=1.2, ls='--', label='target', alpha=0.7)
+            ax1.plot(tx, temp, color='#2b7fd4', lw=1.8, label='temperature')
+            ax1.set_xlabel('time [s]', fontsize=9)
+            ax1.set_ylabel('temperature [°C]', fontsize=9)
+            ax1.legend(fontsize=9, loc='best')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_title('Temperature profile', fontsize=11, loc='left')
+
+            # Wykres PWM (pod spodem)
+            ax2 = fig.add_axes([0.1, 0.40, 0.82, 0.10])
+            ax2.fill_between(tx, pwm, color='#3ea662', alpha=0.5)
+            ax2.set_xlabel('time [s]', fontsize=8)
+            ax2.set_ylabel('PWM [%]', fontsize=8)
+            ax2.grid(True, alpha=0.3)
+
+            # Tabela statystyk (dol)
+            def settle_str():
+                return f"{st['settle_time']:.0f} s" if st['settle_time'] is not None else "not reached"
+            stats_lines = [
+                ("STATISTICS", ""),
+                ("Temperature range", f"{st['tmin']:.1f} - {st['tmax']:.1f} °C"),
+                ("Target", f"{st['target']:.1f} °C"),
+                ("Duration", f"{int(st['duration']//60)}m {int(st['duration']%60)}s"),
+                ("Average rise rate", f"{st['avg_rise']:.2f} °C/min"),
+                ("Overshoot", f"{st['overshoot']:.2f} °C"),
+                ("Settling time (±1°C)", settle_str()),
+                ("Steady-state error", f"{st['steady_error']:.3f} °C"),
+                ("Max deviation from ramp", f"{st['max_dev']:.2f} °C"),
+                ("Noise σ (quality)", f"±{st['noise_std']:.3f} °C"),
+            ]
+            y = 0.32
+            for label, val in stats_lines:
+                if label == "STATISTICS":
+                    fig.text(0.1, y, label, fontsize=11, fontweight='bold')
+                else:
+                    fig.text(0.12, y, label, fontsize=9, color='#333')
+                    fig.text(0.55, y, val, fontsize=9, fontweight='bold')
+                y -= 0.025
+
+            pdf.savefig(fig)
 
 
     # ────────────────────────────────────────────────────
@@ -2186,6 +2471,124 @@ class CalibrationWindow:
             self.app.send("STOP")
             self.app.cal_running = False
             self.win.destroy()
+
+
+# ════════════════════════════════════════════════════════
+#  OKNO PRESETÓW (zapisywalne zestawy nastaw)
+# ════════════════════════════════════════════════════════
+class PresetWindow:
+    def __init__(self, parent, app):
+        self.app = app
+        self.win = tk.Toplevel(parent)
+        self.win.title("Presets")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("520x560")
+        self.win.minsize(480, 480)
+        self.win.transient(parent)
+        self.win.update_idletasks()
+        try:
+            px = parent.winfo_rootx() + parent.winfo_width()//2 - 260
+            py = parent.winfo_rooty() + parent.winfo_height()//2 - 280
+            self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
+        except: pass
+
+        tk.Frame(self.win, bg=C['green'], height=4).pack(fill='x')
+        inner = tk.Frame(self.win, bg=C['bg'])
+        inner.pack(fill='both', expand=True, padx=24, pady=20)
+
+        tk.Label(inner, text="PRESETS", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+        tk.Label(inner, text="Save & load complete settings (setpoint, ramps, PID, fan)",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+
+        # Zapis nowego presetu
+        save_box = tk.Frame(inner, bg=C['bg2'])
+        save_box.pack(fill='x', pady=(0, 16))
+        si = tk.Frame(save_box, bg=C['bg2'])
+        si.pack(fill='x', padx=12, pady=10)
+        tk.Label(si, text="Save current settings as:", bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 4))
+        erow = tk.Frame(si, bg=C['bg2'])
+        erow.pack(fill='x')
+        self.name_entry = tk.Entry(erow, bg=C['bg'], fg=C['text'], font=(FONT, fsz(11)),
+                                   relief='flat', bd=0, insertbackground=C['green'],
+                                   highlightthickness=2, highlightbackground=C['green'])
+        self.name_entry.pack(side='left', fill='x', expand=True, ipady=5, padx=(0, 8))
+        self.name_entry.insert(0, "My preset")
+        self.name_entry.bind('<Return>', lambda e: self.save_preset())
+        mk_btn(erow, "SAVE", self.save_preset, C['green']).pack(side='right')
+
+        # Lista zapisanych presetow
+        tk.Label(inner, text="SAVED PRESETS", bg=C['bg'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(0, 6))
+        list_wrap = tk.Frame(inner, bg=C['bg2'])
+        list_wrap.pack(fill='both', expand=True)
+        psb = tk.Scrollbar(list_wrap)
+        psb.pack(side='right', fill='y')
+        self.canvas = tk.Canvas(list_wrap, bg=C['bg2'], highlightthickness=0,
+                               yscrollcommand=psb.set)
+        self.canvas.pack(side='left', fill='both', expand=True)
+        psb.config(command=self.canvas.yview)
+        self.items = tk.Frame(self.canvas, bg=C['bg2'])
+        self.canvas.create_window((0, 0), window=self.items, anchor='nw')
+        self.items.bind('<Configure>',
+            lambda e: self.canvas.config(scrollregion=self.canvas.bbox('all')))
+
+        self.refresh_list()
+
+    def refresh_list(self):
+        for w in self.items.winfo_children():
+            w.destroy()
+        presets = self.app._load_presets()
+        if not presets:
+            tk.Label(self.items, text="No presets yet.\nSave current settings above.",
+                     bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9)), justify='left').pack(
+                     anchor='w', padx=12, pady=12)
+            return
+        for name, settings in presets.items():
+            row = tk.Frame(self.items, bg=C['bg2'])
+            row.pack(fill='x', pady=2, padx=4)
+            info = tk.Frame(row, bg=C['bg2'])
+            info.pack(side='left', fill='x', expand=True)
+            tk.Label(info, text=name, bg=C['bg2'], fg=C['text'],
+                     font=(FONT, fsz(10), 'bold'), anchor='w').pack(anchor='w')
+            # Krotki opis nastaw
+            desc = f"SP {settings.get('sp','?')}°C · ↑{settings.get('ru','?')} ↓{settings.get('rd','?')}°C/min · fan {settings.get('fan','?')}%"
+            tk.Label(info, text=desc, bg=C['bg2'], fg=C['dim2'],
+                     font=(FONT, fsz(8)), anchor='w').pack(anchor='w')
+            # Przyciski
+            mk_btn(row, "LOAD", lambda n=name: self.load_preset(n), C['green']).pack(
+                side='left', padx=(4, 2))
+            mk_btn_outline(row, "DEL", lambda n=name: self.del_preset(n), C['red']).pack(
+                side='left', padx=(2, 0))
+
+    def save_preset(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showinfo("Name required", "Enter a preset name.")
+            return
+        presets = self.app._load_presets()
+        if name in presets:
+            if not messagebox.askyesno("Overwrite?", f"Preset '{name}' exists. Overwrite?"):
+                return
+        presets[name] = self.app._gather_settings()
+        if self.app._save_presets(presets):
+            self.refresh_list()
+            messagebox.showinfo("Saved", f"Preset '{name}' saved.")
+
+    def load_preset(self, name):
+        presets = self.app._load_presets()
+        if name in presets:
+            self.app.apply_preset(presets[name])
+            messagebox.showinfo("Loaded", f"Preset '{name}' applied.")
+            self.win.destroy()
+
+    def del_preset(self, name):
+        if messagebox.askyesno("Delete?", f"Delete preset '{name}'?"):
+            presets = self.app._load_presets()
+            presets.pop(name, None)
+            self.app._save_presets(presets)
+            self.refresh_list()
 
 
 # ════════════════════════════════════════════════════════
