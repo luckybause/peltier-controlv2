@@ -291,6 +291,33 @@ class PeltierControl:
         self._build_ui()
         self._pulse()
         self.tick()
+        # Auto-polaczenie: sprobuj polaczyc z urzadzeniem po starcie
+        self.root.after(800, self._auto_connect)
+
+    def _auto_connect(self):
+        """Automatyczne polaczenie - wykryj i polacz z ItsyBitsy"""
+        if self.connected:
+            return
+        try:
+            ports = list(serial.tools.list_ports.comports())
+        except Exception:
+            return
+        if not ports:
+            return
+        # Priorytet: porty z opisem pasujacym do ItsyBitsy/Adafruit/USB
+        def score(p):
+            d = (p.description or '').lower()
+            m = (p.manufacturer or '').lower() if hasattr(p, 'manufacturer') else ''
+            s = 0
+            for kw in ['itsybitsy', 'adafruit', 'usb serial', 'usb-serial', 'circuitpython']:
+                if kw in d or kw in m: s += 10
+            # ItsyBitsy M0 VID = 0x239A (Adafruit)
+            if hasattr(p, 'vid') and p.vid == 0x239A: s += 20
+            return s
+        best = max(ports, key=score)
+        # Polacz tylko jesli cos sensownego (jakikolwiek port jesli jeden)
+        if score(best) > 0 or len(ports) == 1:
+            self.connect(best.device)
 
     def _build_styles(self):
         st = ttk.Style()
@@ -319,6 +346,7 @@ class PeltierControl:
             self.ser = serial.Serial(port, self.baud, timeout=0.5)
             self.port_name = port
             self.clear_buf()
+            self._cfg_synced = False  # pozwol na jednorazowa synchronizacje suwakow
             self.set_status(True, f"{port} - 115200")
             self.running = True
             threading.Thread(target=self.reader, daemon=True).start()
@@ -446,14 +474,18 @@ class PeltierControl:
 
     def _apply_cfg(self, d):
         try:
-            if 'SP' in d and hasattr(self, 'sl_sp'):    self.sl_sp.set(float(d['SP']))
-            if 'RU' in d and hasattr(self, 'sl_ru'):    self.sl_ru.set(float(d['RU']))
-            if 'RD' in d and hasattr(self, 'sl_rd'):    self.sl_rd.set(float(d['RD']))
-            if 'TMAX' in d and hasattr(self, 'sl_tmax'): self.sl_tmax.set(float(d['TMAX']))
-            if 'KP' in d and hasattr(self, 'sl_kp'):    self.sl_kp.set(float(d['KP']))
-            if 'KI' in d and hasattr(self, 'sl_ki'):    self.sl_ki.set(float(d['KI']))
-            if 'KD' in d and hasattr(self, 'sl_kd'):    self.sl_kd.set(float(d['KD']))
-            if 'OFFSET' in d and hasattr(self, 'sl_off'): self.sl_off.set(float(d['OFFSET']))
+            # Suwaki synchronizuj TYLKO przy pierwszym CFG po polaczeniu.
+            # Potem nastawy uzytkownika maja zostawac (nie nadpisuj po STOP itp.)
+            if not getattr(self, '_cfg_synced', False):
+                if 'SP' in d and hasattr(self, 'sl_sp'):    self.sl_sp.set(float(d['SP']))
+                if 'RU' in d and hasattr(self, 'sl_ru'):    self.sl_ru.set(float(d['RU']))
+                if 'RD' in d and hasattr(self, 'sl_rd'):    self.sl_rd.set(float(d['RD']))
+                if 'TMAX' in d and hasattr(self, 'sl_tmax'): self.sl_tmax.set(float(d['TMAX']))
+                if 'KP' in d and hasattr(self, 'sl_kp'):    self.sl_kp.set(float(d['KP']))
+                if 'KI' in d and hasattr(self, 'sl_ki'):    self.sl_ki.set(float(d['KI']))
+                if 'KD' in d and hasattr(self, 'sl_kd'):    self.sl_kd.set(float(d['KD']))
+                if 'OFFSET' in d and hasattr(self, 'sl_off'): self.sl_off.set(float(d['OFFSET']))
+                self._cfg_synced = True
             if 'CAL' in d:
                 self.dev_cal = (d['CAL'] == '1')
             if 'STATE' in d:
@@ -737,7 +769,7 @@ class PeltierControl:
             self._draw_dot(C['dim2'], glow=False)
             self.s_lbl.config(text=msg or "DISCONNECTED", fg=C['dim'])
         # Aktywuj/dezaktywuj panel
-        if hasattr(self, 'btn_start'):
+        if hasattr(self, 'btn_run'):
             self._set_panel_enabled(connected)
 
     # ────────────────────────────────────────────────────
@@ -760,17 +792,12 @@ class PeltierControl:
         # Przyciski START/STOP/E-STOP (prawa czesc paska) - zawsze widoczne
         ctrl = tk.Frame(topbar, bg=C['bg'])
         ctrl.pack(side='right', padx=(8, 0))
-        self.btn_start = tk.Button(ctrl, text="▶ START", command=self.do_start,
-                                   bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(13), 'bold'),
-                                   relief='flat', cursor='hand2', bd=0, padx=18, pady=14,
-                                   activebackground=_lighten(C['green'], 0.15))
-        self.btn_start.pack(side='left', padx=(0, 4), fill='y')
-        self.btn_stop = tk.Button(ctrl, text="■ STOP", command=self.do_stop,
-                                  bg=C['bg2'], fg=C['red'], font=(FONT, fsz(13), 'bold'),
-                                  relief='flat', cursor='hand2', bd=0, padx=18, pady=14,
-                                  highlightthickness=2, highlightbackground=C['red'],
-                                  activebackground=C['panel3'])
-        self.btn_stop.pack(side='left', padx=(0, 4), fill='y')
+        self.is_running = False  # stan: czy cykl trwa
+        self.btn_run = tk.Button(ctrl, text="▶ START", command=self.toggle_run,
+                                 bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(13), 'bold'),
+                                 relief='flat', cursor='hand2', bd=0, padx=22, pady=14,
+                                 activebackground=_lighten(C['green'], 0.15))
+        self.btn_run.pack(side='left', padx=(0, 4), fill='y')
         # FREEZE - zamroz gal do wymiany probki
         self.btn_freeze = tk.Button(ctrl, text="❄ FREEZE", command=self.do_freeze,
                                     bg=C['bg2'], fg=C['cyan'], font=(FONT, fsz(13), 'bold'),
@@ -1105,7 +1132,7 @@ class PeltierControl:
             if hasattr(self, sl):
                 getattr(self, sl).set_enabled(True)
         # Przyciski zawsze klikalnie - reaguja komunikatem jesli brak polaczenia
-        for b in ['btn_start', 'btn_stop', 'btn_st', 'btn_autocal', 'btn_estop', 'btn_freeze', 'btn_fan']:
+        for b in ['btn_run', 'btn_st', 'btn_autocal', 'btn_estop', 'btn_freeze', 'btn_fan']:
             if hasattr(self, b):
                 getattr(self, b).config(state='normal')
 
@@ -1113,6 +1140,25 @@ class PeltierControl:
     # ────────────────────────────────────────────────────
     #  AKCJE PRZYCISKOW
     # ────────────────────────────────────────────────────
+    def toggle_run(self):
+        """Przelacznik START/STOP w jednym przycisku"""
+        if self.is_running:
+            self.do_stop()
+        else:
+            self.do_start()
+
+    def _update_run_button(self, running):
+        """Aktualizuj wyglad przycisku: zielony START / czerwony STOP"""
+        self.is_running = running
+        if not hasattr(self, 'btn_run'):
+            return
+        if running:
+            self.btn_run.config(text="■ STOP", bg=C['red'], fg='#fff',
+                               activebackground=_lighten(C['red'], 0.15))
+        else:
+            self.btn_run.config(text="▶ START", bg=C['green'], fg='#1a1c1f',
+                               activebackground=_lighten(C['green'], 0.15))
+
     def do_start(self):
         """START - wyslij wszystkie nastawy z panelu, potem uruchom"""
         if not self.connected:
@@ -1129,12 +1175,14 @@ class PeltierControl:
         self.send(f"OFFSET:{self.sl_off.get():.1f}")
         time.sleep(0.05)
         self.send("START")
+        self._update_run_button(True)
 
     def do_stop(self):
         self.send("STOP")
         self.send("AUTOCALSTOP")  # przerwij tez kalibracje jesli trwa
         if hasattr(self, 'cal_status'):
             self.cal_status.config(text="")
+        self._update_run_button(False)
 
     def do_estop(self):
         """Awaryjne zatrzymanie - natychmiast wylacza PWM"""
@@ -1477,14 +1525,20 @@ class PeltierControl:
         self.ax_a.set_facecolor(C['panel2'])
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
         self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
+        # Pierwszy rysunek PRZED toolbarem - inicjalizuje canvas
+        self.cv_a.draw()
 
-        # Pasek narzedzi - toolbar matplotlib w OSOBNYM wierszu (pełna szerokość)
-        # Osobny wiersz zapobiega kolizji z przyciskami po prawej
-        tbf = tk.Frame(cf, bg=C['panel'])
+        # Pasek narzedzi matplotlib - WLASNY wiersz, po draw()
+        # Toolbar musi powstac po pierwszym draw, inaczej zoom/pan nie dzialaja
+        tbf = tk.Frame(cf, bg='#3a3f44')
         tbf.pack(fill='x', padx=8, pady=(4, 0))
         try:
             self.mpl_toolbar_a = NavigationToolbar2Tk(self.cv_a, tbf, pack_toolbar=False)
-            self.mpl_toolbar_a.config(bg=C['panel'])
+            self.mpl_toolbar_a.config(bg='#3a3f44')
+            # Przyciski toolbara czytelne na ciemnym tle
+            for child in self.mpl_toolbar_a.winfo_children():
+                try: child.config(bg='#3a3f44')
+                except: pass
             self.mpl_toolbar_a.update()
             self.mpl_toolbar_a.pack(side='left', fill='x')
         except Exception as e:
@@ -1510,6 +1564,14 @@ class PeltierControl:
                       command=self._redraw_arch, bg=C['panel'], fg=C['dim'],
                       selectcolor=C['bg2'], activebackground=C['panel'],
                       font=(FONT, fsz(8)), bd=0, highlightthickness=0).pack(side='left')
+
+        # Panel nastaw przebiegu (pokazuje SP/rampy/PID zaznaczonego cyklu)
+        self.arch_settings = tk.Frame(cf, bg=C['bg2'])
+        self.arch_settings.pack(fill='x', padx=8, pady=(0, 8))
+        self.arch_settings_lbl = tk.Label(self.arch_settings, text="",
+                                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
+                                         anchor='w', justify='left')
+        self.arch_settings_lbl.pack(fill='x', padx=10, pady=6)
 
         self.refresh_arch()
         # Narysuj pusty wykres od razu - inicjalizuje canvas i toolbar
@@ -1541,6 +1603,66 @@ class PeltierControl:
                                font=(FONT, fsz(9)), bd=0, highlightthickness=0,
                                anchor='w')
             cb.pack(side='left', fill='x', expand=True)
+            # Przycisk usuwania cyklu (X)
+            delb = tk.Button(row, text="✕", command=lambda p=f: self._delete_cycle(p),
+                            bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9), 'bold'),
+                            relief='flat', cursor='hand2', bd=0, padx=8,
+                            activebackground=C['red'], activeforeground='#fff')
+            delb.pack(side='right', padx=(0, 4))
+
+    def _delete_cycle(self, path):
+        """Usun plik cyklu z archiwum (z potwierdzeniem)"""
+        from pathlib import Path as _P
+        name = _P(path).stem.replace('cykl_', '')
+        if messagebox.askyesno("Delete cycle",
+                f"Permanently delete this cycle?\n\n{name}\n\nThis cannot be undone."):
+            try:
+                _P(path).unlink()
+                self.refresh_arch()
+                self._redraw_arch()
+            except Exception as e:
+                messagebox.showerror("Delete error", str(e))
+
+    def _cycle_settings(self, path):
+        """Odczytaj nastawy przebiegu z CSV: target SP, rampy, PID. Zwraca dict lub None"""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                rows = list(csv.DictReader(f))
+        except Exception:
+            return None
+        # Znajdz pierwszy poprawny wiersz danych
+        valid = [r for r in rows if r.get('czas_s', '').replace('.','').replace('-','').isdigit()]
+        if not valid:
+            return None
+        s = {}
+        # Target setpoint - najczestsza wartosc setpoint_cel (cel koncowy)
+        try:
+            sps = [float(r['setpoint_cel']) for r in valid if r.get('setpoint_cel')]
+            s['target'] = max(set(sps), key=sps.count) if sps else None
+        except: s['target'] = None
+        # PID - z pierwszego wiersza (stale przez przebieg lub z kalibracji)
+        try:
+            s['kp'] = float(valid[0].get('Kp', 0))
+            s['ki'] = float(valid[0].get('Ki', 0))
+            s['kd'] = float(valid[0].get('Kd', 0))
+        except: s['kp'] = s['ki'] = s['kd'] = None
+        # Oszacuj rampe z nachylenia setpoint_aktywny na poczatku
+        try:
+            t0 = float(valid[0]['czas_s'])
+            sa0 = float(valid[0]['setpoint_aktywny'])
+            # znajdz punkt ~10s pozniej
+            ramp = None
+            for r in valid:
+                tt = float(r['czas_s'])
+                if tt - t0 >= 5:
+                    sa = float(r['setpoint_aktywny'])
+                    dt_min = (tt - t0) / 60.0
+                    if dt_min > 0:
+                        ramp = abs(sa - sa0) / dt_min
+                    break
+            s['ramp'] = ramp
+        except: s['ramp'] = None
+        return s
 
     def _arch_clear_sel(self):
         """Odznacz wszystkie cykle"""
@@ -1639,6 +1761,8 @@ class PeltierControl:
                           ha='center', va='center', color=C['dim2'],
                           fontsize=11, transform=self.ax_a.transAxes)
             self.cv_a.draw()
+            if hasattr(self, 'arch_settings_lbl'):
+                self.arch_settings_lbl.config(text="")
             return
 
         files = sorted(self.log_dir.glob("cykl_*.csv"), reverse=True)
@@ -1694,6 +1818,22 @@ class PeltierControl:
                               color=C['dim'], fontsize=9, loc='left')
         self.fig_a.tight_layout()
         self.cv_a.draw()
+
+        # Panel nastaw przebiegu (tylko przy jednym zaznaczonym cyklu)
+        if hasattr(self, 'arch_settings_lbl'):
+            if not multi:
+                cs = self._cycle_settings(selected[0][0])
+                if cs:
+                    def fmt(v, suf=''):
+                        return f"{v:.1f}{suf}" if v is not None else "?"
+                    txt = (f"SETTINGS:   target {fmt(cs['target'],'°C')}   ·   "
+                           f"ramp ~{fmt(cs['ramp'],'°C/min')}   ·   "
+                           f"PID  Kp {fmt(cs['kp'])}  Ki {fmt(cs['ki'])}  Kd {fmt(cs['kd'])}")
+                    self.arch_settings_lbl.config(text=txt)
+                else:
+                    self.arch_settings_lbl.config(text="")
+            else:
+                self.arch_settings_lbl.config(text=f"({len(selected)} cycles selected — settings shown for single selection)")
 
     def _selected_arch_path(self):
         """Pierwszy zaznaczony cykl (do eksportu)"""
