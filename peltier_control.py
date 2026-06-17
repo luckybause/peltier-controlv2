@@ -1164,6 +1164,19 @@ class PeltierControl:
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
+        # RESET statystyk dojscia - kazdy START liczy nowa srednia od zera.
+        # Dzieki temu mozna robic pomiary jeden po drugim bez starych danych.
+        self.reach_start_t = None
+        self.reach_start_temp = None
+        self.reach_target = self.sl_sp.get()
+        self.reach_done = False
+        self.reach_time = None
+        self.reach_avg_rate = None
+        self.reach_dir = None
+        self.last_setpoint_target = None
+        self._last_reach_summary = None
+        if hasattr(self, 'reach_lbl'):
+            self.reach_lbl.config(text="→ starting...", fg=C['dim'])
         # Wyslij komplet nastaw z panelu
         self.send(f"SP:{self.sl_sp.get():.1f}")
         self.send(f"RU:{self.sl_ru.get():.1f}")
