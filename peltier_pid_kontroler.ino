@@ -63,7 +63,7 @@
 
 // STOP: wylacz Peltier od razu, wentylatory chodza jeszcze chwile
 // (dochladzaja radiator, potem same gasna - jesli byly wlaczone)
-#define FAN_RUNON_MS 30000UL   // czas pracy wentylatorow po STOP [ms]
+#define FAN_RUNON_MS 120000UL  // czas pracy wentylatorow po STOP [ms] = 2 min
 // FREEZE: utrzymanie galu w stanie stalym do wymiany probki.
 // Gal (galinstan) topi sie ~30C; trzymamy 20C z marginesem.
 #define FREEZE_TARGET   20.0f   // docelowa temp galu (stan staly)
@@ -649,7 +649,8 @@ void hBtn(){
         Serial.println("ON");
       } else if(sys==AUTO){
         stpPel();sys=MAN;stOn=false;
-        if(fanOn){ fanRunonActive=true; fanRunonT=millis(); }
+        fanOn=true; fanSpeed=100; fanApply();
+        fanRunonActive=true; fanRunonT=millis();
         Serial.println("STOP");
       }
     }
@@ -850,9 +851,10 @@ void procCmd(String c){
   }
   else if(key=="STOP"){
     // Wylacz Peltier OD RAZU (bez schodzenia do niskich temp).
-    // Jesli wentylatory byly wlaczone - chodza jeszcze FAN_RUNON_MS (dochladzaja radiator).
+    // Wentylator ZAWSZE wlacza sie na 100% i chlodzi radiator przez FAN_RUNON_MS.
     stpPel(); sys=MAN; stOn=false;
-    if(fanOn){ fanRunonActive=true; fanRunonT=millis(); }
+    fanOn=true; fanSpeed=100; fanApply();   // auto-chlodzenie radiatora
+    fanRunonActive=true; fanRunonT=millis();
     Serial.println("STOP");
   }
   else if(key=="ESTOP"){ wPwm(0);stpPel();sys=MAN;stOn=false;Serial.println("E-STOP"); }
