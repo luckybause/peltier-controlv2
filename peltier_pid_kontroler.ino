@@ -61,16 +61,15 @@
 #define ST_ADJ      0.04f
 #define ST_DEAD     0.3f
 
-// Cooldown
-#define CD_TARGET   10.0f
+// STOP: wylacz Peltier od razu, wentylatory chodza jeszcze chwile
+// (dochladzaja radiator, potem same gasna - jesli byly wlaczone)
+#define FAN_RUNON_MS 30000UL   // czas pracy wentylatorow po STOP [ms]
 // FREEZE: utrzymanie galu w stanie stalym do wymiany probki.
 // Gal (galinstan) topi sie ~30C; trzymamy 20C z marginesem.
 #define FREEZE_TARGET   20.0f   // docelowa temp galu (stan staly)
 #define FREEZE_RAMP     6.0f    // lagodna rampa zejscia [C/min] (~2-3 min z 36->20)
 #define FREEZE_TOL      0.8f    // tolerancja "stabilny" [C]
 #define FREEZE_STABLE_MS 8000   // ile ms w tolerancji = "gal staly, gotowy"
-#define CD_RAMP      5.0f
-#define CD_TIMEOUT  120000UL
 
 // Soft-start
 #define SS_STEP     5
@@ -134,8 +133,9 @@ String stSt="";
 bool ssA=false; int ssPwm=0,ssTgt=0;
 unsigned long ssTm=0;
 
-// Cooldown
-unsigned long cdT=0;
+// STOP fan run-on (wentylatory dochladzaja po STOP)
+unsigned long fanRunonT=0;
+bool fanRunonActive=false;
 
 // Slope
 #define SB 20
@@ -627,7 +627,6 @@ void hBtn(){
   if(r1==HIGH&&b1p==LOW){uint32_t h=now-b1t;if(!b1h&&h>DB&&h<HLD&&inM) mP=(mP+1)%MI;}
   b1p=r1;
   if(r2==LOW&&b2p==HIGH&&(now-b2t)>DB){b2t=now;b2h=false;}
-  if(r2==LOW&&!b2h&&sys==COOL&&(now-b2t)>=HLL){b2h=true;stpPel();sys=MAN;ig=0;pe=0;Serial.println("Cooldown ANULOWANY");}
   if(r2==HIGH&&b2p==LOW){
     uint32_t h=now-b2t;if(b2h){b2h=false;b2p=r2;return;}if(h<DB){b2p=r2;return;}
     // BTN2 podczas wyboru zakresu kalibracji = start
@@ -649,7 +648,9 @@ void hBtn(){
         // Self-tune trzeba uruchomic recznie z menu
         Serial.println("ON");
       } else if(sys==AUTO){
-        sys=COOL;cdT=millis();spT=CD_TARGET;spA=lT;ig=0;pe=0;slT=0;stOn=false;Serial.println("OFF – cooldown");
+        stpPel();sys=MAN;stOn=false;
+        if(fanOn){ fanRunonActive=true; fanRunonT=millis(); }
+        Serial.println("STOP");
       }
     }
   }
@@ -848,9 +849,11 @@ void procCmd(String c){
     }
   }
   else if(key=="STOP"){
-    if(sys==AUTO){ sys=COOL;cdT=millis();spT=CD_TARGET;spA=lT;ig=0;pe=0;slT=0;stOn=false;
-      Serial.println("OFF - cooldown"); }
-    else { stpPel();sys=MAN;Serial.println("STOP"); }
+    // Wylacz Peltier OD RAZU (bez schodzenia do niskich temp).
+    // Jesli wentylatory byly wlaczone - chodza jeszcze FAN_RUNON_MS (dochladzaja radiator).
+    stpPel(); sys=MAN; stOn=false;
+    if(fanOn){ fanRunonActive=true; fanRunonT=millis(); }
+    Serial.println("STOP");
   }
   else if(key=="ESTOP"){ wPwm(0);stpPel();sys=MAN;stOn=false;Serial.println("E-STOP"); }
   else if(key=="FREEZE"){
@@ -1014,6 +1017,13 @@ void readSerial(){
 void loop(){
   uint32_t now=millis();
   readSerial();              // czytaj komendy z PC
+  // Wentylatory dobiegowe: po STOP chodza FAN_RUNON_MS, potem auto-wylaczenie
+  if(fanRunonActive){
+    if(now-fanRunonT>=FAN_RUNON_MS){
+      fanRunonActive=false; fanOn=false; fanApply();
+      Serial.println("FAN runon done - off");
+    }
+  }
   if(!pcMode) hBtn();        // przyciski tylko gdy NIE w trybie PC
   if(!pcMode && inM) rdMP();
   else if(!pcMode && (sys==AUTO||sys==MAN)){spT=SP_MIN+(SP_MAX-SP_MIN)*pot(PIN_POT1);rU=RAMP_MIN+(RAMP_MAX-RAMP_MIN)*pot(PIN_POT2);}
@@ -1025,7 +1035,7 @@ void loop(){
   updSS();
   if(now-tP>=PID_DT_MS){
     tP=now;float temp=rdT();
-    if(temp>tMax&&sys!=MAN){stpPel();sys=COOL;cdT=now;spT=CD_TARGET;spA=temp;ig=0;pe=0;Serial.println("!!! TEMP MAX !!!");}
+    if(temp>tMax&&sys!=MAN){stpPel();sys=MAN;stOn=false;if(fanOn){fanRunonActive=true;fanRunonT=now;}Serial.println("!!! TEMP MAX - STOP !!!");}
     switch(sys){
       case AUTO:
         if(temp<TEMP_MIN_C&&lPwm<0) stpPel();else setPwr(compPID(temp));
@@ -1033,16 +1043,6 @@ void loop(){
         Serial.print(spA,2);Serial.print(",");Serial.print(spT,2);Serial.print(",");
         Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
         Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);Serial.println(",AUTO");
-        break;
-      case COOL:
-        if(now-cdT>=CD_TIMEOUT){stpPel();sys=MAN;break;}
-        if(spA>CD_TARGET) spA=max(spA-rD/60.0f,CD_TARGET);
-        if(lT<=CD_TARGET+1){stpPel();sys=MAN;Serial.println("Cooldown done");break;}
-        setPwr(compPID(temp));
-        Serial.print(now/1000.0f,1);Serial.print(",");Serial.print(temp,2);Serial.print(",");
-        Serial.print(spA,2);Serial.print(",");Serial.print(CD_TARGET,1);Serial.print(",");
-        Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
-        Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);Serial.println(",COOLDOWN");
         break;
       case FREEZE: {
         // Lagodna rampa setpointu w dol do FREEZE_TARGET
