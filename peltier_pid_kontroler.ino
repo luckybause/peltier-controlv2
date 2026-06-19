@@ -369,70 +369,33 @@ int compPID(float temp){
     else   {Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;}
   }
 
-  // Dystans rampy do celu finalnego
-  float spDistTgt=fabs(spT-spA);     // ile setpoint ma jeszcze do celu
-  bool atT=(spDistTgt<0.5f);          // setpoint dobil do celu
+  // Dystans do celu finalnego
+  bool atT=(fabs(spA-spT)<0.5f);
 
-  // ── WSPOLCZYNNIK PRZEJSCIA (0..1) ──────────────────────
-  // Plynne wygaszanie feed-forward i mocy w poblizu celu.
-  // Zamiast binarnego ciecia (skok!), moc maleje stopniowo
-  // gdy setpoint zbliza sie do celu w ostatnich BLEND_C stopniach.
-  const float BLEND_C=4.0f;
-  float blend=1.0f;
-  if(spDistTgt<BLEND_C) blend=spDistTgt/BLEND_C;  // liniowo 1->0
-
-  // ── MIEKKI START RAMPY (0..1) ──────────────────────────
-  // Feed-forward narasta przez pierwsze RAMP_RISE_MS od startu rampy,
-  // zamiast wskakiwac od razu (likwiduje schodki na starcie).
-  float soft=1.0f;
-  unsigned long sinceRamp=millis()-tR;
-  const unsigned long RAMP_RISE_MS=3000;
-  if(sinceRamp<RAMP_RISE_MS) soft=(float)sinceRamp/RAMP_RISE_MS;
-
-  // ── ANTI-WINDUP ────────────────────────────────────────
-  // Integruj tylko gdy nie nasycamy wyjscia w te sama strone.
-  // Zapobiega przeladowaniu integratora podczas dlugiej rampy,
-  // ktory przy dojsciu do celu powodowal przestrzelenie i skok w dol.
-  float igLim = INTEGRAL_MAX * (atT ? 1.0f : 0.5f); // mniejszy limit na rampie
-  float igNew = ig + err*dt;
-  igNew = constrain(igNew, -igLim, igLim);
+  // Integracja z anti-windup (prosty, sprawdzony)
+  ig=constrain(ig+err*dt,-INTEGRAL_MAX,INTEGRAL_MAX);
 
   // Derywata
   float dv=(err-pe)/dt;pe=err;
 
-  // ── FEED-FORWARD (plynny) ──────────────────────────────
-  float ff=0;
+  // Wyjscie PID
+  float out=Kp*err+Ki*ig+Kd*dv;
+
+  // ── FEED-FORWARD RAMPY ──────────────────────────────
+  // Podczas rampy dodaj wyprzedzajaca moc ~ do zadanego rate.
+  // Temperatura "goni" setpoint bez opoznienia zamiast czekac az narosnie blad.
   if(!atT){
-    float rate=htg?rU:-rD;
-    ff = rate*FF_GAIN*blend*soft;  // wygaszany przy celu i na starcie
+    float rate=htg?rU:-rD;            // zadany rate [C/min]
+    out+=rate*FF_GAIN;                // moc wyprzedzajaca
   }
 
-  // Wyjscie PID + FF
-  float pidOut = Kp*err + Ki*igNew + Kd*dv;
-  float out = pidOut + ff;
-
-  // Anti-windup: cofnij integracje jesli wyjscie nasycone
-  if((out>PWM_MAX && err>0) || (out<-PWM_MAX && err<0)){
-    // nie powiekszaj integratora gdy juz na maksie
-  } else {
-    ig = igNew;  // akceptuj integracje tylko gdy nie nasycone
-  }
-
-  // ── MIEKKIE OGRANICZENIE MOCY PRZY CELU ────────────────
-  // W strefie przejscia ogranicz max moc proporcjonalnie,
-  // zeby nie bylo gwaltownego ruchu gdy temp dochodzi do celu.
-  float maxOut = PWM_MAX;
-  if(spDistTgt<BLEND_C && fabs(err)<2.0f){
-    // blisko celu i maly blad - ogranicz moc plynnie
-    maxOut = PWM_MAX*(0.4f + 0.6f*blend);
-  }
-
-  // Jednostronne sterowanie podczas rampy, dwustronne przy celu
+  // Jednostronne sterowanie podczas rampy (tylko grzanie LUB chlodzenie),
+  // dwustronne przy celu (moze korygowac w obie strony)
   if(!atT){
-    if(htg) out=constrain(out,0,maxOut);
-    else    out=constrain(out,-maxOut,0);
+    if(htg) out=constrain(out,0,(float)PWM_MAX);
+    else    out=constrain(out,-(float)PWM_MAX,0);
   } else {
-    out=constrain(out,-PWM_MAX,PWM_MAX);
+    out=constrain(out,-(float)PWM_MAX,(float)PWM_MAX);
   }
 
   return (int)out;
@@ -453,10 +416,10 @@ void detPol(){
   Serial.println(polSw?"Pol:swapped":"Pol:normal");
 }
 
-void startRT(){sys=RTEST;rtP=0;rtU=rtD=0;rtT0=lT;rtTm=millis();rtSt="HEAT 0/60s";wPwm(PWM_MAX);}
+void startRT(){sys=RTEST;rtP=0;rtU=rtD=0;rtT0=lT;rtTm=millis();rtSt="HEAT 0/60s";wPwm(pwmLimit);}
 void runRT(float t){
   if(sys!=RTEST) return;unsigned long el=millis()-rtTm;int s=(int)(el/1000);
-  if(rtP==0){rtSt="HEAT "+String(s)+"/60s";if(t>=tMax-5||s>=60){wPwm(0);float dT=t-rtT0,dM=el/60000.0f;rtU=(dM>0)?dT/dM:0;rtP=1;rtT0=t;rtTm=millis();delay(300);wPwm(-PWM_MAX);}}
+  if(rtP==0){rtSt="HEAT "+String(s)+"/60s";if(t>=tMax-5||s>=60){wPwm(0);float dT=t-rtT0,dM=el/60000.0f;rtU=(dM>0)?dT/dM:0;rtP=1;rtT0=t;rtTm=millis();delay(300);wPwm(-pwmLimit);}}
   else if(rtP==1){rtSt="COOL "+String(s)+"/60s";if(t<=TEMP_MIN_C+2||s>=60){wPwm(0);float dT=rtT0-t,dM=el/60000.0f;rtD=(dM>0)?dT/dM:0;if(rtU>0) rU=constrain(rtU*0.8f,RAMP_MIN,RAMP_MAX);if(rtD>0) rD=constrain(rtD*0.8f,RAMP_MIN,RAMP_MAX);rtP=2;sys=MAN;stpPel();rtSt="G:"+fts(rtU,1)+" C:"+fts(rtD,1);}}
 }
 
