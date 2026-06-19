@@ -422,7 +422,7 @@ class PeltierControl:
                     self._parse_calstat(raw[8:])
                     continue
 
-                # Linia danych CSV (9 pol)
+                # Linia danych CSV (9 pol + opcjonalne temp2 jako 10.)
                 p = raw.split(',')
                 if len(p) < 9: continue
                 try: float(p[0])
@@ -432,15 +432,24 @@ class PeltierControl:
                              pwm=int(p[4]), kp=float(p[5]), ki=float(p[6]),
                              kd=float(p[7]), state=p[8].strip())
                 except: continue
+                # temp2 - druga termopara (10. pole, jesli obecne)
+                d['temp2'] = None
+                if len(p) >= 10:
+                    try:
+                        v2 = float(p[9])
+                        d['temp2'] = v2 if v2 != 0 else None  # 0 = brak/blad
+                    except: pass
+                self._latest_temp2 = d['temp2']  # do wyswietlenia na karcie
 
                 if self.t0 is None: self.t0 = time.time()
                 now = time.time() - self.t0
                 state = d['state']
 
-                if self.cyc_on and state in ('AUTO', 'COOLDOWN'):
+                if self.cyc_on and state in ('AUTO', 'COOLDOWN', 'FREEZE', 'FREEZE_READY'):
                     self.cyc_log(time.time() - self.cyc_t0 if self.cyc_t0 else 0,
                                 d['temp'], d['sa'], d['st'],
-                                d['pwm'], d['kp'], d['ki'], d['kd'], state)
+                                d['pwm'], d['kp'], d['ki'], d['kd'], state,
+                                d.get('temp2'))
 
                 prev = self.last_state
                 self.last_state = state
@@ -500,6 +509,12 @@ class PeltierControl:
                 self.dev_cal_min = float(d['CALMIN'])
             if 'CALMAX' in d:
                 self.dev_cal_max = float(d['CALMAX'])
+            # Limit mocy Peltiera
+            if 'PWMLIM' in d and hasattr(self, 'sl_pwmlim'):
+                try:
+                    if not getattr(self, '_cfg_synced', False):
+                        self.sl_pwmlim.set(float(d['PWMLIM']), silent=True)
+                except: pass
             # Stan wentylatorow
             if 'FAN' in d:
                 fan_val = int(float(d['FAN']))
@@ -785,6 +800,7 @@ class PeltierControl:
         cards.pack(side='left', fill='x', expand=True)
         self.cards = {}
         self.cards['temp'] = self._stat_card(cards, "TEMP", "°C", C['blue'])
+        self.cards['temp2'] = self._stat_card(cards, "TEMP 2", "°C", C['cyan'])
         self.cards['sp']   = self._stat_card(cards, "SETPOINT", "°C", C['orange'])
         self.cards['rate'] = self._stat_card(cards, "AVG RATE", "°C/min", C['yellow'])
         self.cards['pwm']  = self._stat_card(cards, "PWM", "%", C['green'])
@@ -1085,6 +1101,16 @@ class PeltierControl:
         tk.Label(sec4, text="Detected once, saved permanently",
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(6, 0))
 
+        # ── POWER LIMIT (ochrona sterownika) ──
+        sec_pl = self._adv_section(inner, "PELTIER POWER LIMIT", C['red'])
+        self.sl_pwmlim = SliderField(sec_pl, "MAX POWER", 10, 100, 30,
+                                     C['red'], "%", 0,
+                                     on_change=lambda v: self.send(f"SETPWMLIM:{v:.0f}"))
+        tk.Label(sec_pl, text="⚠ Limits Peltier current to protect the driver (MDD3A: 3A cont.)\n"
+                 "30% ≈ 2.4A · raise only after measuring real current!",
+                 bg=C['bg2'], fg=C['yellow'], font=(FONT, fsz(8)),
+                 justify='left').pack(anchor='w', pady=(6, 0))
+
         # ── DEVICE FLASH MEMORY ──
         sec5 = self._adv_section(inner, "DEVICE FLASH", C['green'])
         bf2 = tk.Frame(sec5, bg=C['bg2'])
@@ -1128,7 +1154,7 @@ class PeltierControl:
         # Suwaki zawsze aktywne (mozna ustawic wartosci przed polaczeniem)
         # START/STOP tez aktywne - sprawdzaja polaczenie w momencie klikniecia
         # (dezaktywujemy tylko gdy chcemy wyraznie zablokowac)
-        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off', 'sl_fan']:
+        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off', 'sl_fan', 'sl_pwmlim']:
             if hasattr(self, sl):
                 getattr(self, sl).set_enabled(True)
         # Przyciski zawsze klikalnie - reaguja komunikatem jesli brak polaczenia
@@ -1356,7 +1382,8 @@ class PeltierControl:
         s = {}
         for key, attr in [('sp','sl_sp'),('ru','sl_ru'),('rd','sl_rd'),
                           ('tmax','sl_tmax'),('kp','sl_kp'),('ki','sl_ki'),
-                          ('kd','sl_kd'),('off','sl_off'),('fan','sl_fan')]:
+                          ('kd','sl_kd'),('off','sl_off'),('fan','sl_fan'),
+                          ('pwmlim','sl_pwmlim')]:
             if hasattr(self, attr):
                 try: s[key] = getattr(self, attr).get()
                 except: pass
@@ -1390,7 +1417,8 @@ class PeltierControl:
         """Zastosuj preset - ustaw suwaki i wyslij do urzadzenia"""
         mapping = [('sp','sl_sp','SP',1),('ru','sl_ru','RU',1),('rd','sl_rd','RD',1),
                    ('tmax','sl_tmax','TMAX',0),('kp','sl_kp','KP',1),('ki','sl_ki','KI',2),
-                   ('kd','sl_kd','KD',2),('off','sl_off','OFFSET',1),('fan','sl_fan','FAN',0)]
+                   ('kd','sl_kd','KD',2),('off','sl_off','OFFSET',1),('fan','sl_fan','FAN',0),
+                   ('pwmlim','sl_pwmlim','SETPWMLIM',0)]
         for key, attr, cmd, dec in mapping:
             if key in settings and hasattr(self, attr):
                 val = settings[key]
@@ -1691,6 +1719,7 @@ class PeltierControl:
         except Exception:
             return None
         t, temp, spt, pwm = [], [], [], []
+        temp2 = []
         for r in data:
             cz = r.get('czas_s', '')
             if not cz or cz.startswith('#'):
@@ -1706,8 +1735,16 @@ class PeltierControl:
                 pwm.append(float(r.get('PWM_%', r.get('PWM', 0))))
             except:
                 pwm.append(0)
+            # temp2 - druga termopara (opcjonalna kolumna)
+            try:
+                t2v = r.get('temperatura2_C', '')
+                temp2.append(float(t2v) if t2v else None)
+            except:
+                temp2.append(None)
         if not t:
             return None
+        # Dolacz temp2 jako 5. element (kompatybilnie - stary kod bierze [:4])
+        self._last_temp2 = temp2
         return t, temp, spt, pwm
 
     def _compute_stats(self, data):
@@ -1798,7 +1835,15 @@ class PeltierControl:
             if not multi:
                 self.ax_a.plot(tx, spt, color=C['orange'], lw=1.2, ls='--',
                               label='target', alpha=0.6)
-                self.ax_a.plot(tx, temp, color=col, lw=2, label=name)
+                self.ax_a.plot(tx, temp, color=col, lw=2, label='temp (gal)')
+                # Druga termopara jesli dostepna w tym cyklu
+                t2 = getattr(self, '_last_temp2', None)
+                if t2 and any(v is not None for v in t2):
+                    tx2 = [tx[i] for i in range(len(t2)) if i < len(tx) and t2[i] is not None]
+                    ty2 = [v for v in t2 if v is not None]
+                    if ty2:
+                        self.ax_a.plot(tx2, ty2, color=C['cyan'], lw=1.5,
+                                      label='temp 2', alpha=0.8)
             else:
                 self.ax_a.plot(tx, temp, color=col, lw=1.8, label=name)
 
@@ -2147,6 +2192,10 @@ class PeltierControl:
         if not self.t: return
         temp = self.temp[-1]; spt = self.spt[-1]; pwm = self.pwm[-1]
         self.cards['temp']['val'].config(text=f"{temp:.2f}")
+        # Karta drugiej termopary
+        t2 = getattr(self, '_latest_temp2', None)
+        if 'temp2' in self.cards:
+            self.cards['temp2']['val'].config(text=f"{t2:.2f}" if t2 is not None else "--")
         self.cards['sp']['val'].config(text=f"{spt:.1f}")
         # AVG RATE - srednie tempo przejscia (od startu dochodzenia do teraz)
         # Bardziej uzyteczne niz chwilowe - pokazuje realna srednia rampe
@@ -2258,16 +2307,18 @@ class PeltierControl:
         self.cyc_file = open(self.cyc_fn, 'w', newline='', encoding='utf-8')
         self.cyc_wr = csv.writer(self.cyc_file)
         self.cyc_wr.writerow(['czas_s', 'temperatura_C', 'setpoint_aktywny',
-                              'setpoint_cel', 'PWM', 'PWM_%', 'Kp', 'Ki', 'Kd', 'stan'])
+                              'setpoint_cel', 'PWM', 'PWM_%', 'Kp', 'Ki', 'Kd', 'stan',
+                              'temperatura2_C'])
         self.cyc_rows = 0
         print(f"CYC START T={temp0:.1f}")
 
-    def cyc_log(self, t, temp, sa, st, pwm, kp, ki, kd, state):
+    def cyc_log(self, t, temp, sa, st, pwm, kp, ki, kd, state, temp2=None):
         if self.cyc_wr:
             try:
+                t2str = f"{temp2:.2f}" if temp2 is not None else ""
                 self.cyc_wr.writerow([f"{t:.2f}", f"{temp:.2f}", f"{sa:.2f}",
                                      f"{st:.2f}", pwm, f"{pwm*100/255:.1f}",
-                                     f"{kp:.3f}", f"{ki:.4f}", f"{kd:.3f}", state])
+                                     f"{kp:.3f}", f"{ki:.4f}", f"{kd:.3f}", state, t2str])
                 self.cyc_file.flush()
                 self.cyc_rows += 1
             except: pass
