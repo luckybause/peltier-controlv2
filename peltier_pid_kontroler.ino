@@ -22,6 +22,7 @@
 #include <FlashStorage_SAMD.h>
 
 #define PIN_CS_TC  9
+#define PIN_CS_TC2 A1   // CS drugiej termopary (pomiar dodatkowy, nie wplywa na PID)
 #define PIN_M1A    11
 #define PIN_M1B    10
 #define PIN_M2A    12   // wentylatory + (PWM predkosc)
@@ -32,6 +33,10 @@
 #define PIN_BTN2   A5
 
 #define PWM_MAX       255
+// Limit PWM Peltiera - ochrona sterownika MDD3A (max 3A ciagle, 5A chwilowo).
+// Domyslnie 30% = ~2.4A przy Peltierze 12V/8A. Regulowane z aplikacji (SETPWMLIM).
+// UWAGA: zmierz realny prad przed podniesieniem limitu!
+int pwmLimit = 77;   // 30% z 255 = 77 (domyslny bezpieczny limit)
 #define TEMP_MIN_C    -15.0f
 #define TEMP_MAX_DEF   110.0f
 #define PID_DT_MS      100
@@ -98,6 +103,9 @@ struct FD { bool cal; Prof p[P_TOT]; float ru,rd,tm; bool polSet; bool polSw; fl
 FlashStorage(pidFlash,FD);
 
 Adafruit_MAX31856 tc=Adafruit_MAX31856(PIN_CS_TC);
+Adafruit_MAX31856 tc2=Adafruit_MAX31856(PIN_CS_TC2);  // druga termopara (pomiar dodatkowy)
+float temp2=NAN;      // odczyt z drugiej termopary
+bool tc2OK=false;     // czy druga termopara dziala
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0,U8X8_PIN_NONE);
 
 Prof prof[P_TOT];
@@ -238,6 +246,8 @@ void fanApply(){
 }
 void stpPel(){analogWrite(PIN_M1A,0);analogWrite(PIN_M1B,0);lPwm=0;ssA=false;ssPwm=0;}
 void setPwr(int o){
+  // Najpierw twardy limit ochronny (chroni MDD3A przed przekroczeniem pradu)
+  o=constrain(o,-pwmLimit,pwmLimit);
   o=constrain(o,-PWM_MAX,PWM_MAX);
   bool dir=(lPwm>0&&o<0)||(lPwm<0&&o>0),zero=(lPwm==0&&o!=0);
   if(dir||zero){if(dir){wPwm(0);delay(50);}ssA=true;ssTgt=o;ssPwm=(o>0)?SS_INIT:-SS_INIT;ssTm=millis();wPwm(ssPwm);}
@@ -775,6 +785,9 @@ void setup(){
   pinMode(PIN_BTN1,INPUT_PULLUP);pinMode(PIN_BTN2,INPUT_PULLUP);
   if(!tc.begin()) Serial.println("ERROR: MAX31856!");
   tc.setThermocoupleType(MAX31856_TCTYPE_K);
+  // Druga termopara (pomiar dodatkowy) - osobny CS, ta sama magistrala SPI
+  if(tc2.begin()){ tc2.setThermocoupleType(MAX31856_TCTYPE_K); tc2OK=true; }
+  else { Serial.println("WARN: MAX31856 #2 not found"); tc2OK=false; }
   for(int i=0;i<P_TOT;i++) prof[i]={10,0.3f,0.8f,10,0.3f,0.3f,false};
   oled.begin();oled.clearBuffer();
   oled.setFont(u8g2_font_7x13B_tf);
@@ -822,6 +835,7 @@ void sendCfg(){
   Serial.print(",CALMIN=");Serial.print(cTmn,0);
   Serial.print(",CALMAX=");Serial.print(cTmx,0);
   Serial.print(",FAN=");Serial.print(fanOn?fanSpeed:0);
+  Serial.print(",PWMLIM=");Serial.print((int)(pwmLimit*100.0/255.0));
   Serial.println();
 }
 
@@ -884,6 +898,13 @@ void procCmd(String c){
   else if(key=="FANOFF"){
     fanOn=false; fanApply();
     Serial.println("FAN OFF");
+  }
+  else if(key=="SETPWMLIM"){
+    // SETPWMLIM:0-100 - limit mocy Peltiera w % (ochrona MDD3A)
+    int pct=constrain((int)fv,10,100);
+    pwmLimit=(int)(pct*2.55f);
+    Serial.print("PWM LIMIT set: ");Serial.print(pct);Serial.print("% (");
+    Serial.print(pwmLimit);Serial.println("/255)");
   }
   else if(key=="SELFTUNE"){ if(sys==AUTO) stStart(); }
   else if(key=="SELFTUNESTOP"){ if(stOn) stStop(); }
@@ -1037,6 +1058,11 @@ void loop(){
   updSS();
   if(now-tP>=PID_DT_MS){
     tP=now;float temp=rdT();
+    // Odczyt drugiej termopary (pomiar dodatkowy, nie wplywa na regulacje)
+    if(tc2OK){
+      uint8_t f2=tc2.readFault();
+      if(!f2){ float r2=tc2.readThermocoupleTemperature(); if(!isnan(r2)) temp2=r2; }
+    }
     if(temp>tMax&&sys!=MAN){stpPel();sys=MAN;stOn=false;if(fanOn){fanRunonActive=true;fanRunonT=now;}Serial.println("!!! TEMP MAX - STOP !!!");}
     switch(sys){
       case AUTO:
@@ -1044,7 +1070,8 @@ void loop(){
         Serial.print(now/1000.0f,1);Serial.print(",");Serial.print(temp,2);Serial.print(",");
         Serial.print(spA,2);Serial.print(",");Serial.print(spT,2);Serial.print(",");
         Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
-        Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);Serial.println(",AUTO");
+        Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);Serial.print(",AUTO,");
+        Serial.println(isnan(temp2)?0:temp2,2);
         break;
       case FREEZE: {
         // Lagodna rampa setpointu w dol do FREEZE_TARGET
@@ -1067,7 +1094,8 @@ void loop(){
         Serial.print(spA,2);Serial.print(",");Serial.print(FREEZE_TARGET,1);Serial.print(",");
         Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
         Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);
-        Serial.println(frzReady?",FREEZE_READY":",FREEZE");
+        Serial.print(frzReady?",FREEZE_READY,":",FREEZE,");
+        Serial.println(isnan(temp2)?0:temp2,2);
         break;
       }
       case MAN:
@@ -1080,7 +1108,8 @@ void loop(){
         Serial.print(0);Serial.print(",");
         Serial.print(Kp,3);Serial.print(",");
         Serial.print(Ki,4);Serial.print(",");
-        Serial.print(Kd,3);Serial.println(",MAN");
+        Serial.print(Kd,3);Serial.print(",MAN,");
+        Serial.println(isnan(temp2)?0:temp2,2);
         break;
       default:break;
     }
