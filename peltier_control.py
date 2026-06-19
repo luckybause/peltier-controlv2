@@ -441,8 +441,16 @@ class PeltierControl:
                     except: pass
                 self._latest_temp2 = d['temp2']  # do wyswietlenia na karcie
 
-                if self.t0 is None: self.t0 = time.time()
-                now = time.time() - self.t0
+                # Czas z FIRMWARE (p[0] = czas_s) - dokladny, niezalezny od
+                # opoznien aplikacji/buforowania kolejki. Zegar komputera (time.time)
+                # rozjezdzal sie przy buforowaniu i zanizal AVG RATE.
+                try:
+                    fw_time = float(p[0])
+                except:
+                    fw_time = 0
+                if self.t0 is None:
+                    self.t0 = fw_time  # pierwszy czas firmware = punkt zero
+                now = fw_time - self.t0
                 state = d['state']
 
                 if self.cyc_on and state in ('AUTO', 'COOLDOWN', 'FREEZE', 'FREEZE_READY'):
@@ -1528,7 +1536,7 @@ class PeltierControl:
         body.pack(fill='both', expand=True)
 
         # Lista cykli z checkboxami (do porownywania)
-        lf = tk.Frame(body, bg=C['panel'], width=300)
+        lf = tk.Frame(body, bg=C['panel'], width=340)
         lf.pack(side='left', fill='y', padx=(0, 12))
         lf.pack_propagate(False)
         tk.Frame(lf, bg=C['purple'], height=3).pack(fill='x')
@@ -1548,9 +1556,13 @@ class PeltierControl:
         self.arch_canvas.pack(side='left', fill='both', expand=True)
         asb.config(command=self.arch_canvas.yview)
         self.arch_items = tk.Frame(self.arch_canvas, bg=C['bg2'])
-        self.arch_canvas.create_window((0, 0), window=self.arch_items, anchor='nw')
+        self._arch_win = self.arch_canvas.create_window((0, 0), window=self.arch_items, anchor='nw')
         self.arch_items.bind('<Configure>',
             lambda e: self.arch_canvas.config(scrollregion=self.arch_canvas.bbox('all')))
+        # KLUCZOWE: okno wewnetrzne musi miec szerokosc canvasu, inaczej
+        # wiersze nie rozciagaja sie i przycisk ✕ (side='right') wypada poza widok
+        self.arch_canvas.bind('<Configure>',
+            lambda e: self.arch_canvas.itemconfig(self._arch_win, width=e.width))
         self.arch_canvas.bind('<Enter>', lambda e: self.arch_canvas.bind_all(
             '<MouseWheel>', lambda ev: self.arch_canvas.yview_scroll(int(-ev.delta/120), 'units')))
         self.arch_canvas.bind('<Leave>', lambda e: self.arch_canvas.unbind_all('<MouseWheel>'))
@@ -1678,11 +1690,11 @@ class PeltierControl:
                                    font=(FONT, fsz(9)), bd=0, highlightthickness=0,
                                    anchor='w')
                 cb.pack(side='left', fill='x', expand=True)
-                delb = tk.Button(row, text="✕", command=lambda p=f: self._delete_cycle(p),
-                                bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9), 'bold'),
-                                relief='flat', cursor='hand2', bd=0, padx=8,
+                delb = tk.Button(row, text="🗑", command=lambda p=f: self._delete_cycle(p),
+                                bg=C['bg2'], fg=C['red'], font=(FONT, fsz(10), 'bold'),
+                                relief='flat', cursor='hand2', bd=0, padx=8, pady=2,
                                 activebackground=C['red'], activeforeground='#fff')
-                delb.pack(side='right', padx=(0, 4))
+                delb.pack(side='right', padx=(2, 6))
 
     def _delete_cycle(self, path):
         """Usun plik cyklu z archiwum (z potwierdzeniem)"""
