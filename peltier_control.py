@@ -810,20 +810,20 @@ class PeltierControl:
         ctrl.pack(side='right', padx=(8, 0))
         self.is_running = False  # stan: czy cykl trwa
         self.btn_run = tk.Button(ctrl, text="▶ START", command=self.toggle_run,
-                                 bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(13), 'bold'),
-                                 relief='flat', cursor='hand2', bd=0, padx=22, pady=14,
+                                 bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(12), 'bold'),
+                                 relief='flat', cursor='hand2', bd=0, padx=16, pady=12,
                                  activebackground=_lighten(C['green'], 0.15))
         self.btn_run.pack(side='left', padx=(0, 4), fill='y')
         # FREEZE - zamroz gal do wymiany probki
         self.btn_freeze = tk.Button(ctrl, text="❄ FREEZE", command=self.do_freeze,
-                                    bg=C['bg2'], fg=C['cyan'], font=(FONT, fsz(13), 'bold'),
-                                    relief='flat', cursor='hand2', bd=0, padx=16, pady=14,
+                                    bg=C['bg2'], fg=C['cyan'], font=(FONT, fsz(12), 'bold'),
+                                    relief='flat', cursor='hand2', bd=0, padx=12, pady=12,
                                     highlightthickness=2, highlightbackground=C['cyan'],
                                     activebackground=C['panel3'])
         self.btn_freeze.pack(side='left', padx=(0, 4), fill='y')
         self.btn_estop = tk.Button(ctrl, text="⛔", command=self.do_estop,
-                                   bg=C['red'], fg='#fff', font=(FONT, fsz(15), 'bold'),
-                                   relief='flat', cursor='hand2', bd=0, padx=14, pady=14,
+                                   bg=C['red'], fg='#fff', font=(FONT, fsz(14), 'bold'),
+                                   relief='flat', cursor='hand2', bd=0, padx=12, pady=12,
                                    activebackground=_lighten(C['red'], 0.15))
         self.btn_estop.pack(side='left', fill='y')
 
@@ -838,20 +838,20 @@ class PeltierControl:
 
     def _stat_card(self, parent, title, unit, color):
         card = tk.Frame(parent, bg=C['panel'])
-        card.pack(side='left', fill='x', expand=True, padx=(0, 6))
+        card.pack(side='left', fill='x', expand=True, padx=(0, 4))
         tk.Frame(card, bg=color, height=3).pack(fill='x')
         inner = tk.Frame(card, bg=C['panel'])
-        inner.pack(fill='both', expand=True, padx=10, pady=6)
+        inner.pack(fill='both', expand=True, padx=7, pady=5)
         tk.Label(inner, text=title, bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(8)), anchor='w').pack(anchor='w')
+                 font=(FONT, fsz(7)), anchor='w').pack(anchor='w')
         vrow = tk.Frame(inner, bg=C['panel'])
-        vrow.pack(anchor='w', pady=(2, 0))
+        vrow.pack(anchor='w', pady=(1, 0))
         val = tk.Label(vrow, text="--", bg=C['panel'], fg=color,
-                       font=(FONT, fsz(19), 'bold'))
+                       font=(FONT, fsz(16), 'bold'))
         val.pack(side='left')
         unit_lbl = tk.Label(vrow, text=" " + unit, bg=C['panel'], fg=C['dim2'],
-                            font=(FONT, fsz(8)))
-        unit_lbl.pack(side='left', pady=(5, 0))
+                            font=(FONT, fsz(7)))
+        unit_lbl.pack(side='left', pady=(4, 0))
         return {'val': val, 'unit': unit, 'unit_lbl': unit_lbl, 'extra': None, 'row': vrow}
 
     def _build_chart(self, parent):
@@ -1618,43 +1618,76 @@ class PeltierControl:
         # Narysuj pusty wykres od razu - inicjalizuje canvas i toolbar
         self._redraw_arch()
 
+    def _cycle_display_name(self, path):
+        """Czytelna nazwa cyklu: usuwa prefiks c_/cykl_ i zamienia _ na spacje"""
+        from pathlib import Path as _P
+        s = _P(path).stem
+        if s.startswith('cykl_'): s = s[5:]
+        elif s.startswith('c_'): s = s[2:]
+        return s.replace('_', ' ')
+
     def refresh_arch(self):
         # Wyczysc liste checkboxow
         for w in self.arch_items.winfo_children():
             w.destroy()
         self.arch_vars = {}
-        files = sorted(self.log_dir.glob("cykl_*.csv"), reverse=True)
+        files = sorted([f for f in self.log_dir.glob("*.csv") if (f.name.startswith("cykl_") or f.name.startswith("c_")) and not f.name.startswith("_tmp")],
+                       key=lambda f: f.stat().st_mtime, reverse=True)
         # Paleta kolorow dla porownania
         self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
                             C['cyan'], C['purple'], C['yellow'], '#ff8fab']
-        for i, f in enumerate(files):
-            row = tk.Frame(self.arch_items, bg=C['bg2'])
-            row.pack(fill='x', pady=1)
-            var = tk.BooleanVar(value=False)
-            self.arch_vars[str(f)] = var
-            # Kolorowy kwadracik (kolor na wykresie)
-            col = self._arch_colors[i % len(self._arch_colors)]
-            dot = tk.Frame(row, bg=col, width=10, height=10)
-            dot.pack(side='left', padx=(4, 4))
-            dot.pack_propagate(False)
-            cb = tk.Checkbutton(row, text=f.stem.replace('cykl_', ''),
-                               variable=var, command=self._redraw_arch,
-                               bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
-                               activebackground=C['bg2'], activeforeground=col,
-                               font=(FONT, fsz(9)), bd=0, highlightthickness=0,
-                               anchor='w')
-            cb.pack(side='left', fill='x', expand=True)
-            # Przycisk usuwania cyklu (X)
-            delb = tk.Button(row, text="✕", command=lambda p=f: self._delete_cycle(p),
-                            bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9), 'bold'),
-                            relief='flat', cursor='hand2', bd=0, padx=8,
-                            activebackground=C['red'], activeforeground='#fff')
-            delb.pack(side='right', padx=(0, 4))
+        if not files:
+            tk.Label(self.arch_items, text="No saved cycles yet.\nRun a cycle and give it a name.",
+                     bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9)), justify='left').pack(
+                     anchor='w', padx=12, pady=12)
+            return
+
+        # Grupowanie po dacie (dzien modyfikacji pliku)
+        from datetime import datetime as _dt
+        import time as _time
+        groups = {}
+        for f in files:
+            day = _dt.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d")
+            groups.setdefault(day, []).append(f)
+
+        today = _dt.now().strftime("%Y-%m-%d")
+        i = 0
+        for day, day_files in groups.items():
+            # Naglowek grupy (data)
+            day_label = "Today" if day == today else day
+            hdr = tk.Frame(self.arch_items, bg=C['panel'])
+            hdr.pack(fill='x', pady=(6, 1))
+            tk.Label(hdr, text=f"▸ {day_label}  ({len(day_files)})", bg=C['panel'],
+                     fg=C['cyan'], font=(FONT, fsz(8), 'bold'), anchor='w').pack(
+                     side='left', padx=8, pady=3)
+            # Pliki w grupie
+            for f in day_files:
+                row = tk.Frame(self.arch_items, bg=C['bg2'])
+                row.pack(fill='x', pady=1)
+                var = tk.BooleanVar(value=False)
+                self.arch_vars[str(f)] = var
+                col = self._arch_colors[i % len(self._arch_colors)]
+                i += 1
+                dot = tk.Frame(row, bg=col, width=10, height=10)
+                dot.pack(side='left', padx=(8, 4))
+                dot.pack_propagate(False)
+                cb = tk.Checkbutton(row, text=self._cycle_display_name(f),
+                                   variable=var, command=self._redraw_arch,
+                                   bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
+                                   activebackground=C['bg2'], activeforeground=col,
+                                   font=(FONT, fsz(9)), bd=0, highlightthickness=0,
+                                   anchor='w')
+                cb.pack(side='left', fill='x', expand=True)
+                delb = tk.Button(row, text="✕", command=lambda p=f: self._delete_cycle(p),
+                                bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9), 'bold'),
+                                relief='flat', cursor='hand2', bd=0, padx=8,
+                                activebackground=C['red'], activeforeground='#fff')
+                delb.pack(side='right', padx=(0, 4))
 
     def _delete_cycle(self, path):
         """Usun plik cyklu z archiwum (z potwierdzeniem)"""
         from pathlib import Path as _P
-        name = _P(path).stem.replace('cykl_', '')
+        name = self._cycle_display_name(_P(path))
         if messagebox.askyesno("Delete cycle",
                 f"Permanently delete this cycle?\n\n{name}\n\nThis cannot be undone."):
             try:
@@ -1720,6 +1753,7 @@ class PeltierControl:
             return None
         t, temp, spt, pwm = [], [], [], []
         temp2 = []
+        sa_list = []
         for r in data:
             cz = r.get('czas_s', '')
             if not cz or cz.startswith('#'):
@@ -1731,6 +1765,11 @@ class PeltierControl:
             except (ValueError, TypeError):
                 continue
             t.append(tt); temp.append(tm); spt.append(sp)
+            # setpoint aktywny (rampa) - osobno do wykresu
+            try:
+                sa_list.append(float(r.get('setpoint_aktywny', 'nan')))
+            except:
+                sa_list.append(None)
             try:
                 pwm.append(float(r.get('PWM_%', r.get('PWM', 0))))
             except:
@@ -1743,8 +1782,9 @@ class PeltierControl:
                 temp2.append(None)
         if not t:
             return None
-        # Dolacz temp2 jako 5. element (kompatybilnie - stary kod bierze [:4])
+        # Dolacz temp2 i setpoint aktywny jako atrybuty (kompatybilnie - zwracamy 4)
         self._last_temp2 = temp2
+        self._last_sa = sa_list
         return t, temp, spt, pwm
 
     def _compute_stats(self, data):
@@ -1815,41 +1855,62 @@ class PeltierControl:
                 self.arch_settings_lbl.config(text="")
             return
 
-        files = sorted(self.log_dir.glob("cykl_*.csv"), reverse=True)
+        files = sorted([f for f in self.log_dir.glob("*.csv") if (f.name.startswith("cykl_") or f.name.startswith("c_")) and not f.name.startswith("_tmp")], reverse=True)
         file_order = {str(f): i for i, f in enumerate(files)}
         align = self.arch_align.get()
 
         multi = len(selected) > 1
+        # Sprawdz maksymalny czas (do wyboru jednostki osi: s czy min)
+        max_t = 0
+        for path, _ in selected:
+            d = self._load_cycle_data(path)
+            if d and d[0]:
+                span = d[0][-1] - (d[0][0] if align else 0)
+                max_t = max(max_t, span)
+        use_min = max_t > 180  # powyzej 3 min -> osi w minutach
+        tdiv = 60.0 if use_min else 1.0
+
         for path, _ in selected:
             d = self._load_cycle_data(path)
             if not d: continue
             t, temp, spt, pwm = d
+            sa = getattr(self, '_last_sa', None)
             ci = file_order.get(path, 0) % len(self._arch_colors)
             col = self._arch_colors[ci]
-            # Os X: od zera (align) albo absolutna
+            # Os X: od zera (align) albo absolutna, przeliczona na wybrana jednostke
             t0 = t[0] if align else 0
-            tx = [x - t0 for x in t]
+            tx = [(x - t0) / tdiv for x in t]
             from pathlib import Path as _P
-            name = _P(path).stem.replace('cykl_', '')
-            # Przy jednym cyklu pokaz tez target; przy wielu tylko temp (czytelniej)
+            name = self._cycle_display_name(_P(path))
+            # Przy jednym cyklu pokaz target + setpoint-ramp + temp; przy wielu tylko temp
             if not multi:
                 self.ax_a.plot(tx, spt, color=C['orange'], lw=1.2, ls='--',
-                              label='target', alpha=0.6)
+                              label='target', alpha=0.55)
+                # Setpoint aktywny (rampa) - kropkowana linia
+                if sa and any(v is not None for v in sa):
+                    txs = [tx[i] for i in range(len(sa)) if i < len(tx) and sa[i] is not None]
+                    sas = [v for v in sa if v is not None]
+                    if sas:
+                        self.ax_a.plot(txs, sas, color=C['cyan'], lw=1.1, ls=':',
+                                      label='setpoint (ramp)', alpha=0.7)
                 self.ax_a.plot(tx, temp, color=col, lw=2, label='temp (gal)')
-                # Druga termopara jesli dostepna w tym cyklu
+                # Druga termopara jesli dostepna
                 t2 = getattr(self, '_last_temp2', None)
                 if t2 and any(v is not None for v in t2):
                     tx2 = [tx[i] for i in range(len(t2)) if i < len(tx) and t2[i] is not None]
                     ty2 = [v for v in t2 if v is not None]
                     if ty2:
-                        self.ax_a.plot(tx2, ty2, color=C['cyan'], lw=1.5,
+                        self.ax_a.plot(tx2, ty2, color=C['purple'], lw=1.5,
                                       label='temp 2', alpha=0.8)
             else:
                 self.ax_a.plot(tx, temp, color=col, lw=1.8, label=name)
 
-        self.ax_a.set_xlabel('time [s]' + ('  (aligned from 0)' if align else ''),
-                            color=C['dim'], fontsize=9)
-        self.ax_a.set_ylabel('°C', color=C['dim'], fontsize=9)
+        # Opis osi czasu - z jednostka i informacja o wyrownaniu
+        unit_txt = 'minutes' if use_min else 'seconds'
+        xlabel = f'time [{unit_txt}]'
+        if align: xlabel += '  ·  aligned from 0'
+        self.ax_a.set_xlabel(xlabel, color=C['dim'], fontsize=9)
+        self.ax_a.set_ylabel('temperature [°C]', color=C['dim'], fontsize=9)
         self.ax_a.tick_params(colors=C['dim'], labelsize=8)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
                         labelcolor=C['dim'], fontsize=8, loc='best')
@@ -1980,7 +2041,7 @@ class PeltierControl:
         from pathlib import Path as _P
         tk.Label(inner, text="CYCLE STATISTICS", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(14), 'bold')).pack(anchor='w')
-        tk.Label(inner, text=_P(path).stem.replace('cykl_', ''), bg=C['bg'], fg=C['dim'],
+        tk.Label(inner, text=self._cycle_display_name(_P(path)), bg=C['bg'], fg=C['dim'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
 
         def settle_str():
@@ -2066,7 +2127,7 @@ class PeltierControl:
             fig.text(0.5, 0.96, "Peltier Control - Cycle Report", ha='center',
                      fontsize=16, fontweight='bold')
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            fig.text(0.5, 0.935, f"{_P(path).stem.replace('cykl_','')}  ·  generated {ts}",
+            fig.text(0.5, 0.935, f"{self._cycle_display_name(_P(path))}  ·  generated {ts}",
                      ha='center', fontsize=9, color='gray')
 
             # Wykres temperatury (gorna polowa)
@@ -2144,7 +2205,9 @@ class PeltierControl:
                     self.reach_time = None
                     self.reach_avg_rate = None
                     self.last_setpoint_target = st
-                elif self.cyc_on and prev == 'COOLDOWN' and state == 'MAN':
+                elif self.cyc_on and state == 'MAN' and prev in ('AUTO', 'COOLDOWN', 'FREEZE', 'FREEZE_READY'):
+                    # Koniec cyklu - przejscie z pracy do MAN (STOP).
+                    # Bez cooldown teraz idzie prosto AUTO->MAN.
                     self.cyc_stop("done")
 
                 # Wykrywanie zmiany docelowego setpointu podczas pracy (nowe dotarcie)
@@ -2344,11 +2407,18 @@ class PeltierControl:
         SaveCycleDialog(self.root, self, tmp_path)
 
     def save_cycle_as(self, tmp_path, name):
-        """Zapisz cykl pod podana nazwa do archiwum"""
+        """Zapisz cykl pod nazwa = opis uzytkownika (timestamp tylko przy duplikacie)"""
         import re as _re
-        safe = _re.sub(r'[^\w\-]', '_', name.strip()) or "cykl"
-        ts = getattr(self, 'cyc_ts', datetime.now().strftime("%Y%m%d_%H%M%S"))
-        dest = self.log_dir / f"cykl_{safe}_{ts}.csv"
+        # Zachowaj czytelny opis: pozwol na spacje, myslniki, podkreslenia
+        clean = name.strip()
+        safe = _re.sub(r'[^\w\-\s]', '', clean).strip()
+        safe = _re.sub(r'\s+', '_', safe) or "cykl"
+        # Plik: prefix c_ (do wyszukiwania w archiwum) + opis
+        dest = self.log_dir / f"c_{safe}.csv"
+        # Jesli istnieje - dodaj timestamp zeby nie nadpisac
+        if dest.exists():
+            ts = datetime.now().strftime("%m%d_%H%M")
+            dest = self.log_dir / f"c_{safe}_{ts}.csv"
         try:
             tmp_path.rename(dest)
             print(f"Zapisano cykl: {dest.name}")
