@@ -462,6 +462,10 @@ class PeltierControl:
                 prev = self.last_state
                 self.last_state = state
                 self.cur_state = state
+                # SELF-TUNE: gdy stan to ST-..., self-tune zmienia PID na zywo.
+                # Przepisz nowe Kp/Ki/Kd na suwaki, zeby tabela sie aktualizowala.
+                if state.startswith('ST') or state.startswith('CAL'):
+                    self._st_pid_update = (d['kp'], d['ki'], d['kd'])
                 # Wykryj koniec kalibracji (CAL/CAL-N -> MAN)
                 if self.cal_running and 'CAL' in prev and state == 'MAN':
                     self.cal_running = False
@@ -2191,6 +2195,15 @@ class PeltierControl:
     # ────────────────────────────────────────────────────
     def tick(self):
         try:
+            # SELF-TUNE/kalibracja zmienily PID - zaktualizuj suwaki (tabele)
+            stp = getattr(self, '_st_pid_update', None)
+            if stp is not None:
+                self._st_pid_update = None
+                try:
+                    if hasattr(self, 'sl_kp'): self.sl_kp.set(stp[0], silent=True)
+                    if hasattr(self, 'sl_ki'): self.sl_ki.set(stp[1], silent=True)
+                    if hasattr(self, 'sl_kd'): self.sl_kd.set(stp[2], silent=True)
+                except: pass
             rows = []
             while not self.data_queue.empty():
                 rows.append(self.data_queue.get_nowait())
