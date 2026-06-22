@@ -389,6 +389,17 @@ int compPID(float temp){
     out+=rate*FF_GAIN;                // moc wyprzedzajaca
   }
 
+  // ── OCHRONA STARTU ──────────────────────────────────
+  // Gdy temp jest blisko setpointu (start rampy, maly blad), ogranicz moc
+  // do 70%. Zapobiega gwaltownemu skokowi PWM na samym poczatku rampy.
+  // Po oddaleniu od setpointu (blad rosnie) pelna moc jest dozwolona.
+  float spDist=fabs(spA-temp);
+  if(spDist<0.5f && htg && out>PWM_MAX*0.7f){
+    out=PWM_MAX*0.7f;
+  } else if(spDist<0.5f && !htg && out<-PWM_MAX*0.7f){
+    out=-PWM_MAX*0.7f;
+  }
+
   // Jednostronne sterowanie podczas rampy (tylko grzanie LUB chlodzenie),
   // dwustronne przy celu (moze korygowac w obie strony)
   if(!atT){
