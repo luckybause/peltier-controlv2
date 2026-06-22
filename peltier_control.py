@@ -649,6 +649,77 @@ class PeltierControl:
                 "This will overwrite the current calibration."):
             self.load_calibration_from_pc()
 
+    def show_cal_table(self):
+        """Pobierz profile z urzadzenia i pokaz tabele Kp/Ki/Kd"""
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        self._caldump_buf = []
+        self._caldump_active = False
+        self._caldump_purpose = 'view'
+        self.send("DUMPCAL")
+        print("Pobieranie tabeli kalibracji...")
+
+    def _show_cal_table_window(self, profiles):
+        """Okno z tabela skalibrowanych PID (temp x rampa)"""
+        # Siatka jak w firmware
+        PT = [20, 30, 40, 50, 60, 70, 80, 90, 100]
+        PR = [2, 5, 10, 20]
+        win = tk.Toplevel(self.root)
+        win.title("Calibration Table")
+        win.configure(bg=C['bg'])
+        win.geometry("720x520")
+        tk.Label(win, text="CALIBRATION TABLE — heating PID (Kp / Ki / Kd)",
+                 bg=C['bg'], fg=C['purple'], font=(FONT, fsz(12), 'bold')).pack(
+                 anchor='w', padx=16, pady=(14, 4))
+        n_valid = sum(1 for p in profiles if p['valid'])
+        tk.Label(win, text=f"{n_valid} of {len(profiles)} grid points calibrated.  "
+                 "Empty = not calibrated (uses defaults 10/0.3/0.8).",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', padx=16)
+        # Mapa idx -> profil
+        pmap = {p['idx']: p for p in profiles}
+        # Tabela przewijalna
+        frame = tk.Frame(win, bg=C['bg'])
+        frame.pack(fill='both', expand=True, padx=16, pady=12)
+        canvas = tk.Canvas(frame, bg=C['bg2'], highlightthickness=0)
+        sb = tk.Scrollbar(frame, orient='vertical', command=canvas.yview)
+        inner = tk.Frame(canvas, bg=C['bg2'])
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: canvas.config(scrollregion=canvas.bbox('all')))
+        canvas.config(yscrollcommand=sb.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        # Naglowek: rampy
+        tk.Label(inner, text="Temp\\Ramp", bg=C['panel'], fg=C['cyan'],
+                 font=(FONT, fsz(9), 'bold'), width=10, anchor='w').grid(
+                 row=0, column=0, sticky='nsew', padx=1, pady=1)
+        for ci, r in enumerate(PR):
+            tk.Label(inner, text=f"{r}°C/min", bg=C['panel'], fg=C['cyan'],
+                     font=(FONT, fsz(9), 'bold'), width=16).grid(
+                     row=0, column=ci+1, sticky='nsew', padx=1, pady=1)
+        # Wiersze: temperatury
+        for ri, t in enumerate(PT):
+            tk.Label(inner, text=f"{t}°C", bg=C['panel'], fg=C['orange'],
+                     font=(FONT, fsz(9), 'bold'), width=10, anchor='w').grid(
+                     row=ri+1, column=0, sticky='nsew', padx=1, pady=1)
+            for ci, r in enumerate(PR):
+                idx = ri * len(PR) + ci  # pi_(ti,ri) = ti*PR_N+ri
+                p = pmap.get(idx)
+                if p and p['valid']:
+                    txt = f"{p['KpH']:.1f} / {p['KiH']:.2f} / {p['KdH']:.2f}"
+                    fg = C['text']; bg = C['bg2']
+                else:
+                    txt = "—"
+                    fg = C['dim2']; bg = C['panel2']
+                tk.Label(inner, text=txt, bg=bg, fg=fg,
+                         font=(FONT, fsz(8)), width=16).grid(
+                         row=ri+1, column=ci+1, sticky='nsew', padx=1, pady=1)
+        # Stopka
+        tk.Label(win, text="Each cell: Kp / Ki / Kd for that temperature and ramp rate.\n"
+                 "On START, the app interpolates between the 4 nearest points automatically.",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(8)), justify='left').pack(
+                 anchor='w', padx=16, pady=(0, 12))
+
     def dump_calibration_to_pc(self, silent=True):
         """Poprosi urzadzenie o profile i offset, zapisze do JSON"""
         if not self.connected:
@@ -695,6 +766,9 @@ class PeltierControl:
                         f"Saved {n_valid} calibrated profiles.\n"
                         "They will be auto-loaded on next connection.")
                 except: pass
+            elif self._caldump_purpose == 'view':
+                # Pokaz tabele w oknie
+                self._show_cal_table_window(profiles)
         except Exception as e:
             print(f"Blad zapisu kalibracji: {e}")
         self._caldump_purpose = None
@@ -1093,8 +1167,12 @@ class PeltierControl:
         self.btn_autocal = mk_btn(sec2, "⚙ AUTO-CAL (select range)",
                                   self.do_autocal, C['purple'], fg='#fff')
         self.btn_autocal.pack(fill='x', pady=(0, 6))
-        tk.Label(sec2, text="Calibrates PID for temp × ramp grid, saves to Flash",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w')
+        mk_btn_outline(sec2, "📋 VIEW CAL TABLE", self.show_cal_table,
+                       C['purple']).pack(fill='x', pady=(0, 6))
+        tk.Label(sec2, text="Calibrates PID for temp × ramp grid, saves to Flash.\n"
+                 "View table shows stored Kp/Ki/Kd per point.",
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left').pack(anchor='w')
 
         # ── THERMOCOUPLE OFFSET ──
         sec3 = self._adv_section(inner, "THERMOCOUPLE", C['purple'])
@@ -1642,6 +1720,24 @@ class PeltierControl:
         elif s.startswith('c_'): s = s[2:]
         return s.replace('_', ' ')
 
+    def _bind_tooltip(self, widget, text):
+        """Prosty tooltip pokazujacy pelny tekst po najechaniu"""
+        tip = {'win': None}
+        def show(e):
+            if tip['win']: return
+            tw = tk.Toplevel(widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{e.x_root+10}+{e.y_root+10}")
+            tk.Label(tw, text=text, bg='#1a1c1f', fg='#e8e8e8',
+                     font=(FONT, fsz(8)), padx=6, pady=3,
+                     relief='solid', bd=1).pack()
+            tip['win'] = tw
+        def hide(e):
+            if tip['win']:
+                tip['win'].destroy(); tip['win'] = None
+        widget.bind('<Enter>', show)
+        widget.bind('<Leave>', hide)
+
     def refresh_arch(self):
         # Wyczysc liste checkboxow
         for w in self.arch_items.winfo_children():
@@ -1684,21 +1780,30 @@ class PeltierControl:
                 self.arch_vars[str(f)] = var
                 col = self._arch_colors[i % len(self._arch_colors)]
                 i += 1
+                # KOLEJNOSC PACK: kosz NAJPIERW (side=right) = zawsze widoczny,
+                # potem kropka (left), na koncu checkbox wypelnia srodek.
+                # Dzieki temu dluga nazwa nie zaslania kosza.
+                delb = tk.Button(row, text="🗑", command=lambda p=f: self._delete_cycle(p),
+                                bg=C['bg2'], fg=C['red'], font=(FONT, fsz(11), 'bold'),
+                                relief='flat', cursor='hand2', bd=0, padx=10, pady=2,
+                                activebackground=C['red'], activeforeground='#fff')
+                delb.pack(side='right', padx=(2, 6))
                 dot = tk.Frame(row, bg=col, width=10, height=10)
                 dot.pack(side='left', padx=(8, 4))
                 dot.pack_propagate(False)
-                cb = tk.Checkbutton(row, text=self._cycle_display_name(f),
+                # Nazwa skrocona jesli za dluga (zeby nie rozpychala wiersza)
+                full_name = self._cycle_display_name(f)
+                disp_name = full_name if len(full_name) <= 22 else full_name[:20] + "…"
+                cb = tk.Checkbutton(row, text=disp_name,
                                    variable=var, command=self._redraw_arch,
                                    bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
                                    activebackground=C['bg2'], activeforeground=col,
                                    font=(FONT, fsz(9)), bd=0, highlightthickness=0,
                                    anchor='w')
+                # Pelna nazwa w tooltipie (po najechaniu)
+                if len(full_name) > 22:
+                    self._bind_tooltip(cb, full_name)
                 cb.pack(side='left', fill='x', expand=True)
-                delb = tk.Button(row, text="🗑", command=lambda p=f: self._delete_cycle(p),
-                                bg=C['bg2'], fg=C['red'], font=(FONT, fsz(10), 'bold'),
-                                relief='flat', cursor='hand2', bd=0, padx=8, pady=2,
-                                activebackground=C['red'], activeforeground='#fff')
-                delb.pack(side='right', padx=(2, 6))
 
     def _delete_cycle(self, path):
         """Usun plik cyklu z archiwum (z potwierdzeniem)"""
