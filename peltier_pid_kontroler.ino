@@ -55,7 +55,7 @@ int pwmLimit = 77;   // 30% z 255 = 77 (domyslny bezpieczny limit)
 #define KD_MIN       0.0f
 #define KD_MAX       3.0f
 #define RAMP_MIN     0.5f
-#define RAMP_MAX    40.0f
+#define RAMP_MAX    80.0f
 #define TMAX_MIN    50.0f
 #define TMAX_MAX   115.0f
 
@@ -83,16 +83,16 @@ int pwmLimit = 77;   // 30% z 255 = 77 (domyslny bezpieczny limit)
 
 // Profile
 #define PT_N  9
-#define PR_N  4
+#define PR_N  8
 #define P_TOT (PT_N*PR_N)
 const float PT[PT_N]={20,30,40,50,60,70,80,90,100};
-const float PR[PR_N]={2,5,10,20};
+const float PR[PR_N]={2,5,10,20,30,40,60,80};
 
 // Konfigurowalna lista ramp do kalibracji (ustawiana z aplikacji).
 // Domyslnie = PR. Maksymalnie 10 ramp.
-#define CAL_RAMP_MAX 10
-float calRamps[CAL_RAMP_MAX]={2,5,10,20};
-int   calRampN=4;  // ile ramp aktywnych
+#define CAL_RAMP_MAX 20
+float calRamps[CAL_RAMP_MAX]={2,5,10,20,30,40,60,80};
+int   calRampN=8;  // ile ramp aktywnych
 
 struct Prof {
   float Kp_h,Ki_h,Kd_h;
@@ -185,6 +185,7 @@ String cSt="";
 #define CI  2000   // co 2s analizuj
 
 unsigned long tP=0,tD=0,tR=0;
+unsigned long rampT0=0;   // czas startu rampy (do soft startu feed-forward)
 #define DT_D 200
 #define DT_R 200
 
@@ -381,18 +382,27 @@ int compPID(float temp){
   // Wyjscie PID
   float out=Kp*err+Ki*ig+Kd*dv;
 
-  // ── FEED-FORWARD RAMPY ──────────────────────────────
+  // ── FEED-FORWARD RAMPY (z soft startem) ─────────────
   // Podczas rampy dodaj wyprzedzajaca moc ~ do zadanego rate.
-  // Temperatura "goni" setpoint bez opoznienia zamiast czekac az narosnie blad.
+  // SOFT START: przez pierwsze 3s feed-forward narasta od 0 do pelnej
+  // wartosci, zeby nie bylo wybuchu mocy na starcie (ktory zaklamuje
+  // tempo wzrostu temperatury). Po 3s pelna moc wyprzedzajaca.
   if(!atT){
     float rate=htg?rU:-rD;            // zadany rate [C/min]
-    out+=rate*FF_GAIN;                // moc wyprzedzajaca
+    float ff=rate*FF_GAIN;            // docelowa moc wyprzedzajaca
+    // Soft start: mnoznik 0->1 przez SOFT_MS od startu rampy
+    const unsigned long SOFT_MS=3000;
+    unsigned long sinceStart=millis()-rampT0;
+    if(sinceStart<SOFT_MS){
+      float k=(float)sinceStart/SOFT_MS;  // 0..1 liniowo
+      ff*=k;
+    }
+    out+=ff;
   }
 
   // ── OCHRONA STARTU ──────────────────────────────────
   // Gdy temp jest blisko setpointu (start rampy, maly blad), ogranicz moc
   // do 70%. Zapobiega gwaltownemu skokowi PWM na samym poczatku rampy.
-  // Po oddaleniu od setpointu (blad rosnie) pelna moc jest dozwolona.
   float spDist=fabs(spA-temp);
   if(spDist<0.5f && htg && out>PWM_MAX*0.7f){
     out=PWM_MAX*0.7f;
@@ -400,13 +410,16 @@ int compPID(float temp){
     out=-PWM_MAX*0.7f;
   }
 
-  // Jednostronne sterowanie podczas rampy (tylko grzanie LUB chlodzenie),
-  // dwustronne przy celu (moze korygowac w obie strony)
-  if(!atT){
-    if(htg) out=constrain(out,0,(float)PWM_MAX);
-    else    out=constrain(out,-(float)PWM_MAX,0);
+  // ── TWARDA JEDNOKIERUNKOWOSC ─────────────────────────
+  // ZASADA: jak grzejemy to TYLKO grzejemy, jak chlodzimy to TYLKO chlodzimy.
+  // Nigdy nie mieszamy. Kierunek decyduje htg (grzanie=true).
+  // - htg (grzanie):  PWM zawsze >= 0 (0..max), NIGDY ujemny
+  // - !htg (chlodzenie): PWM zawsze <= 0 (-max..0), NIGDY dodatni
+  // Dotyczy CALEJ rampy I utrzymania przy celu - bez wyjatkow.
+  if(htg){
+    out=constrain(out,0.0f,(float)PWM_MAX);     // tylko grzanie
   } else {
-    out=constrain(out,-(float)PWM_MAX,(float)PWM_MAX);
+    out=constrain(out,-(float)PWM_MAX,0.0f);    // tylko chlodzenie
   }
 
   return (int)out;
@@ -833,6 +846,7 @@ void procCmd(String c){
   else if(key=="START"){
     if(sys==MAN){
       sys=AUTO;spA=lT;ig=0;pe=0;slT=0;tR=millis();
+      rampT0=millis();   // znacznik startu rampy - dla soft startu feed-forward
       if(calDone) ldProf(spT,rU);
       Serial.println("ON");
     }
@@ -1045,7 +1059,7 @@ void loop(){
         Serial.print(spA,2);Serial.print(",");Serial.print(spT,2);Serial.print(",");
         Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
         Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);Serial.print(",AUTO,");
-        Serial.println(isnan(temp2)?0:temp2,2);
+        Serial.println(isnan(temp2)?0.0f:temp2,2);
         break;
       case FREEZE: {
         // Lagodna rampa setpointu w dol do FREEZE_TARGET
@@ -1069,7 +1083,7 @@ void loop(){
         Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
         Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);
         Serial.print(frzReady?",FREEZE_READY,":",FREEZE,");
-        Serial.println(isnan(temp2)?0:temp2,2);
+        Serial.println(isnan(temp2)?0.0f:temp2,2);
         break;
       }
       case MAN:
@@ -1083,7 +1097,7 @@ void loop(){
         Serial.print(Kp,3);Serial.print(",");
         Serial.print(Ki,4);Serial.print(",");
         Serial.print(Kd,3);Serial.print(",MAN,");
-        Serial.println(isnan(temp2)?0:temp2,2);
+        Serial.println(isnan(temp2)?0.0f:temp2,2);
         break;
       default:break;
     }
