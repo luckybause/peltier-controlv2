@@ -521,12 +521,6 @@ class PeltierControl:
                 self.dev_cal_min = float(d['CALMIN'])
             if 'CALMAX' in d:
                 self.dev_cal_max = float(d['CALMAX'])
-            # Limit mocy Peltiera
-            if 'PWMLIM' in d and hasattr(self, 'sl_pwmlim'):
-                try:
-                    if not getattr(self, '_cfg_synced', False):
-                        self.sl_pwmlim.set(float(d['PWMLIM']), silent=True)
-                except: pass
             # Stan wentylatorow
             if 'FAN' in d:
                 fan_val = int(float(d['FAN']))
@@ -1191,16 +1185,6 @@ class PeltierControl:
         tk.Label(sec4, text="Detected once, saved permanently",
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(6, 0))
 
-        # ── POWER LIMIT (ochrona sterownika) ──
-        sec_pl = self._adv_section(inner, "PELTIER POWER LIMIT", C['red'])
-        self.sl_pwmlim = SliderField(sec_pl, "MAX POWER", 10, 100, 30,
-                                     C['red'], "%", 0,
-                                     on_change=lambda v: self.send(f"SETPWMLIM:{v:.0f}"))
-        tk.Label(sec_pl, text="⚠ Limits Peltier current to protect the driver (MDD3A: 3A cont.)\n"
-                 "30% ≈ 2.4A · raise only after measuring real current!",
-                 bg=C['bg2'], fg=C['yellow'], font=(FONT, fsz(8)),
-                 justify='left').pack(anchor='w', pady=(6, 0))
-
         # ── DEVICE FLASH MEMORY ──
         sec5 = self._adv_section(inner, "DEVICE FLASH", C['green'])
         bf2 = tk.Frame(sec5, bg=C['bg2'])
@@ -1244,7 +1228,7 @@ class PeltierControl:
         # Suwaki zawsze aktywne (mozna ustawic wartosci przed polaczeniem)
         # START/STOP tez aktywne - sprawdzaja polaczenie w momencie klikniecia
         # (dezaktywujemy tylko gdy chcemy wyraznie zablokowac)
-        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off', 'sl_fan', 'sl_pwmlim']:
+        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off', 'sl_fan']:
             if hasattr(self, sl):
                 getattr(self, sl).set_enabled(True)
         # Przyciski zawsze klikalnie - reaguja komunikatem jesli brak polaczenia
@@ -1472,8 +1456,7 @@ class PeltierControl:
         s = {}
         for key, attr in [('sp','sl_sp'),('ru','sl_ru'),('rd','sl_rd'),
                           ('tmax','sl_tmax'),('kp','sl_kp'),('ki','sl_ki'),
-                          ('kd','sl_kd'),('off','sl_off'),('fan','sl_fan'),
-                          ('pwmlim','sl_pwmlim')]:
+                          ('kd','sl_kd'),('off','sl_off'),('fan','sl_fan')]:
             if hasattr(self, attr):
                 try: s[key] = getattr(self, attr).get()
                 except: pass
@@ -1507,8 +1490,7 @@ class PeltierControl:
         """Zastosuj preset - ustaw suwaki i wyslij do urzadzenia"""
         mapping = [('sp','sl_sp','SP',1),('ru','sl_ru','RU',1),('rd','sl_rd','RD',1),
                    ('tmax','sl_tmax','TMAX',0),('kp','sl_kp','KP',1),('ki','sl_ki','KI',2),
-                   ('kd','sl_kd','KD',2),('off','sl_off','OFFSET',1),('fan','sl_fan','FAN',0),
-                   ('pwmlim','sl_pwmlim','SETPWMLIM',0)]
+                   ('kd','sl_kd','KD',2),('off','sl_off','OFFSET',1),('fan','sl_fan','FAN',0)]
         for key, attr, cmd, dec in mapping:
             if key in settings and hasattr(self, attr):
                 val = settings[key]
