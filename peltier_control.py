@@ -1151,7 +1151,7 @@ class PeltierControl:
         self.btn_st.pack(side='right')
         self.sl_kp = SliderField(sec1, "Kp", 1, 30, 10.0, C['cyan'], "", 1,
                                  on_change=lambda v: self.send(f"KP:{v:.1f}"))
-        self.sl_ki = SliderField(sec1, "Ki", 0, 3, 0.3, C['cyan'], "", 2,
+        self.sl_ki = SliderField(sec1, "Ki", 0, 1.5, 0.3, C['cyan'], "", 2,
                                  on_change=lambda v: self.send(f"KI:{v:.2f}"))
         self.sl_kd = SliderField(sec1, "Kd", 0, 3, 0.8, C['cyan'], "", 2,
                                  on_change=lambda v: self.send(f"KD:{v:.2f}"))
