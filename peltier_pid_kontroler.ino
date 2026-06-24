@@ -33,10 +33,6 @@
 #define PIN_BTN2   A5
 
 #define PWM_MAX       255
-// Limit PWM Peltiera - ochrona sterownika MDD3A (max 3A ciagle, 5A chwilowo).
-// Domyslnie 30% = ~2.4A przy Peltierze 12V/8A. Regulowane z aplikacji (SETPWMLIM).
-// UWAGA: zmierz realny prad przed podniesieniem limitu!
-int pwmLimit = 77;   // 30% z 255 = 77 (domyslny bezpieczny limit)
 #define TEMP_MIN_C    -15.0f
 #define TEMP_MAX_DEF   110.0f
 #define PID_DT_MS      100
@@ -117,6 +113,7 @@ float Kp_c=10,Ki_c=0.3f,Kd_c=0.3f;
 float Kp=10,Ki=0.3f,Kd=0.8f;
 float rU=2,rD=2,tMax=TEMP_MAX_DEF;
 bool  htg=true;
+bool  wasAtT=false;   // poprzedni stan "przy celu" (do przyciecia integratora)
 
 float ig=0,pe=0,lT=25;
 int   lPwm=0;
@@ -247,8 +244,7 @@ void fanApply(){
 }
 void stpPel(){analogWrite(PIN_M1A,0);analogWrite(PIN_M1B,0);lPwm=0;ssA=false;ssPwm=0;}
 void setPwr(int o){
-  // Najpierw twardy limit ochronny (chroni MDD3A przed przekroczeniem pradu)
-  o=constrain(o,-pwmLimit,pwmLimit);
+  // Pelna moc bez limitu (bezpieczny zasilacz 5V/3A)
   o=constrain(o,-PWM_MAX,PWM_MAX);
   bool dir=(lPwm>0&&o<0)||(lPwm<0&&o>0),zero=(lPwm==0&&o!=0);
   if(dir||zero){if(dir){wPwm(0);delay(50);}ssA=true;ssTgt=o;ssPwm=(o>0)?SS_INIT:-SS_INIT;ssTm=millis();wPwm(ssPwm);}
@@ -373,32 +369,24 @@ int compPID(float temp){
   // Dystans do celu finalnego
   bool atT=(fabs(spA-spT)<0.5f);
 
-  // Integracja z anti-windup (prosty, sprawdzony)
-  ig=constrain(ig+err*dt,-INTEGRAL_MAX,INTEGRAL_MAX);
+  // ── PRZEJSCIE RAMPA->CEL: przytnij integrator ────────
+  // Gdy setpoint pierwszy raz dobija do celu, integrator z rampy moglby
+  // byc niezerowy i powodowac skok. Przycinamy go do polowy limitu celu,
+  // zeby przejscie bylo plynne (bez dziury/oscylacji jak wczesniej).
+  if(atT && !wasAtT){
+    ig = constrain(ig, -INTEGRAL_MAX*0.5f, INTEGRAL_MAX*0.5f);
+  }
+  wasAtT = atT;
+
+  // ── INTEGRACJA z ANTI-WINDUP ────────────────────────
+  // Pelny zakres integratora - to on dostarcza moc na rampie (czysty PID).
+  ig=constrain(ig+err*dt, -INTEGRAL_MAX, INTEGRAL_MAX);
 
   // Derywata
   float dv=(err-pe)/dt;pe=err;
 
-  // Wyjscie PID
+  // Wyjscie PID (czysty PID, bez feed-forward)
   float out=Kp*err+Ki*ig+Kd*dv;
-
-  // ── FEED-FORWARD RAMPY (z soft startem) ─────────────
-  // Podczas rampy dodaj wyprzedzajaca moc ~ do zadanego rate.
-  // SOFT START: przez pierwsze 3s feed-forward narasta od 0 do pelnej
-  // wartosci, zeby nie bylo wybuchu mocy na starcie (ktory zaklamuje
-  // tempo wzrostu temperatury). Po 3s pelna moc wyprzedzajaca.
-  if(!atT){
-    float rate=htg?rU:-rD;            // zadany rate [C/min]
-    float ff=rate*FF_GAIN;            // docelowa moc wyprzedzajaca
-    // Soft start: mnoznik 0->1 przez SOFT_MS od startu rampy
-    const unsigned long SOFT_MS=3000;
-    unsigned long sinceStart=millis()-rampT0;
-    if(sinceStart<SOFT_MS){
-      float k=(float)sinceStart/SOFT_MS;  // 0..1 liniowo
-      ff*=k;
-    }
-    out+=ff;
-  }
 
   // ── OCHRONA STARTU ──────────────────────────────────
   // Gdy temp jest blisko setpointu (start rampy, maly blad), ogranicz moc
@@ -440,10 +428,10 @@ void detPol(){
   Serial.println(polSw?"Pol:swapped":"Pol:normal");
 }
 
-void startRT(){sys=RTEST;rtP=0;rtU=rtD=0;rtT0=lT;rtTm=millis();rtSt="HEAT 0/60s";wPwm(pwmLimit);}
+void startRT(){sys=RTEST;rtP=0;rtU=rtD=0;rtT0=lT;rtTm=millis();rtSt="HEAT 0/60s";wPwm(PWM_MAX);}
 void runRT(float t){
   if(sys!=RTEST) return;unsigned long el=millis()-rtTm;int s=(int)(el/1000);
-  if(rtP==0){rtSt="HEAT "+String(s)+"/60s";if(t>=tMax-5||s>=60){wPwm(0);float dT=t-rtT0,dM=el/60000.0f;rtU=(dM>0)?dT/dM:0;rtP=1;rtT0=t;rtTm=millis();delay(300);wPwm(-pwmLimit);}}
+  if(rtP==0){rtSt="HEAT "+String(s)+"/60s";if(t>=tMax-5||s>=60){wPwm(0);float dT=t-rtT0,dM=el/60000.0f;rtU=(dM>0)?dT/dM:0;rtP=1;rtT0=t;rtTm=millis();delay(300);wPwm(-PWM_MAX);}}
   else if(rtP==1){rtSt="COOL "+String(s)+"/60s";if(t<=TEMP_MIN_C+2||s>=60){wPwm(0);float dT=rtT0-t,dM=el/60000.0f;rtD=(dM>0)?dT/dM:0;if(rtU>0) rU=constrain(rtU*0.8f,RAMP_MIN,RAMP_MAX);if(rtD>0) rD=constrain(rtD*0.8f,RAMP_MIN,RAMP_MAX);rtP=2;sys=MAN;stpPel();rtSt="G:"+fts(rtU,1)+" C:"+fts(rtD,1);}}
 }
 
@@ -822,7 +810,6 @@ void sendCfg(){
   Serial.print(",CALMIN=");Serial.print(cTmn,0);
   Serial.print(",CALMAX=");Serial.print(cTmx,0);
   Serial.print(",FAN=");Serial.print(fanOn?fanSpeed:0);
-  Serial.print(",PWMLIM=");Serial.print((int)(pwmLimit*100.0/255.0));
   Serial.println();
 }
 
@@ -886,13 +873,6 @@ void procCmd(String c){
   else if(key=="FANOFF"){
     fanOn=false; fanApply();
     Serial.println("FAN OFF");
-  }
-  else if(key=="SETPWMLIM"){
-    // SETPWMLIM:0-100 - limit mocy Peltiera w % (ochrona MDD3A)
-    int pct=constrain((int)fv,10,100);
-    pwmLimit=(int)(pct*2.55f);
-    Serial.print("PWM LIMIT set: ");Serial.print(pct);Serial.print("% (");
-    Serial.print(pwmLimit);Serial.println("/255)");
   }
   else if(key=="SELFTUNE"){ if(sys==AUTO) stStart(); }
   else if(key=="SELFTUNESTOP"){ if(stOn) stStop(); }
