@@ -47,7 +47,7 @@
 #define KP_MIN       1.0f
 #define KP_MAX      30.0f
 #define KI_MIN       0.0f
-#define KI_MAX       3.0f
+#define KI_MAX       1.5f
 #define KD_MIN       0.0f
 #define KD_MAX       3.0f
 #define RAMP_MIN     0.5f
@@ -379,8 +379,11 @@ int compPID(float temp){
   wasAtT = atT;
 
   // ── INTEGRACJA z ANTI-WINDUP ────────────────────────
-  // Pelny zakres integratora - to on dostarcza moc na rampie (czysty PID).
-  ig=constrain(ig+err*dt, -INTEGRAL_MAX, INTEGRAL_MAX);
+  // Na RAMPIE ograniczamy integrator (mniejszy zakres), zeby nie narastal
+  // do maksimum - to glowne zrodlo dziury i oscylacji przy dojsciu do celu.
+  // Przy CELU pelny zakres - do precyzyjnego utrzymania.
+  float igLim = atT ? INTEGRAL_MAX : (INTEGRAL_MAX*0.4f);
+  ig=constrain(ig+err*dt, -igLim, igLim);
 
   // Derywata
   float dv=(err-pe)/dt;pe=err;
@@ -401,14 +404,24 @@ int compPID(float temp){
   // ── TWARDA JEDNOKIERUNKOWOSC ─────────────────────────
   // ZASADA: jak grzejemy to TYLKO grzejemy, jak chlodzimy to TYLKO chlodzimy.
   // Nigdy nie mieszamy. Kierunek decyduje htg (grzanie=true).
-  // - htg (grzanie):  PWM zawsze >= 0 (0..max), NIGDY ujemny
-  // - !htg (chlodzenie): PWM zawsze <= 0 (-max..0), NIGDY dodatni
-  // Dotyczy CALEJ rampy I utrzymania przy celu - bez wyjatkow.
   if(htg){
     out=constrain(out,0.0f,(float)PWM_MAX);     // tylko grzanie
   } else {
     out=constrain(out,-(float)PWM_MAX,0.0f);    // tylko chlodzenie
   }
+
+  // ── OGRANICZENIE TEMPA ZMIANY PWM (slew rate) ────────
+  // PWM nie moze zmieniac sie gwaltownie - narasta i opada stopniowo.
+  // To naprawia DWA problemy naraz:
+  //  - START: PWM nie skacze od razu (koniec przeregulowania na poczatku)
+  //  - KONIEC: PWM nie spada gwaltownie do zera (koniec dziury 70->60)
+  // PWM_SLEW = max zmiana PWM na jedno wywolanie (co PID_DT_MS=100ms).
+  // 8/wywolanie = ~80 PWM/s = plynne narastanie i opadanie.
+  const float PWM_SLEW=8.0f;
+  static float lastOut=0;
+  if(out>lastOut+PWM_SLEW) out=lastOut+PWM_SLEW;
+  else if(out<lastOut-PWM_SLEW) out=lastOut-PWM_SLEW;
+  lastOut=out;
 
   return (int)out;
 }
@@ -550,7 +563,10 @@ void runCal(float temp){
         } else if(ae>2&&worse){
           Kp_h=constrain(Kp_h*(1+adj),KP_MIN,KP_MAX);
           Kd_h=constrain(Kd_h*(1+adj*0.3f),KD_MIN,KD_MAX);
-        } else if(ae>0.5f){
+        } else if(ae>0.5f && ae<2.0f){
+          // Ki zwiekszaj TYLKO przy malym stalym bledzie (offset przy celu),
+          // NIE podczas duzego bledu rampy - inaczej Ki rosnie w nieskonczonosc
+          // do maksimum (powodowalo Ki=3.0 wszedzie i oscylacje).
           Ki_h=constrain(Ki_h*(1+adj*0.5f),KI_MIN,KI_MAX);
         }
         Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;
@@ -566,7 +582,8 @@ void runCal(float temp){
         } else if(ae>2&&worse){
           Kp_c=constrain(Kp_c*(1+adj),KP_MIN,KP_MAX);
           Kd_c=constrain(Kd_c*(1+adj*0.3f),KD_MIN,KD_MAX);
-        } else if(ae>0.5f){
+        } else if(ae>0.5f && ae<2.0f){
+          // Ki tylko przy malym stalym bledzie (offset), nie na rampie
           Ki_c=constrain(Ki_c*(1+adj*0.5f),KI_MIN,KI_MAX);
         }
         Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;
@@ -760,9 +777,13 @@ void setup(){
   pinMode(PIN_BTN1,INPUT_PULLUP);pinMode(PIN_BTN2,INPUT_PULLUP);
   if(!tc.begin()) Serial.println("ERROR: MAX31856!");
   tc.setThermocoupleType(MAX31856_TCTYPE_K);
-  // Druga termopara (pomiar dodatkowy) - osobny CS, ta sama magistrala SPI
-  if(tc2.begin()){ tc2.setThermocoupleType(MAX31856_TCTYPE_K); tc2OK=true; }
-  else { Serial.println("WARN: MAX31856 #2 not found"); tc2OK=false; }
+  // Druga termopara (pomiar dodatkowy) - osobny CS, ta sama magistrala SPI.
+  // Zawsze inicjalizuj i zawsze probuj czytac - jesli modulu nie ma,
+  // odczyt bedzie NAN i aplikacja pokaze kreski (poprawnie).
+  tc2.begin();
+  tc2.setThermocoupleType(MAX31856_TCTYPE_K);
+  tc2OK=true;  // zawsze probuj czytac
+  Serial.println("TC2 init done");
   for(int i=0;i<P_TOT;i++) prof[i]={10,0.3f,0.8f,10,0.3f,0.3f,false};
   oled.begin();oled.clearBuffer();
   oled.setFont(u8g2_font_7x13B_tf);
@@ -1028,8 +1049,12 @@ void loop(){
     tP=now;float temp=rdT();
     // Odczyt drugiej termopary (pomiar dodatkowy, nie wplywa na regulacje)
     if(tc2OK){
-      uint8_t f2=tc2.readFault();
-      if(!f2){ float r2=tc2.readThermocoupleTemperature(); if(!isnan(r2)) temp2=r2; }
+      // Czytaj temperature niezaleznie od faultu - MAX31856 czesto zglasza
+      // drobne faulty (np. zakres) ale temperatura jest poprawna.
+      // Odrzucamy tylko ewidentnie zle odczyty (NAN, ekstremalne wartosci).
+      float r2=tc2.readThermocoupleTemperature();
+      if(!isnan(r2) && r2>-50 && r2<200) temp2=r2;
+      else temp2=NAN;
     }
     if(temp>tMax&&sys!=MAN){stpPel();sys=MAN;stOn=false;if(fanOn){fanRunonActive=true;fanRunonT=now;}Serial.println("!!! TEMP MAX - STOP !!!");}
     switch(sys){
