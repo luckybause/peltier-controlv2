@@ -662,9 +662,9 @@ class PeltierControl:
 
     def _show_cal_table_window(self, profiles):
         """Okno z tabela skalibrowanych PID (temp x rampa)"""
-        # Siatka jak w firmware
+        # Siatka jak w firmware (PR_N=8)
         PT = [20, 30, 40, 50, 60, 70, 80, 90, 100]
-        PR = [2, 5, 10, 20]
+        PR = [2, 5, 10, 20, 30, 40, 60, 80]
         win = tk.Toplevel(self.root)
         win.title("Calibration Table")
         win.configure(bg=C['bg'])
@@ -1059,10 +1059,10 @@ class PeltierControl:
         self.sl_sp = SliderField(inner, "TARGET", -15, 100, 25.0,
                                  C['orange'], "°C", 1,
                                  on_change=lambda v: self.send(f"SP:{v:.1f}"))
-        self.sl_ru = SliderField(inner, "HEAT RATE", 0.5, 40, 2.0,
+        self.sl_ru = SliderField(inner, "HEAT RATE", 0.5, 80, 2.0,
                                  C['yellow'], "°C/min", 1,
                                  on_change=lambda v: self.send(f"RU:{v:.1f}"))
-        self.sl_rd = SliderField(inner, "COOL RATE", 0.5, 40, 2.0,
+        self.sl_rd = SliderField(inner, "COOL RATE", 0.5, 80, 2.0,
                                  C['cyan'], "°C/min", 1,
                                  on_change=lambda v: self.send(f"RD:{v:.1f}"))
         self.sl_tmax = SliderField(inner, "MAX TEMP", 50, 115, 80,
@@ -2611,8 +2611,8 @@ class CalRangeDialog:
         tk.Label(inner, text="TEMP STEP: 10°C (fixed)", bg=C['bg'], fg=C['dim2'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 12))
 
-        # MAX RATE - suwak
-        self.sl_maxrate = SliderField(inner, "MAX RATE", 5, 40, 20,
+        # MAX RATE - suwak (do 80)
+        self.sl_maxrate = SliderField(inner, "MAX RATE", 5, 80, 40,
                                       C['yellow'], "°C/min", 0,
                                       on_change=lambda v: self._update_estimate())
 
@@ -2632,7 +2632,7 @@ class CalRangeDialog:
                          activebackground=C['panel3'])
             b.pack(side='left', padx=4, fill='x', expand=True)
             self.step_btns[st] = b
-        self._set_step(5)  # zaznacz domyslny
+        self._set_step(10)  # zaznacz domyslny krok 10 (przy max 80 = 8 ramp)
 
         # Podglad generowanej listy ramp
         self.ramps_preview = tk.Label(inner, text="", bg=C['bg'], fg=C['cyan'],
@@ -2672,7 +2672,7 @@ class CalRangeDialog:
         step = self.rate_step
         ramps = []
         r = step
-        while r <= maxr + 0.01 and len(ramps) < 10:
+        while r <= maxr + 0.01 and len(ramps) < 20:
             ramps.append(int(round(r)))
             r += step
         if not ramps:  # gdy max < krok, uzyj samego max
