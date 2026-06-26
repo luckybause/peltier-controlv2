@@ -541,23 +541,32 @@ class PeltierControl:
             print(f"apply_cfg err: {e}")
 
     def _parse_calplan(self, txt):
-        """CALPLAN:24,temps=50/60/70,ramps=2/5/10/20 - buduj liste krokow"""
+        """CALPLAN:9,temps=20/30/.../90,ramps=relay - buduj liste krokow.
+        Relay: jeden test na temperature (ramps=relay), nie siatka temp×rampa."""
         try:
             d = {}
-            # pierwsza czesc to total
             parts = txt.split(',')
             total = int(parts[0])
-            temps, ramps = [], []
+            temps, ramps, relay_mode = [], [], False
             for part in parts[1:]:
                 if part.startswith('temps='):
                     temps = [float(x) for x in part[6:].split('/') if x]
                 elif part.startswith('ramps='):
-                    ramps = [float(x) for x in part[6:].split('/') if x]
-            # Buduj plan: dla kazdej temp, wszystkie rampy (kolejnosc jak firmware)
+                    rv = part[6:]
+                    if rv.strip() == 'relay':
+                        relay_mode = True
+                    else:
+                        ramps = [float(x) for x in rv.split('/') if x]
+            # Buduj plan
             plan = []
-            for t in temps:
-                for r in ramps:
-                    plan.append((t, r))
+            if relay_mode:
+                # Relay: jeden krok na temperature
+                for t in temps:
+                    plan.append((t, 'relay'))
+            else:
+                for t in temps:
+                    for r in ramps:
+                        plan.append((t, r))
             self.cal_plan = plan
             self.cal_total = total or len(plan)
             self.cal_current = 0
@@ -581,7 +590,12 @@ class PeltierControl:
                 if part.startswith('T='):
                     self.cal_cur_temp = float(part[2:])
                 elif part.startswith('R='):
-                    self.cal_cur_ramp = float(part[2:])
+                    rv = part[2:]
+                    if rv.strip() == 'relay':
+                        self.cal_cur_ramp = 'relay'
+                    else:
+                        try: self.cal_cur_ramp = float(rv)
+                        except: self.cal_cur_ramp = rv
             # Jesli zmienil sie krok - zapisz czas (do ETA)
             if new_current != self.cal_current:
                 if self.cal_t0:
@@ -1153,7 +1167,7 @@ class PeltierControl:
                                  on_change=lambda v: self.send(f"KP:{v:.1f}"))
         self.sl_ki = SliderField(sec1, "Ki", 0, 1.5, 0.3, C['cyan'], "", 2,
                                  on_change=lambda v: self.send(f"KI:{v:.2f}"))
-        self.sl_kd = SliderField(sec1, "Kd", 0, 3, 0.8, C['cyan'], "", 2,
+        self.sl_kd = SliderField(sec1, "Kd", 0, 80, 0.8, C['cyan'], "", 2,
                                  on_change=lambda v: self.send(f"KD:{v:.2f}"))
 
         # ── AUTO-CALIBRATION ──
@@ -2798,12 +2812,18 @@ class CalibrationWindow:
 
         # Teraz
         if app.cal_cur_temp is not None and app.cal_cur_ramp is not None:
-            self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C @ {app.cal_cur_ramp:.0f}°C/min")
+            if app.cal_cur_ramp == 'relay':
+                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C · relay test")
+            else:
+                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C @ {app.cal_cur_ramp:.0f}°C/min")
         # Nastepny
         if cur < len(app.cal_plan):
             nt, nr = app.cal_plan[cur] if cur < len(app.cal_plan) else (None, None)
             if nt is not None:
-                self.lbl_next.config(text=f"{nt:.0f}°C @ {nr:.0f}°C/min")
+                if nr == 'relay':
+                    self.lbl_next.config(text=f"{nt:.0f}°C · relay test")
+                else:
+                    self.lbl_next.config(text=f"{nt:.0f}°C @ {nr:.0f}°C/min")
         else:
             self.lbl_next.config(text="(last step)")
         # ETA
