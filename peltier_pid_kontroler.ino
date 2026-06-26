@@ -194,14 +194,14 @@ String cSt="";
 // Standard przemyslowy. Zamiast zgadywac nastawy, MIERZY charakterystyke
 // ukladu (ultimate gain Ku, ultimate period Tu) wymuszajac kontrolowana
 // oscylacje przekaznikiem, potem LICZY Kp/Ki/Kd ze wzorow.
-#define RELAY_AMP    100      // amplituda przekaznika [PWM] (~40% mocy)
-#define RELAY_HYST   0.5f     // histereza [C] - martwa strefa wokol setpointu
+#define RELAY_AMP    60       // amplituda przekaznika [PWM] (~24% mocy - lagodne pobudzenie)
+#define RELAY_HYST   0.3f     // histereza [C] - martwa strefa wokol setpointu
 #define RELAY_CYCLES 6        // ile cykli oscylacji zmierzyc
 #define RELAY_MAX_MS 180000   // max czas relay testu (3min) - zabezpieczenie
 float relayPeakHi=-999,relayPeakLo=999;  // szczyty oscylacji w biezacym cyklu
-float relayAmpSum=0;          // suma amplitud (do sredniej)
+float relayAmps[RELAY_CYCLES]={};        // amplitudy kolejnych cykli
+float relayPers[RELAY_CYCLES]={};        // okresy kolejnych cykli
 unsigned long relayTcross=0;  // czas ostatniego przejscia przez setpoint
-float relayPerSum=0;          // suma okresow (do sredniej)
 int relayCycN=0;              // licznik zmierzonych cykli
 bool relayState=false;        // stan przekaznika (true=grzanie)
 bool relayWasAbove=false;     // czy temp byla powyzej setpointu
@@ -508,24 +508,41 @@ void runCal(float temp){
     setPwr(compPID(temp));
     char b[32];sprintf(b,"->%.0fC T=%.1f",cTP[cTi],temp);
     cSt=String(b);
+    // Status dla aplikacji co 500ms (zeby okno postepu nie milczalo)
+    if(now-cLI>=500){
+      cLI=now;
+      int tot=cTN,done=cTi+1;
+      Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
+      Serial.print(tot);Serial.print(",T=");Serial.print(cTP[cTi],0);
+      Serial.println(",R=heating");
+    }
     if(ae<2.0f||el>CA){
       cPh=1;cPT=now;cSt="Stabilizing...";
-      ig=0;pe=0;
+      ig=0;pe=0;cLI=now;
     }
   }
   else if(cPh==1){
     // Stabilizacja na temperaturze bazowej
     setPwr(compPID(temp));
     cSt="Stabil "+String((CS-el)/1000)+"s";
+    if(now-cLI>=500){
+      cLI=now;
+      int tot=cTN,done=cTi+1;
+      Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
+      Serial.print(tot);Serial.print(",T=");Serial.print(cTP[cTi],0);
+      Serial.println(",R=stabil");
+    }
     if(el>CS){
       // Przejdz do RELAY testu - inicjalizuj pomiar oscylacji
       cPh=2;cPT=now;
       spT=cTP[cTi];spA=cTP[cTi];  // setpoint = temperatura bazowa (staly)
       relayPeakHi=-999;relayPeakLo=999;
-      relayAmpSum=0;relayPerSum=0;relayCycN=0;
+      for(int i=0;i<RELAY_CYCLES;i++){relayAmps[i]=relayPers[i]=0;}
+      relayCycN=0;
       relayTcross=now;
       relayWasAbove=(temp>spT);
       relayState=(temp<spT);
+      cLI=now;  // dla throttlingu logow
       ig=0;pe=0;
       cSt="Relay test...";
     }
@@ -548,10 +565,13 @@ void runCal(float temp){
     bool nowAbove=(temp>sp);
     if(nowAbove && !relayWasAbove){
       unsigned long per=now-relayTcross;
-      if(relayCycN>0 && per>500){  // pomijaj 1. cykl (rozruch) i za krotkie
+      if(relayCycN>0 && per>500){
+        // Zapisz amplitude i okres TEGO cyklu do tablic (bierzemy pozniej
+        // tylko OSTATNIE ustalone cykle, bo pierwsze moga narastac).
         float amp=(relayPeakHi-relayPeakLo)/2.0f;
-        relayAmpSum+=amp;
-        relayPerSum+=(float)per;
+        int slot=(relayCycN-1)%RELAY_CYCLES;
+        relayAmps[slot]=amp;
+        relayPers[slot]=(float)per;
       }
       relayTcross=now;
       relayPeakHi=-999;relayPeakLo=999;
@@ -562,29 +582,40 @@ void runCal(float temp){
     char b[32];sprintf(b,"Relay %d/%d cykli",relayCycN,RELAY_CYCLES);
     cSt=String(b);
 
-    int tot=cTN,done=cTi+1;
-    Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
-    Serial.print(tot);Serial.print(",T=");Serial.print(sp,0);
-    Serial.println(",R=relay");
-    Serial.print(now/1000.0f,1);Serial.print(",");Serial.print(temp,2);Serial.print(",");
-    Serial.print(sp,2);Serial.print(",");Serial.print(sp,2);Serial.print(",");
-    Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
-    Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);
-    Serial.print(",CAL-");Serial.println(done);
+    // Log + status TYLKO co 500ms (nie zalewaj portu - inaczej aplikacja
+    // gubi komunikaty CALPLAN/CALSTAT i okno postepu jest puste).
+    if(now-cLI>=500){
+      cLI=now;
+      int tot=cTN,done=cTi+1;
+      Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
+      Serial.print(tot);Serial.print(",T=");Serial.print(sp,0);
+      Serial.println(",R=relay");
+      Serial.print(now/1000.0f,1);Serial.print(",");Serial.print(temp,2);Serial.print(",");
+      Serial.print(sp,2);Serial.print(",");Serial.print(sp,2);Serial.print(",");
+      Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
+      Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);
+      Serial.print(",CAL-");Serial.println(done);
+    }
 
-    if(relayCycN>=RELAY_CYCLES+1 || el>RELAY_MAX_MS){
+    if(relayCycN>=RELAY_CYCLES+2 || el>RELAY_MAX_MS){
       cPh=3;cPT=now;
     }
   }
   else if(cPh==3){
     // ── OBLICZ Kp/Ki/Kd z pomiaru (Tyreus-Luyben) ──
     setPwr(0);
-    int nCyc=relayCycN-1;  // pierwszy cykl byl rozruchem
-    if(nCyc>=1 && relayAmpSum>0.01f && relayPerSum>0){
-      float aAvg=relayAmpSum/nCyc;            // srednia amplituda [C]
-      float Tu=(relayPerSum/nCyc)/1000.0f;    // sredni okres [s]
-      float Ku=(4.0f*RELAY_AMP)/(3.14159f*aAvg);  // ultimate gain
-      // Tyreus-Luyben (lagodne, malo oscylacji):
+    // Wez OSTATNIE cykle (ustalone), policz srednia z tablic.
+    // Pierwsze cykle moga narastac - ostatnie sa miarodajne.
+    int valid=0; float ampSum=0, perSum=0;
+    for(int i=0;i<RELAY_CYCLES;i++){
+      if(relayAmps[i]>0.01f && relayPers[i]>0){
+        ampSum+=relayAmps[i]; perSum+=relayPers[i]; valid++;
+      }
+    }
+    if(valid>=2 && ampSum>0.01f){
+      float aAvg=ampSum/valid;             // srednia amplituda [C]
+      float Tu=(perSum/valid)/1000.0f;     // sredni okres [s]
+      float Ku=(4.0f*RELAY_AMP)/(3.14159f*aAvg);
       float Kp_new=Ku/2.2f;
       float Ti=2.2f*Tu;
       float Td=Tu/6.3f;
@@ -596,7 +627,8 @@ void runCal(float temp){
       cKpH=Kp_new;cKiH=Ki_new;cKdH=Kd_new;
       cKpC=Kp_new;cKiC=Ki_new;cKdC=Kd_new;
       Serial.print("RELAY T=");Serial.print(cTP[cTi],0);
-      Serial.print(" Ku=");Serial.print(Ku,1);Serial.print(" Tu=");Serial.print(Tu,1);
+      Serial.print(" a=");Serial.print(aAvg,1);Serial.print(" Tu=");Serial.print(Tu,1);
+      Serial.print(" Ku=");Serial.print(Ku,1);
       Serial.print(" Kp=");Serial.print(Kp_new,2);Serial.print(" Ki=");Serial.print(Ki_new,3);
       Serial.print(" Kd=");Serial.println(Kd_new,2);
     } else {
@@ -604,7 +636,9 @@ void runCal(float temp){
       cKpC=KP_BASE;cKiC=KI_BASE;cKdC=KD_BASE_C;
       Serial.println("RELAY FAIL - bazowe");
     }
-    nxtCS();  // zapisuje profil dla wszystkich ramp tej temperatury
+    // wyczysc tablice na nastepna temperature
+    for(int i=0;i<RELAY_CYCLES;i++){relayAmps[i]=relayPers[i]=0;}
+    nxtCS();
   }
 }
 
