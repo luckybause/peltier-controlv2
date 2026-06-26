@@ -2812,10 +2812,17 @@ class CalibrationWindow:
 
         # Teraz
         if app.cal_cur_temp is not None and app.cal_cur_ramp is not None:
-            if app.cal_cur_ramp == 'relay':
-                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C · relay test")
+            r = app.cal_cur_ramp
+            if r == 'relay':
+                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C · relay test (pomiar)")
+            elif r == 'heating':
+                self.lbl_now.config(text=f"→ grzanie do {app.cal_cur_temp:.0f}°C")
+            elif r == 'stabil':
+                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C · stabilizacja")
+            elif isinstance(r, (int, float)):
+                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C @ {r:.0f}°C/min")
             else:
-                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C @ {app.cal_cur_ramp:.0f}°C/min")
+                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C · {r}")
         # Nastepny
         if cur < len(app.cal_plan):
             nt, nr = app.cal_plan[cur] if cur < len(app.cal_plan) else (None, None)
