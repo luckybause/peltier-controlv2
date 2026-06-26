@@ -49,7 +49,14 @@
 #define KI_MIN       0.0f
 #define KI_MAX       1.5f
 #define KD_MIN       0.0f
-#define KD_MAX       3.0f
+#define KD_MAX      80.0f
+// Bazowe wartosci PID - od nich startuje strojenie KAZDEGO punktu kalibracji.
+// KLUCZOWE: bez resetu do bazy kolejne punkty dziedziczyly napompowane Ki
+// z poprzednich -> Ki tylko roslo, ladowalo na maksimum wszedzie.
+#define KP_BASE      10.0f
+#define KI_BASE      0.3f
+#define KD_BASE_H    0.8f
+#define KD_BASE_C    0.3f
 #define RAMP_MIN     0.5f
 #define RAMP_MAX    80.0f
 #define TMAX_MIN    50.0f
@@ -182,6 +189,22 @@ String cSt="";
 #define CS 15000   // stabilizacja (15s)
 #define CT 60000   // strojenie (60s = 30 iteracji)
 #define CI  2000   // co 2s analizuj
+
+// ── RELAY FEEDBACK AUTOTUNING (Astrom-Hagglund + Tyreus-Luyben) ──
+// Standard przemyslowy. Zamiast zgadywac nastawy, MIERZY charakterystyke
+// ukladu (ultimate gain Ku, ultimate period Tu) wymuszajac kontrolowana
+// oscylacje przekaznikiem, potem LICZY Kp/Ki/Kd ze wzorow.
+#define RELAY_AMP    100      // amplituda przekaznika [PWM] (~40% mocy)
+#define RELAY_HYST   0.5f     // histereza [C] - martwa strefa wokol setpointu
+#define RELAY_CYCLES 6        // ile cykli oscylacji zmierzyc
+#define RELAY_MAX_MS 180000   // max czas relay testu (3min) - zabezpieczenie
+float relayPeakHi=-999,relayPeakLo=999;  // szczyty oscylacji w biezacym cyklu
+float relayAmpSum=0;          // suma amplitud (do sredniej)
+unsigned long relayTcross=0;  // czas ostatniego przejscia przez setpoint
+float relayPerSum=0;          // suma okresow (do sredniej)
+int relayCycN=0;              // licznik zmierzonych cykli
+bool relayState=false;        // stan przekaznika (true=grzanie)
+bool relayWasAbove=false;     // czy temp byla powyzej setpointu
 
 unsigned long tP=0,tD=0,tR=0;
 unsigned long rampT0=0;   // czas startu rampy (do soft startu feed-forward)
@@ -430,170 +453,158 @@ void bldCP(){cTN=0;float t=cTmn;while(t<=cTmx+0.1f&&cTN<CPM){cTP[cTN++]=t;t+=10;
 void stCalS(){sys=CAL;cPh=-1;cSt="Ustaw zakres";}
 void stCalR(){
   bldCP();cTi=cRi=cPh=cIt=0;cPT=millis();cBH=cBC=999;
+  // Start od wartosci bazowych
+  Kp_h=KP_BASE;Ki_h=KI_BASE;Kd_h=KD_BASE_H;Kp_c=KP_BASE;Ki_c=KI_BASE;Kd_c=KD_BASE_C;
   cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;
   for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;cLI=0;ig=0;pe=0;
-  spT=cTP[0];spA=lT;rU=rD=calRamps[cRi];int tot=cTN*calRampN;char b[24];sprintf(b,"Start 1/%d",tot);cSt=String(b);
-  Serial.println("=== KAL. START ===");
-  // Wyslij plan kalibracji dla aplikacji: CALPLAN:tot,temps=...,ramps=...
+  spT=cTP[0];spA=lT;rU=rD=RAMP_MAX;
+  int tot=cTN;  // relay: tylko temperatury (nie temp*rampa)
+  char b[24];sprintf(b,"Start 1/%d",tot);cSt=String(b);
+  Serial.println("=== KAL. RELAY START ===");
+  // Plan: CALPLAN ma temps; ramps=relay (jeden test na temperature)
   Serial.print("CALPLAN:");Serial.print(tot);
   Serial.print(",temps=");
   for(int i=0;i<cTN;i++){Serial.print(cTP[i],0);if(i<cTN-1)Serial.print("/");}
-  Serial.print(",ramps=");
-  for(int i=0;i<calRampN;i++){Serial.print(calRamps[i],0);if(i<calRampN-1)Serial.print("/");}
+  Serial.print(",ramps=relay");
   Serial.println();
 }
-void savCP(){int ti=nTi(cTP[cTi]),idx=pi_(ti,nRi(calRamps[cRi]));prof[idx]={cKpH,cKiH,cKdH,cKpC,cKiC,cKdC,true};
-  Serial.print("Prof T=");Serial.print(cTP[cTi],0);Serial.print(" R=");Serial.print(calRamps[cRi],0);Serial.print(" Kph=");Serial.println(cKpH,1);}
+void savCP(){
+  // Relay: profil zalezy tylko od TEMPERATURY (nie od rampy).
+  // Wypelnij WSZYSTKIE rampy tej temperatury tym samym profilem.
+  int ti=nTi(cTP[cTi]);
+  for(int ri=0;ri<PR_N;ri++){
+    int idx=pi_(ti,ri);
+    prof[idx]={cKpH,cKiH,cKdH,cKpC,cKiC,cKdC,true};
+  }
+  Serial.print("Prof T=");Serial.print(cTP[cTi],0);Serial.print(" (wszystkie rampy) Kp=");Serial.println(cKpH,1);
+}
 void nxtCS(){
-  savCP();cRi++;if(cRi>=calRampN){cRi=0;cTi++;}
-  int tot=cTN*calRampN,done=cTi*calRampN+cRi;
+  savCP();cTi++;  // relay: idziemy tylko po temperaturach
+  int tot=cTN,done=cTi;
   if(cTi>=cTN){calDone=true;savF();sys=MAN;stpPel();char b[24];sprintf(b,"DONE %d/%d",tot,tot);cSt=String(b);Serial.println("=== KAL. ZAKONCZONA ===");return;}
-  cPh=0;cPT=millis();cIt=0;cBH=cBC=999;cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;
-  for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;cLI=0;
-  spT=cTP[cTi];rU=rD=calRamps[cRi];spA=lT;ig=0;pe=0;
-  char b[24];sprintf(b,"Krok %d/%d",done+1,tot);cSt=String(b);
+  cPh=0;cPT=millis();
+  Kp_h=KP_BASE;Ki_h=KI_BASE;Kd_h=KD_BASE_H;Kp_c=KP_BASE;Ki_c=KI_BASE;Kd_c=KD_BASE_C;
+  spT=cTP[cTi];rU=rD=RAMP_MAX;spA=lT;ig=0;pe=0;
+  char b[24];sprintf(b,"Temp %d/%d",done+1,tot);cSt=String(b);
 }
 // ── KALIBRACJA ────────────────────────────────────────────
 // Dla kazdego punktu (temp,rampa):
 //   Faza 0: dochodzenie do temp bazowej z pelna moca (60s)
 //   Faza 1: stabilizacja na temp bazowej (15s)
-//   Faza 2: strojenie rampy w gore o 10C, potem w dol o 10C (60s)
-//           Co 2s analizuje blad i koryguje Kp/Ki/Kd
-//           Zapamietuje najlepsze parametry
-//   Po fazie 2: przywraca najlepsze i przechodzi do kolejnego punktu
+//   RELAY FEEDBACK AUTOTUNING (standard przemyslowy Astrom-Hagglund)
+//   Faza 0: dojscie do temperatury bazowej (pelna predkosc)
+//   Faza 1: stabilizacja
+//   Faza 2: RELAY - wymus oscylacje przekaznikiem, zmierz Ku i Tu
+//   Faza 3: oblicz Kp/Ki/Kd (Tyreus-Luyben), zapisz, nastepny punkt
 void runCal(float temp){
   if(sys!=CAL||cPh==-1) return;
   unsigned long now=millis(),el=now-cPT;
   float err=spA-temp,ae=abs(err);
 
   if(cPh==0){
-    // Dochodzenie do temperatury bazowej
+    // Dochodzenie do temperatury bazowej - PELNA predkosc (szybki dojazd)
+    rU=rD=RAMP_MAX;
     if(now-tR>=DT_R){tR=now;updRamp();}
     setPwr(compPID(temp));
     char b[32];sprintf(b,"->%.0fC T=%.1f",cTP[cTi],temp);
     cSt=String(b);
-    // Przejdz do stabilizacji gdy bliska celu lub timeout
     if(ae<2.0f||el>CA){
       cPh=1;cPT=now;cSt="Stabilizing...";
       ig=0;pe=0;
     }
   }
   else if(cPh==1){
-    // Stabilizacja – trzymaj temperature bazowa
+    // Stabilizacja na temperaturze bazowej
     setPwr(compPID(temp));
     cSt="Stabil "+String((CS-el)/1000)+"s";
     if(el>CS){
-      // Przejdz do strojenia – ustaw rampe w gore o 10C
-      cPh=2;cPT=now;cIt=0;cLI=0;
-      cBH=cBC=999;
-      cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;
-      cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;
-      for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;
+      // Przejdz do RELAY testu - inicjalizuj pomiar oscylacji
+      cPh=2;cPT=now;
+      spT=cTP[cTi];spA=cTP[cTi];  // setpoint = temperatura bazowa (staly)
+      relayPeakHi=-999;relayPeakLo=999;
+      relayAmpSum=0;relayPerSum=0;relayCycN=0;
+      relayTcross=now;
+      relayWasAbove=(temp>spT);
+      relayState=(temp<spT);
       ig=0;pe=0;
-      rU=rD=calRamps[cRi];
-      // Cel: +10C w gore (lub -10C jesli za blisko tMax)
-      if(cTP[cTi]+10<=tMax-5) spT=cTP[cTi]+10;
-      else spT=cTP[cTi]-10;
-      cSt="Tuning...";
+      cSt="Relay test...";
     }
   }
   else if(cPh==2){
-    // Strojenie – pracuje z aktywna rampa
-    if(now-tR>=DT_R){tR=now;updRamp();}
-    setPwr(compPID(temp));
+    // ── RELAY FEEDBACK: wymus oscylacje, mierz Ku i Tu ──
+    // Przekaznik z histereza: ponizej setpointu -> grzanie, powyzej -> chlodzenie.
+    float sp=cTP[cTi];
+    bool above=(temp > sp+RELAY_HYST);
+    bool below=(temp < sp-RELAY_HYST);
+    if(below) relayState=true;
+    else if(above) relayState=false;
+    setPwr(relayState ? RELAY_AMP : -RELAY_AMP);
 
-    if(now-cLI>=CI){
-      cLI=now;cIt++;
-      // Zapisz do historii
-      cEH[cHI]=err;cPwH[cHI]=(float)lPwm;cHI=(cHI+1)%CH;
+    // Sledz szczyty w biezacym cyklu
+    if(temp>relayPeakHi) relayPeakHi=temp;
+    if(temp<relayPeakLo) relayPeakLo=temp;
 
-      // Analiza oscylacji (3+ zmiany znaku w historii)
-      int sc=0;
-      for(int i=0;i<CH-1;i++){
-        int a=i,b_=(i+1)%CH;
-        if(cEH[a]*cEH[b_]<0) sc++;
+    // Przejscie przez setpoint z dolu do gory = koniec cyklu
+    bool nowAbove=(temp>sp);
+    if(nowAbove && !relayWasAbove){
+      unsigned long per=now-relayTcross;
+      if(relayCycN>0 && per>500){  // pomijaj 1. cykl (rozruch) i za krotkie
+        float amp=(relayPeakHi-relayPeakLo)/2.0f;
+        relayAmpSum+=amp;
+        relayPerSum+=(float)per;
       }
-      bool osc=(sc>=2);  // czulsze wykrywanie fal (bylo 3 - przepuszczalo delikatne fale)
-
-      // Czy kalibracja jest przy celu rampy (setpoint dobil do celu)
-      bool atTcal=(fabs(spA-spT)<1.0f);
-
-      // ── PROSTA, JASNA ZASADA STROJENIA ──────────────────
-      // Priorytet: gladka linia. Lekkie opoznienie (temp za setpointem) OK.
-      // PWM jest juz filtrowany w compPID, wiec kalibracja nie walczy ze
-      // skokami mocy - skupia sie na trzech przypadkach:
-      //   1. OSCYLUJE -> tlum: Kd w gore, Ki+Kp w dol
-      //   2. ZOSTAJE W TYLE (duzy staly blad) -> wzmocnij Kp
-      //   3. MALY STALY BLAD przy celu -> dodaj troche Ki (kasuje offset)
-      // Metryka wyboru profilu: blad + mocna kara za oscylacje (gladkosc!).
-      float quality = ae + sc*1.0f;
-      float adj=0.04f;
-
-      if(htg){
-        if(osc){
-          // Oscyluje - TLUM (to klucz do gladkiej linii)
-          Kd_h=constrain(Kd_h*(1+adj*1.5f),KD_MIN,KD_MAX);
-          Ki_h=constrain(Ki_h*(1-adj),KI_MIN,KI_MAX);
-          Kp_h=constrain(Kp_h*(1-adj),KP_MIN,KP_MAX);
-          ig*=0.5f;
-        } else if(ae>3.0f){
-          // Zostaje w tyle - wzmocnij Kp (dogon setpoint)
-          Kp_h=constrain(Kp_h*(1+adj),KP_MIN,KP_MAX);
-        } else if(ae>0.5f && ae<3.0f && atTcal){
-          // Maly staly blad przy celu - troche Ki (kasuje offset)
-          Ki_h=constrain(Ki_h*(1+adj*0.5f),KI_MIN,KI_MAX);
-        }
-        Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;
-        if(quality<cBH){cBH=quality;cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;}
-      } else {
-        if(osc){
-          Kd_c=constrain(Kd_c*(1+adj*1.5f),KD_MIN,KD_MAX);
-          Ki_c=constrain(Ki_c*(1-adj),KI_MIN,KI_MAX);
-          Kp_c=constrain(Kp_c*(1-adj),KP_MIN,KP_MAX);
-          ig*=0.5f;
-        } else if(ae>3.0f){
-          Kp_c=constrain(Kp_c*(1+adj),KP_MIN,KP_MAX);
-        } else if(ae>0.5f && ae<3.0f && atTcal){
-          Ki_c=constrain(Ki_c*(1+adj*0.5f),KI_MIN,KI_MAX);
-        }
-        Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;
-        if(quality<cBC){cBC=quality;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;}
-      }
-
-      int tot=cTN*calRampN,done=cTi*calRampN+cRi+1;
-      char b[32];
-      sprintf(b,"%d/%d i%d e%.1f",done,tot,cIt,err);
-      cSt=String(b);
-      // Status kalibracji dla aplikacji PC
-      Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
-      Serial.print(tot);Serial.print(",T=");Serial.print(cTP[cTi],0);
-      Serial.print(",R=");Serial.println(calRamps[cRi],0);
-
-      // Log CSV
-      Serial.print(now/1000.0f,1);Serial.print(",");
-      Serial.print(temp,2);Serial.print(",");
-      Serial.print(spA,2);Serial.print(",");
-      Serial.print(spT,2);Serial.print(",");
-      Serial.print(lPwm);Serial.print(",");
-      Serial.print(Kp,3);Serial.print(",");
-      Serial.print(Ki,4);Serial.print(",");
-      Serial.print(Kd,3);
-      Serial.print(",CAL-");Serial.println(done);
+      relayTcross=now;
+      relayPeakHi=-999;relayPeakLo=999;
+      relayCycN++;
     }
+    relayWasAbove=nowAbove;
 
-    // Koniec fazy strojenia – zapisz najlepsze i nastepny krok.
-    // Czas strojenia skalowany z predkoscia rampy: wolne rampy potrzebuja
-    // wiecej czasu (rampa +10C trwa dluzej). Min CT, ale dla wolnych ramp
-    // wydluzamy tak, by rampa +10C zdazyla sie zakonczyc + zapas na strojenie.
-    float rampTime = 10.0f/calRamps[cRi]*60.0f*1000.0f;  // czas rampy +10C [ms]
-    unsigned long tuneTime = (unsigned long)(rampTime + CT);  // rampa + zapas strojenia
-    if(tuneTime < CT) tuneTime = CT;
-    if(tuneTime > 180000) tuneTime = 180000;  // max 3min na punkt (ograniczenie)
-    if(el>tuneTime){
-      Kp_h=cKpH;Ki_h=cKiH;Kd_h=cKdH;
-      Kp_c=cKpC;Ki_c=cKiC;Kd_c=cKdC;
-      nxtCS();
+    char b[32];sprintf(b,"Relay %d/%d cykli",relayCycN,RELAY_CYCLES);
+    cSt=String(b);
+
+    int tot=cTN,done=cTi+1;
+    Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
+    Serial.print(tot);Serial.print(",T=");Serial.print(sp,0);
+    Serial.println(",R=relay");
+    Serial.print(now/1000.0f,1);Serial.print(",");Serial.print(temp,2);Serial.print(",");
+    Serial.print(sp,2);Serial.print(",");Serial.print(sp,2);Serial.print(",");
+    Serial.print(lPwm);Serial.print(",");Serial.print(Kp,3);Serial.print(",");
+    Serial.print(Ki,4);Serial.print(",");Serial.print(Kd,3);
+    Serial.print(",CAL-");Serial.println(done);
+
+    if(relayCycN>=RELAY_CYCLES+1 || el>RELAY_MAX_MS){
+      cPh=3;cPT=now;
     }
+  }
+  else if(cPh==3){
+    // ── OBLICZ Kp/Ki/Kd z pomiaru (Tyreus-Luyben) ──
+    setPwr(0);
+    int nCyc=relayCycN-1;  // pierwszy cykl byl rozruchem
+    if(nCyc>=1 && relayAmpSum>0.01f && relayPerSum>0){
+      float aAvg=relayAmpSum/nCyc;            // srednia amplituda [C]
+      float Tu=(relayPerSum/nCyc)/1000.0f;    // sredni okres [s]
+      float Ku=(4.0f*RELAY_AMP)/(3.14159f*aAvg);  // ultimate gain
+      // Tyreus-Luyben (lagodne, malo oscylacji):
+      float Kp_new=Ku/2.2f;
+      float Ti=2.2f*Tu;
+      float Td=Tu/6.3f;
+      float Ki_new=Kp_new/Ti;
+      float Kd_new=Kp_new*Td;
+      Kp_new=constrain(Kp_new,KP_MIN,KP_MAX);
+      Ki_new=constrain(Ki_new,KI_MIN,KI_MAX);
+      Kd_new=constrain(Kd_new,KD_MIN,KD_MAX);
+      cKpH=Kp_new;cKiH=Ki_new;cKdH=Kd_new;
+      cKpC=Kp_new;cKiC=Ki_new;cKdC=Kd_new;
+      Serial.print("RELAY T=");Serial.print(cTP[cTi],0);
+      Serial.print(" Ku=");Serial.print(Ku,1);Serial.print(" Tu=");Serial.print(Tu,1);
+      Serial.print(" Kp=");Serial.print(Kp_new,2);Serial.print(" Ki=");Serial.print(Ki_new,3);
+      Serial.print(" Kd=");Serial.println(Kd_new,2);
+    } else {
+      cKpH=KP_BASE;cKiH=KI_BASE;cKdH=KD_BASE_H;
+      cKpC=KP_BASE;cKiC=KI_BASE;cKdC=KD_BASE_C;
+      Serial.println("RELAY FAIL - bazowe");
+    }
+    nxtCS();  // zapisuje profil dla wszystkich ramp tej temperatury
   }
 }
 
