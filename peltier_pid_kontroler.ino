@@ -114,6 +114,8 @@ float Kp=10,Ki=0.3f,Kd=0.8f;
 float rU=2,rD=2,tMax=TEMP_MAX_DEF;
 bool  htg=true;
 bool  wasAtT=false;   // poprzedni stan "przy celu" (do przyciecia integratora)
+float dFilt=0;        // filtrowana pochodna (tlumi szum termopary)
+float pwmFilt=0;      // filtrowane wyjscie PWM (wygladza skoki mocy)
 
 float ig=0,pe=0,lT=25;
 int   lPwm=0;
@@ -167,7 +169,7 @@ unsigned long rtTm=0;String rtSt="";
 // Kalibracja
 int cTi=0,cRi=0,cPh=0,cIt=0;
 unsigned long cPT=0;
-float cTmn=50,cTmx=100;
+float cTmn=20,cTmx=90;
 #define CPM 10
 float cTP[CPM];int cTN=0;
 float cBH=999,cBC=999;
@@ -212,15 +214,19 @@ void ldProf(float temp,float ramp){
   if(ramp<PR[0]){ri0=ri1=0;}if(ramp>PR[PR_N-1]){ri0=ri1=PR_N-1;}
   float wt=(ti1!=ti0)?(temp-PT[ti0])/(PT[ti1]-PT[ti0]):0.5f;
   float wr=(ri1!=ri0)?(ramp-PR[ri0])/(PR[ri1]-PR[ri0]):0.5f;
-  float kph=0,kih=0,kdh=0,kpc=0,kic=0,kdc=0;int cnt=0;
+  float kph=0,kih=0,kdh=0,kpc=0,kic=0,kdc=0;float wsum=0;int cnt=0;
   auto add=[&](int ti,int ri,float w){
     Prof&p=prof[pi_(ti,ri)];
     if(p.valid){kph+=p.Kp_h*w;kih+=p.Ki_h*w;kdh+=p.Kd_h*w;
-                kpc+=p.Kp_c*w;kic+=p.Ki_c*w;kdc+=p.Kd_c*w;cnt++;}
+                kpc+=p.Kp_c*w;kic+=p.Ki_c*w;kdc+=p.Kd_c*w;wsum+=w;cnt++;}
   };
   add(ti0,ri0,(1-wt)*(1-wr));add(ti0,ri1,(1-wt)*wr);
   add(ti1,ri0,wt*(1-wr));add(ti1,ri1,wt*wr);
-  if(cnt>0){
+  if(cnt>0 && wsum>0.001f){
+    // KLUCZOWE: przeskaluj przez sume wag waznych punktow.
+    // Gdy czesc punktow niewykalibrowana, ich wagi przepadly - bez
+    // tego przeskalowania wynik bylby zanizony (za slabe sterowanie).
+    kph/=wsum;kih/=wsum;kdh/=wsum;kpc/=wsum;kic/=wsum;kdc/=wsum;
     Kp_h=constrain(kph,KP_MIN,KP_MAX);Ki_h=constrain(kih,KI_MIN,KI_MAX);Kd_h=constrain(kdh,KD_MIN,KD_MAX);
     Kp_c=constrain(kpc,KP_MIN,KP_MAX);Ki_c=constrain(kic,KI_MIN,KI_MAX);Kd_c=constrain(kdc,KD_MIN,KD_MAX);
     if(htg){Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;}else{Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;}
@@ -354,11 +360,11 @@ void runST(float temp){
   if(stC>=ST_CYC_MAX) stStop();
 }
 
-// ── Czysty PID ────────────────────────────────────────────────
+// ── Czysty PID (uproszczony, zoptymalizowany pod gladka linie) ────
 int compPID(float temp){
   float dt=PID_DT_MS/1000.0f,err=spA-temp;
 
-  // Kierunek na podstawie rampy
+  // Kierunek na podstawie rampy. Przy zmianie - reset integratora i pochodnej.
   bool rH=(spT>(spA-1.0f));
   if(rH!=htg){
     ig=0;htg=rH;
@@ -366,64 +372,36 @@ int compPID(float temp){
     else   {Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;}
   }
 
-  // Dystans do celu finalnego
   bool atT=(fabs(spA-spT)<0.5f);
 
-  // ── PRZEJSCIE RAMPA->CEL: przytnij integrator ────────
-  // Gdy setpoint pierwszy raz dobija do celu, integrator z rampy moglby
-  // byc niezerowy i powodowac skok. Przycinamy go do polowy limitu celu,
-  // zeby przejscie bylo plynne (bez dziury/oscylacji jak wczesniej).
-  if(atT && !wasAtT){
-    ig = constrain(ig, -INTEGRAL_MAX*0.5f, INTEGRAL_MAX*0.5f);
-  }
-  wasAtT = atT;
-
   // ── INTEGRACJA z ANTI-WINDUP ────────────────────────
-  // Na RAMPIE ograniczamy integrator (mniejszy zakres), zeby nie narastal
-  // do maksimum - to glowne zrodlo dziury i oscylacji przy dojsciu do celu.
-  // Przy CELU pelny zakres - do precyzyjnego utrzymania.
-  float igLim = atT ? INTEGRAL_MAX : (INTEGRAL_MAX*0.4f);
+  // Na rampie ograniczony zakres (zapobiega windup -> dziura przy celu).
+  // Przy celu pelny zakres (precyzyjne utrzymanie).
+  float igLim = atT ? INTEGRAL_MAX : (INTEGRAL_MAX*0.5f);
   ig=constrain(ig+err*dt, -igLim, igLim);
 
-  // Derywata
-  float dv=(err-pe)/dt;pe=err;
+  // ── POCHODNA z FILTREM ──────────────────────────────
+  // Surowa pochodna wzmacnia szum termopary -> drzenie PWM -> fale.
+  // Filtr dolnoprzepustowy wygladza pochodna (EMA, alfa=0.3).
+  float dRaw=(err-pe)/dt; pe=err;
+  dFilt = dFilt + 0.3f*(dRaw - dFilt);   // filtrowana pochodna
 
-  // Wyjscie PID (czysty PID, bez feed-forward)
-  float out=Kp*err+Ki*ig+Kd*dv;
-
-  // ── OCHRONA STARTU ──────────────────────────────────
-  // Gdy temp jest blisko setpointu (start rampy, maly blad), ogranicz moc
-  // do 70%. Zapobiega gwaltownemu skokowi PWM na samym poczatku rampy.
-  float spDist=fabs(spA-temp);
-  if(spDist<0.5f && htg && out>PWM_MAX*0.7f){
-    out=PWM_MAX*0.7f;
-  } else if(spDist<0.5f && !htg && out<-PWM_MAX*0.7f){
-    out=-PWM_MAX*0.7f;
-  }
+  // Wyjscie PID (czysty PID, pochodna filtrowana)
+  float out=Kp*err + Ki*ig + Kd*dFilt;
 
   // ── TWARDA JEDNOKIERUNKOWOSC ─────────────────────────
-  // ZASADA: jak grzejemy to TYLKO grzejemy, jak chlodzimy to TYLKO chlodzimy.
-  // Nigdy nie mieszamy. Kierunek decyduje htg (grzanie=true).
-  if(htg){
-    out=constrain(out,0.0f,(float)PWM_MAX);     // tylko grzanie
-  } else {
-    out=constrain(out,-(float)PWM_MAX,0.0f);    // tylko chlodzenie
-  }
+  // Grzanie: tylko dodatni PWM. Chlodzenie: tylko ujemny. Bez mieszania.
+  if(htg) out=constrain(out,0.0f,(float)PWM_MAX);
+  else    out=constrain(out,-(float)PWM_MAX,0.0f);
 
-  // ── OGRANICZENIE TEMPA ZMIANY PWM (slew rate) ────────
-  // PWM nie moze zmieniac sie gwaltownie - narasta i opada stopniowo.
-  // To naprawia DWA problemy naraz:
-  //  - START: PWM nie skacze od razu (koniec przeregulowania na poczatku)
-  //  - KONIEC: PWM nie spada gwaltownie do zera (koniec dziury 70->60)
-  // PWM_SLEW = max zmiana PWM na jedno wywolanie (co PID_DT_MS=100ms).
-  // 8/wywolanie = ~80 PWM/s = plynne narastanie i opadanie.
-  const float PWM_SLEW=8.0f;
-  static float lastOut=0;
-  if(out>lastOut+PWM_SLEW) out=lastOut+PWM_SLEW;
-  else if(out<lastOut-PWM_SLEW) out=lastOut-PWM_SLEW;
-  lastOut=out;
+  // ── FILTR PWM (wygladzenie mocy) ─────────────────────
+  // Zamiast slew rate - filtr dolnoprzepustowy na wyjsciu PWM.
+  // Wygladza skoki mocy = gladki przyrost = prosta linia temperatury.
+  // alfa=0.4: kompromis miedzy gladkoscia a responsywnoscia.
+  // Reset (pwmFilt=out) gdy wlasnie ruszyl cykl - bez naleciaosci.
+  pwmFilt = pwmFilt + 0.4f*(out - pwmFilt);
 
-  return (int)out;
+  return (int)pwmFilt;
 }
 
 void detPol(){
@@ -535,59 +513,51 @@ void runCal(float temp){
         int a=i,b_=(i+1)%CH;
         if(cEH[a]*cEH[b_]<0) sc++;
       }
-      bool osc=(sc>=3);
+      bool osc=(sc>=2);  // czulsze wykrywanie fal (bylo 3 - przepuszczalo delikatne fale)
 
-      // Saturacja PWM
-      int sat=0;
-      for(int i=0;i<CH;i++) if(abs(cPwH[i])>=PWM_MAX-5) sat++;
-      bool satd=(sat>=CH-2);
+      // Czy kalibracja jest przy celu rampy (setpoint dobil do celu)
+      bool atTcal=(fabs(spA-spT)<1.0f);
 
-      // Trend bledu
-      int p2=(cHI-2+CH)%CH,c2=(cHI-1+CH)%CH;
-      float tr=abs(cEH[c2])-abs(cEH[p2]);
-      bool worse=(tr>0.3f);
+      // ── PROSTA, JASNA ZASADA STROJENIA ──────────────────
+      // Priorytet: gladka linia. Lekkie opoznienie (temp za setpointem) OK.
+      // PWM jest juz filtrowany w compPID, wiec kalibracja nie walczy ze
+      // skokami mocy - skupia sie na trzech przypadkach:
+      //   1. OSCYLUJE -> tlum: Kd w gore, Ki+Kp w dol
+      //   2. ZOSTAJE W TYLE (duzy staly blad) -> wzmocnij Kp
+      //   3. MALY STALY BLAD przy celu -> dodaj troche Ki (kasuje offset)
+      // Metryka wyboru profilu: blad + mocna kara za oscylacje (gladkosc!).
+      float quality = ae + sc*1.0f;
+      float adj=0.04f;
 
-      float adj=0.03f;
-
-      // Strojenie aktywnego zestawu (heat lub cool)
       if(htg){
         if(osc){
-          // Oscyluje – zmniejsz Kp,Kd
-          Kp_h=constrain(Kp_h*(1-adj*1.5f),KP_MIN,KP_MAX);
-          Kd_h=constrain(Kd_h*(1-adj),KD_MIN,KD_MAX);
+          // Oscyluje - TLUM (to klucz do gladkiej linii)
+          Kd_h=constrain(Kd_h*(1+adj*1.5f),KD_MIN,KD_MAX);
+          Ki_h=constrain(Ki_h*(1-adj),KI_MIN,KI_MAX);
+          Kp_h=constrain(Kp_h*(1-adj),KP_MIN,KP_MAX);
           ig*=0.5f;
-        } else if(satd&&ae>2){
-          // Saturacja – nic nie da sie poprawic
-        } else if(ae>8){
-          Kp_h=constrain(Kp_h*(1+adj*2),KP_MIN,KP_MAX);
-        } else if(ae>2&&worse){
+        } else if(ae>3.0f){
+          // Zostaje w tyle - wzmocnij Kp (dogon setpoint)
           Kp_h=constrain(Kp_h*(1+adj),KP_MIN,KP_MAX);
-          Kd_h=constrain(Kd_h*(1+adj*0.3f),KD_MIN,KD_MAX);
-        } else if(ae>0.5f && ae<2.0f){
-          // Ki zwiekszaj TYLKO przy malym stalym bledzie (offset przy celu),
-          // NIE podczas duzego bledu rampy - inaczej Ki rosnie w nieskonczonosc
-          // do maksimum (powodowalo Ki=3.0 wszedzie i oscylacje).
+        } else if(ae>0.5f && ae<3.0f && atTcal){
+          // Maly staly blad przy celu - troche Ki (kasuje offset)
           Ki_h=constrain(Ki_h*(1+adj*0.5f),KI_MIN,KI_MAX);
         }
         Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;
-        if(ae<cBH){cBH=ae;cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;}
+        if(quality<cBH){cBH=quality;cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;}
       } else {
         if(osc){
-          Kp_c=constrain(Kp_c*(1-adj*1.5f),KP_MIN,KP_MAX);
-          Kd_c=constrain(Kd_c*(1-adj),KD_MIN,KD_MAX);
+          Kd_c=constrain(Kd_c*(1+adj*1.5f),KD_MIN,KD_MAX);
+          Ki_c=constrain(Ki_c*(1-adj),KI_MIN,KI_MAX);
+          Kp_c=constrain(Kp_c*(1-adj),KP_MIN,KP_MAX);
           ig*=0.5f;
-        } else if(satd&&ae>2){
-        } else if(ae>8){
-          Kp_c=constrain(Kp_c*(1+adj*2),KP_MIN,KP_MAX);
-        } else if(ae>2&&worse){
+        } else if(ae>3.0f){
           Kp_c=constrain(Kp_c*(1+adj),KP_MIN,KP_MAX);
-          Kd_c=constrain(Kd_c*(1+adj*0.3f),KD_MIN,KD_MAX);
-        } else if(ae>0.5f && ae<2.0f){
-          // Ki tylko przy malym stalym bledzie (offset), nie na rampie
+        } else if(ae>0.5f && ae<3.0f && atTcal){
           Ki_c=constrain(Ki_c*(1+adj*0.5f),KI_MIN,KI_MAX);
         }
         Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;
-        if(ae<cBC){cBC=ae;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;}
+        if(quality<cBC){cBC=quality;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;}
       }
 
       int tot=cTN*calRampN,done=cTi*calRampN+cRi+1;
@@ -611,8 +581,15 @@ void runCal(float temp){
       Serial.print(",CAL-");Serial.println(done);
     }
 
-    // Koniec fazy strojenia – zapisz najlepsze i nastepny krok
-    if(el>CT){
+    // Koniec fazy strojenia – zapisz najlepsze i nastepny krok.
+    // Czas strojenia skalowany z predkoscia rampy: wolne rampy potrzebuja
+    // wiecej czasu (rampa +10C trwa dluzej). Min CT, ale dla wolnych ramp
+    // wydluzamy tak, by rampa +10C zdazyla sie zakonczyc + zapas na strojenie.
+    float rampTime = 10.0f/calRamps[cRi]*60.0f*1000.0f;  // czas rampy +10C [ms]
+    unsigned long tuneTime = (unsigned long)(rampTime + CT);  // rampa + zapas strojenia
+    if(tuneTime < CT) tuneTime = CT;
+    if(tuneTime > 180000) tuneTime = 180000;  // max 3min na punkt (ograniczenie)
+    if(el>tuneTime){
       Kp_h=cKpH;Ki_h=cKiH;Kd_h=cKdH;
       Kp_c=cKpC;Ki_c=cKiC;Kd_c=cKdC;
       nxtCS();
@@ -854,7 +831,8 @@ void procCmd(String c){
   else if(key=="START"){
     if(sys==MAN){
       sys=AUTO;spA=lT;ig=0;pe=0;slT=0;tR=millis();
-      rampT0=millis();   // znacznik startu rampy - dla soft startu feed-forward
+      dFilt=0;pwmFilt=0;   // reset filtrow - bez naleciaosci z poprzedniego cyklu
+      rampT0=millis();
       if(calDone) ldProf(spT,rU);
       Serial.println("ON");
     }
