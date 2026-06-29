@@ -271,6 +271,7 @@ class PeltierControl:
         self.cal_current = 0       # aktualny krok (1-based)
         self.cal_cur_temp = None
         self.cal_cur_ramp = None
+        self.cal_phase = None      # faza biezacego kroku: 'heating'/'stabil'/'relay'
         self.cal_running = False
         self.cal_t0 = None         # czas startu kalibracji
         self.cal_step_times = []   # czasy ukonczenia krokow (do ETA)
@@ -506,6 +507,8 @@ class PeltierControl:
                 if 'KI' in d and hasattr(self, 'sl_ki'):    self.sl_ki.set(float(d['KI']))
                 if 'KD' in d and hasattr(self, 'sl_kd'):    self.sl_kd.set(float(d['KD']))
                 if 'OFFSET' in d and hasattr(self, 'sl_off'): self.sl_off.set(float(d['OFFSET']))
+                if 'KFFH' in d and hasattr(self, 'sl_kffh'): self.sl_kffh.set(float(d['KFFH']))
+                if 'KFFR' in d and hasattr(self, 'sl_kffr'): self.sl_kffr.set(float(d['KFFR']))
                 self._cfg_synced = True
             if 'CAL' in d:
                 self.dev_cal = (d['CAL'] == '1')
@@ -570,6 +573,7 @@ class PeltierControl:
             self.cal_plan = plan
             self.cal_total = total or len(plan)
             self.cal_current = 0
+            self.cal_phase = None
             self.cal_running = True
             self.cal_t0 = time.time()
             self.cal_step_times = []
@@ -590,10 +594,13 @@ class PeltierControl:
                 if part.startswith('T='):
                     self.cal_cur_temp = float(part[2:])
                 elif part.startswith('R='):
-                    rv = part[2:]
-                    if rv.strip() == 'relay':
+                    rv = part[2:].strip()
+                    # Relay: R= to FAZA kroku (heating/stabil/relay), nie rampa.
+                    if rv in ('heating', 'stabil', 'relay'):
+                        self.cal_phase = rv
                         self.cal_cur_ramp = 'relay'
                     else:
+                        self.cal_phase = None
                         try: self.cal_cur_ramp = float(rv)
                         except: self.cal_cur_ramp = rv
             # Jesli zmienil sie krok - zapisz czas (do ETA)
@@ -925,10 +932,13 @@ class PeltierControl:
         main = tk.Frame(parent, bg=C['bg'])
         main.pack(fill='both', expand=True, padx=16, pady=(0, 12))
 
-        # LEWO - wykres
-        self._build_chart(main)
-        # PRAWO - panel sterowania
+        # PRAWO - panel sterowania (pakowany PIERWSZY!)
+        # Stala szerokosc 312px rezerwuje miejsce z prawej ZANIM rozszerzajacy sie
+        # wykres zajmie cavity. Inaczej canvas matplotlib przy przerysowaniu (zoom/
+        # home/resize) zada pelnego rozmiaru i zgniata panel pakowany pozniej -> panel znika.
         self._build_panel(main)
+        # LEWO - wykres (wypelnia pozostala przestrzen)
+        self._build_chart(main)
 
     def _stat_card(self, parent, title, unit, color):
         card = tk.Frame(parent, bg=C['panel'])
@@ -1169,6 +1179,12 @@ class PeltierControl:
                                  on_change=lambda v: self.send(f"KI:{v:.2f}"))
         self.sl_kd = SliderField(sec1, "Kd", 0, 80, 0.8, C['cyan'], "", 2,
                                  on_change=lambda v: self.send(f"KD:{v:.2f}"))
+        # Feed-forward (grzanie): HOLD = moc na utrzymanie, RAMP = moc na dynamike rampy.
+        # Stroj na zywo: za mocno na starcie -> zmniejsz RAMP; nie dochodzi -> zwieksz.
+        self.sl_kffh = SliderField(sec1, "FF HOLD (KFFH)", 0, 8, 2.5, C['yellow'], "PWM/°C", 2,
+                                   on_change=lambda v: self.send(f"KFFH:{v:.2f}"))
+        self.sl_kffr = SliderField(sec1, "FF RAMP (KFFR)", 0, 4, 1.0, C['yellow'], "PWM/(°C/min)", 2,
+                                   on_change=lambda v: self.send(f"KFFR:{v:.2f}"))
 
         # ── AUTO-CALIBRATION ──
         sec2 = self._adv_section(inner, "AUTO-CALIBRATION", C['purple'])
@@ -2712,23 +2728,23 @@ class CalRangeDialog:
         self.app.start_autocal(tmin, tmax, ramps)
         self.win.destroy()
 
-
-# ════════════════════════════════════════════════════════
-#  OKNO POSTĘPU KALIBRACJI
-# ════════════════════════════════════════════════════════
 class CalibrationWindow:
+    # Fazy jednego kroku relay (kolejnosc = przebieg w firmware)
+    PHASES = [('heating', '① Grzanie'), ('stabil', '② Stabilizacja'),
+              ('relay', '③ Relay pomiar')]
+
     def __init__(self, parent, app):
         self.app = app
         self.win = tk.Toplevel(parent)
         self.win.title("Calibration progress")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("620x760")
-        self.win.minsize(580, 680)
+        self.win.geometry("640x780")
+        self.win.minsize(600, 700)
         self.win.transient(parent)
         self.win.update_idletasks()
         try:
-            px = parent.winfo_rootx() + parent.winfo_width()//2 - 310
-            py = parent.winfo_rooty() + parent.winfo_height()//2 - 380
+            px = parent.winfo_rootx() + parent.winfo_width()//2 - 320
+            py = parent.winfo_rooty() + parent.winfo_height()//2 - 390
             self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
         except: pass
 
@@ -2738,46 +2754,59 @@ class CalibrationWindow:
 
         tk.Label(inner, text="CALIBRATION PROGRESS", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+        tk.Label(inner, text="Relay autotuning — jeden test na temperaturę (wypełnia wszystkie rampy)",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 10))
 
-        # Pasek postepu
-        self.prog_frame = tk.Frame(inner, bg=C['bg2'], height=32)
-        self.prog_frame.pack(fill='x', pady=(12, 4))
+        # Pasek postepu (liczony w temperaturach)
+        self.prog_frame = tk.Frame(inner, bg=C['bg2'], height=30)
+        self.prog_frame.pack(fill='x', pady=(0, 10))
         self.prog_frame.pack_propagate(False)
-        self.prog_bar = tk.Frame(self.prog_frame, bg=C['purple'], height=32)
+        self.prog_bar = tk.Frame(self.prog_frame, bg=C['purple'], height=30)
         self.prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
-        self.prog_text = tk.Label(self.prog_frame, text="0 / 0", bg=C['bg2'],
+        self.prog_text = tk.Label(self.prog_frame, text="0 / 0 temperatur", bg=C['bg2'],
                                   fg=C['text'], font=(FONT, fsz(11), 'bold'))
         self.prog_text.place(relx=0.5, rely=0.5, anchor='center')
 
-        # Info: aktualny / nastepny / ETA
+        # Biezacy krok
         info = tk.Frame(inner, bg=C['panel'])
-        info.pack(fill='x', pady=(8, 12))
+        info.pack(fill='x', pady=(0, 10))
         ii = tk.Frame(info, bg=C['panel'])
-        ii.pack(fill='x', padx=14, pady=10)
+        ii.pack(fill='x', padx=14, pady=12)
 
         row1 = tk.Frame(ii, bg=C['panel']); row1.pack(fill='x', pady=2)
-        tk.Label(row1, text="NOW:", bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
+        tk.Label(row1, text="TERAZ:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
         self.lbl_now = tk.Label(row1, text="—", bg=C['panel'], fg=C['orange'],
-                                font=(FONT, fsz(11), 'bold'), anchor='w')
+                                font=(FONT, fsz(12), 'bold'), anchor='w')
         self.lbl_now.pack(side='left')
 
+        # Wskaznik fazy: grzanie -> stabilizacja -> relay
+        phase_row = tk.Frame(ii, bg=C['panel']); phase_row.pack(fill='x', pady=(8, 4))
+        tk.Label(phase_row, text="FAZA:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
+        self.phase_lbls = {}
+        for key, label in self.PHASES:
+            l = tk.Label(phase_row, text=label, bg=C['bg2'], fg=C['dim2'],
+                         font=(FONT, fsz(9)), padx=8, pady=4)
+            l.pack(side='left', padx=(0, 4))
+            self.phase_lbls[key] = l
+
         row2 = tk.Frame(ii, bg=C['panel']); row2.pack(fill='x', pady=2)
-        tk.Label(row2, text="NEXT:", bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
+        tk.Label(row2, text="NASTĘPNA:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
         self.lbl_next = tk.Label(row2, text="—", bg=C['panel'], fg=C['cyan'],
                                  font=(FONT, fsz(11)), anchor='w')
         self.lbl_next.pack(side='left')
 
         row3 = tk.Frame(ii, bg=C['panel']); row3.pack(fill='x', pady=2)
-        tk.Label(row3, text="REMAINING:", bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(9)), width=10, anchor='w').pack(side='left')
+        tk.Label(row3, text="POZOSTAŁO:", bg=C['panel'], fg=C['dim2'],
+                 font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
         self.lbl_eta = tk.Label(row3, text="—", bg=C['panel'], fg=C['yellow'],
                                 font=(FONT, fsz(11), 'bold'), anchor='w')
         self.lbl_eta.pack(side='left')
 
-        # Lista krokow
-        tk.Label(inner, text="ALL STEPS", bg=C['bg'], fg=C['dim'],
+        # Lista temperatur do kalibracji
+        tk.Label(inner, text="TEMPERATURY", bg=C['bg'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(4, 4))
 
         list_wrap = tk.Frame(inner, bg=C['bg2'])
@@ -2793,55 +2822,67 @@ class CalibrationWindow:
         self.steps_frame.bind('<Configure>',
             lambda e: self.canvas.config(scrollregion=self.canvas.bbox('all')))
 
-        # Przycisk przerwij
         mk_btn_outline(inner, "■ ABORT CALIBRATION", self.abort, C['red']).pack(
             fill='x', pady=(12, 0))
 
         self.step_widgets = []
         self.refresh()
 
+    def _step_label(self, t, r):
+        """Czytelna etykieta kroku. Bezpieczna dla relay, gdzie r jest stringiem
+        (stare formatowanie {r:.0f} wywalalo wyjatek i lista nigdy sie nie budowala)."""
+        try:
+            if isinstance(r, str):     # tryb relay: jeden test na temperature
+                return f"{t:.0f}°C"
+            return f"{t:.0f}°C  @  {r:.0f}°C/min"
+        except Exception:
+            return f"{t}"
+
     def refresh(self):
         app = self.app
         total = app.cal_total or len(app.cal_plan)
         cur = app.cal_current
+        phase = getattr(app, 'cal_phase', None)
 
-        # Pasek
+        # Pasek postepu
         frac = (cur / total) if total else 0
-        self.prog_bar.place_configure(relwidth=frac)
-        self.prog_text.config(text=f"{cur} / {total}")
+        self.prog_bar.place_configure(relwidth=min(1.0, frac))
+        self.prog_text.config(text=f"{cur} / {total} temperatur")
 
-        # Teraz
-        if app.cal_cur_temp is not None and app.cal_cur_ramp is not None:
-            r = app.cal_cur_ramp
-            if r == 'relay':
-                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C · relay test (pomiar)")
-            elif r == 'heating':
-                self.lbl_now.config(text=f"→ grzanie do {app.cal_cur_temp:.0f}°C")
-            elif r == 'stabil':
-                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C · stabilizacja")
-            elif isinstance(r, (int, float)):
-                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C @ {r:.0f}°C/min")
-            else:
-                self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C · {r}")
-        # Nastepny
-        if cur < len(app.cal_plan):
-            nt, nr = app.cal_plan[cur] if cur < len(app.cal_plan) else (None, None)
-            if nt is not None:
-                if nr == 'relay':
-                    self.lbl_next.config(text=f"{nt:.0f}°C · relay test")
-                else:
-                    self.lbl_next.config(text=f"{nt:.0f}°C @ {nr:.0f}°C/min")
+        # TERAZ
+        if app.cal_cur_temp is not None:
+            tnum = f"   ({cur}/{total})" if cur else ""
+            self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C{tnum}")
         else:
-            self.lbl_next.config(text="(last step)")
+            self.lbl_now.config(text="— (czekam na urządzenie)")
+
+        # Podswietl aktywna faze
+        for key, _ in self.PHASES:
+            if key == phase:
+                self.phase_lbls[key].config(bg=C['orange'], fg='#1a1c1f')
+            else:
+                self.phase_lbls[key].config(bg=C['bg2'], fg=C['dim2'])
+
+        # NASTEPNA temperatura
+        if 0 < cur < len(app.cal_plan):
+            nt, nr = app.cal_plan[cur]
+            self.lbl_next.config(text=self._step_label(nt, nr))
+        elif cur >= len(app.cal_plan) and len(app.cal_plan) > 0:
+            self.lbl_next.config(text="(ostatnia)")
+        else:
+            self.lbl_next.config(text="—")
+
         # ETA
         eta = app._cal_eta()
         if eta is not None:
             m = int(eta // 60); s = int(eta % 60)
             self.lbl_eta.config(text=f"~{m} min {s} s")
         elif cur >= total and total > 0:
-            self.lbl_eta.config(text="FINISHED ✓")
+            self.lbl_eta.config(text="ZAKOŃCZONO ✓")
+        else:
+            self.lbl_eta.config(text="—")
 
-        # Lista krokow - buduj raz, potem aktualizuj kolory
+        # Lista temperatur - buduj raz, potem aktualizuj statusy
         if len(self.step_widgets) != len(app.cal_plan):
             for w in self.steps_frame.winfo_children():
                 w.destroy()
@@ -2854,29 +2895,31 @@ class CalibrationWindow:
                 num = tk.Label(row, text=f"{i+1:2d}", bg=C['bg2'], fg=C['dim2'],
                               font=(FONT, fsz(9)), width=4, anchor='w')
                 num.pack(side='left')
-                txt = tk.Label(row, text=f"{t:.0f}°C  @  {r:.0f}°C/min",
+                txt = tk.Label(row, text=self._step_label(t, r),
                               bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(10)), anchor='w')
-                txt.pack(side='left', fill='x', expand=True)
+                txt.pack(side='left', fill='x', expand=True, padx=(2, 0))
                 stat = tk.Label(row, text="", bg=C['bg2'], fg=C['dim2'],
-                               font=(FONT, fsz(9)), anchor='e', width=12)
+                               font=(FONT, fsz(9)), anchor='e', width=18)
                 stat.pack(side='right')
                 self.step_widgets.append((bar, num, txt, stat))
 
-        # Aktualizuj kolory/statusy
+        # Statusy + kolory
+        phase_txt = {'heating': '→ grzanie', 'stabil': '~ stabilizacja',
+                     'relay': '◇ relay pomiar'}
         for i, (bar, num, txt, stat) in enumerate(self.step_widgets):
             step_no = i + 1
             if step_no < cur:
                 bar.config(bg=C['green']); txt.config(fg=C['dim2'])
-                num.config(fg=C['green']); stat.config(text="✓ done", fg=C['green'])
+                num.config(fg=C['green']); stat.config(text="✓ gotowe", fg=C['green'])
             elif step_no == cur:
                 bar.config(bg=C['orange']); txt.config(fg=C['text'])
-                num.config(fg=C['orange']); stat.config(text="● NOW", fg=C['orange'])
-                # Przewin do aktualnego
-                try: self.canvas.yview_moveto(max(0, (i-3))/max(1,len(self.step_widgets)))
+                num.config(fg=C['orange'])
+                stat.config(text=phase_txt.get(phase, "● teraz"), fg=C['orange'])
+                try: self.canvas.yview_moveto(max(0, (i-3))/max(1, len(self.step_widgets)))
                 except: pass
             else:
                 bar.config(bg=C['bg2']); txt.config(fg=C['dim'])
-                num.config(fg=C['dim2']); stat.config(text="waiting", fg=C['dim2'])
+                num.config(fg=C['dim2']); stat.config(text="oczekuje", fg=C['dim2'])
 
     def abort(self):
         if messagebox.askyesno("Abort?", "Abort calibration?"):
