@@ -194,7 +194,18 @@ String cSt="";
 // Standard przemyslowy. Zamiast zgadywac nastawy, MIERZY charakterystyke
 // ukladu (ultimate gain Ku, ultimate period Tu) wymuszajac kontrolowana
 // oscylacje przekaznikiem, potem LICZY Kp/Ki/Kd ze wzorow.
-#define RELAY_AMP    60       // amplituda przekaznika [PWM] (~24% mocy - lagodne pobudzenie)
+#define RELAY_AMP    60       // startowa amplituda przekaznika [PWM] (~24% mocy - lagodne pobudzenie)
+// Jesli PRZY STALEJ amplitudzie temperatura nigdy nie przekracza setpointu w
+// obie strony (blisko otoczenia na dole zakresu, blisko granicy mocy grzania
+// na gorze zakresu), test wisi po jednej stronie i NIGDY nie zaliczy cyklu -
+// zaden timeout tego nie naprawi. Dlatego amplituda ESKALUJE: jesli przez
+// RELAY_ESCALATE_MS nie zlapiemy ani jednego prawdziwego przejscia, mocniej
+// pobudzamy uklad. relayAmpCur to biezaca (mozliwe ze juz podbita) amplituda
+// dla aktualnego punktu; resetowana do RELAY_AMP na starcie kazdego punktu.
+#define RELAY_AMP_MAX   140    // sufit eskalacji [PWM] (~55% mocy)
+#define RELAY_AMP_STEP   40    // o ile podbic przy kazdej eskalacji
+#define RELAY_ESCALATE_MS 90000  // po ilu ms bez cyklu podbic amplitude (90s)
+float relayAmpCur=RELAY_AMP;
 #define RELAY_HYST   0.3f     // histereza [C] - martwa strefa wokol setpointu
 #define RELAY_CYCLES 6        // ile ostatnich cykli trzymamy w buforze do usredniania
 // Ile PRAWDZIWYCH przejsc przez setpoint potrzeba zeby zakonczyc test
@@ -561,6 +572,7 @@ void runCal(float temp){
       relayPeakHi=-999;relayPeakLo=999;
       for(int i=0;i<RELAY_CYCLES;i++){relayAmps[i]=relayPers[i]=0;}
       relayCycN=0;
+      relayAmpCur=RELAY_AMP;  // zawsze startuj od lagodnej amplitudy
       relayTcross=now;
       relayWasAbove=(temp>spT);
       relayState=(temp<spT);
@@ -577,7 +589,7 @@ void runCal(float temp){
     bool below=(temp < sp-RELAY_HYST);
     if(below) relayState=true;
     else if(above) relayState=false;
-    setPwr(relayState ? RELAY_AMP : -RELAY_AMP);
+    setPwr(relayState ? (int)relayAmpCur : -(int)relayAmpCur);
 
     // Sledz szczyty w biezacym cyklu
     if(temp>relayPeakHi) relayPeakHi=temp;
@@ -610,7 +622,22 @@ void runCal(float temp){
     }
     relayWasAbove=nowAbove;
 
-    char b[32];sprintf(b,"Relay %d/%d cykli",relayCycN,RELAY_EXIT_CYCLES);
+    // Eskalacja amplitudy: jesli od RELAY_ESCALATE_MS nie zlapalismy ani
+    // jednego prawdziwego przejscia, uklad prawdopodobnie WISI po jednej
+    // stronie setpointu (za blisko otoczenia na dole zakresu / za blisko
+    // granicy mocy grzania na gorze) i lagodna amplituda nigdy go nie
+    // przepchnie na druga strone. Podbij moc i daj nowej amplitudzie wlasne
+    // RELAY_ESCALATE_MS zanim zdecydujemy ze i tak sie nie da.
+    if(now-relayTcross>RELAY_ESCALATE_MS && relayAmpCur<RELAY_AMP_MAX){
+      relayAmpCur+=RELAY_AMP_STEP;
+      if(relayAmpCur>RELAY_AMP_MAX) relayAmpCur=RELAY_AMP_MAX;
+      relayTcross=now;
+      relayPeakHi=-999;relayPeakLo=999;
+      Serial.print("RELAY escalate T=");Serial.print(sp,0);
+      Serial.print(" amp=");Serial.println(relayAmpCur,0);
+    }
+
+    char b[40];sprintf(b,"Relay %d/%d @%d%%",relayCycN,RELAY_EXIT_CYCLES,(int)(relayAmpCur*100/PWM_MAX));
     cSt=String(b);
 
     // Log + status TYLKO co 500ms (nie zalewaj portu - inaczej aplikacja
@@ -646,7 +673,11 @@ void runCal(float temp){
     if(valid>=2 && ampSum>0.01f){
       float aAvg=ampSum/valid;             // srednia amplituda [C]
       float Tu=(perSum/valid)/1000.0f;     // sredni okres [s]
-      float Ku=(4.0f*RELAY_AMP)/(3.14159f*aAvg);
+      // UWAGA: uzywamy relayAmpCur (aktualnej, mozliwe ze eskalowanej mocy
+      // przekaznika), NIE stalej RELAY_AMP - inaczej Ku wyszloby zle jesli
+      // ostatnie (uzyte do usredniania) cykle zlapaly sie dopiero po
+      // podbiciu amplitudy.
+      float Ku=(4.0f*relayAmpCur)/(3.14159f*aAvg);
       float Kp_new=Ku/2.2f;
       float Ti=2.2f*Tu;
       float Td=Tu/6.3f;
@@ -668,8 +699,13 @@ void runCal(float temp){
       Serial.println("RELAY FAIL - bazowe");
       // Sygnal dla aplikacji PC (masz surowa konsole czy nie - to trafi do GUI):
       // ten punkt NIE zostal naprawde skalibrowany, uzyto wartosci bazowych.
+      // amp=... to amplituda przy ktorej test sie poddal (jesli to juz
+      // RELAY_AMP_MAX, to nawet ~55% mocy nie przepchnelo ukladu przez
+      // setpoint w obie strony - warto sprawdzic czy ta temperatura jest w
+      // ogole fizycznie osiagalna/utrzymywalna na tym sprzecie).
       Serial.print("CALWARN:T=");Serial.print(cTP[cTi],0);
       Serial.print(",cycles=");Serial.print(relayCycN);
+      Serial.print(",amp=");Serial.print((int)relayAmpCur);
       Serial.println(",relay_fail");
     }
     // wyczysc tablice na nastepna temperature
