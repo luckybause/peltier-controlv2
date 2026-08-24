@@ -276,7 +276,7 @@ class PeltierControl:
         self.cal_t0 = None         # czas startu kalibracji
         self.cal_step_times = []   # czasy rozpoczecia kolejnych krokow (do ETA)
         self.cal_win = None        # okno postepu kalibracji
-        self.cal_warnings = []     # lista (temp, cycles) dla punktow z relay_fail w tej sesji
+        self.cal_warnings = []     # lista (temp, cycles, amp) dla punktow z relay_fail w tej sesji
 
         # Zapis kalibracji na dysku PC
         self.cal_file = self.log_dir / "kalibracja.json"
@@ -622,11 +622,15 @@ class PeltierControl:
             print(f"calstat err: {e}")
 
     def _parse_calwarn(self, txt):
-        """CALWARN:T=90,cycles=1,relay_fail - test relay dla tej temperatury
-        nie zlapal oscylacji (za mało/za szybkie przejscia przez setpoint) i
-        firmware wpisal wartosci bazowe zamiast realnie zmierzonych. Bez tego
-        sygnalu ten fakt byl widoczny TYLKO w surowej konsoli szeregowej
-        (ktorej nie kazdy ma pod reka) jako 'RELAY FAIL - bazowe'."""
+        """CALWARN:T=90,cycles=1,amp=140,relay_fail - test relay dla tej
+        temperatury nie zlapal oscylacji (za mało/za szybkie przejscia przez
+        setpoint) i firmware wpisal wartosci bazowe zamiast realnie
+        zmierzonych. 'amp' to amplituda PWM przy ktorej test sie poddal -
+        jesli to juz max (140), nawet najmocniejsze lagodne pobudzenie nie
+        przepchnelo ukladu przez setpoint w obie strony (fizyczna granica
+        zakresu, nie tylko kwestia czasu/szumu). Bez tego sygnalu ten fakt
+        byl widoczny TYLKO w surowej konsoli szeregowej (ktorej nie kazdy ma
+        pod reka) jako 'RELAY FAIL - bazowe'."""
         try:
             d = {}
             for part in txt.split(','):
@@ -635,8 +639,9 @@ class PeltierControl:
                     d[k.strip()] = v.strip()
             temp = float(d.get('T', 'nan'))
             cycles = int(d.get('cycles', '0'))
+            amp = int(d['amp']) if 'amp' in d else None
             if temp == temp:  # odrzuc NaN
-                self.cal_warnings.append((temp, cycles))
+                self.cal_warnings.append((temp, cycles, amp))
             self.root.after(0, self._refresh_cal_view)
         except Exception as e:
             print(f"calwarn err: {e}")
@@ -3003,7 +3008,12 @@ class CalibrationWindow:
         # Ostrzezenia o punktach z nieudanym testem relay (wartosci bazowe)
         warns = getattr(app, 'cal_warnings', [])
         if warns:
-            temps_txt = ", ".join(f"{t:.0f}°C" for t, _ in warns)
+            def _wtxt(w):
+                t, cycles, amp = w
+                if amp is not None and amp >= 140:
+                    return f"{t:.0f}°C (nawet max. moc pobudzenia nie pomogła)"
+                return f"{t:.0f}°C"
+            temps_txt = ", ".join(_wtxt(w) for w in warns)
             self.lbl_warn.config(
                 text=f"⚠ Test relay nie złapał oscylacji dla: {temps_txt} — "
                      f"użyto wartości bazowych (10.0/0.30/0.80) zamiast realnie zmierzonych.")
@@ -3034,7 +3044,7 @@ class CalibrationWindow:
         # Statusy + kolory
         phase_txt = {'heating': '→ grzanie', 'stabil': '~ stabilizacja',
                      'relay': '◇ relay pomiar'}
-        warn_temps = {round(t) for t, _ in getattr(app, 'cal_warnings', [])}
+        warn_temps = {round(w[0]) for w in getattr(app, 'cal_warnings', [])}
         for i, (bar, num, txt, stat) in enumerate(self.step_widgets):
             step_no = i + 1
             step_temp = app.cal_plan[i][0] if i < len(app.cal_plan) else None
