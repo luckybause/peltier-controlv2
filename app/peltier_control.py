@@ -207,6 +207,33 @@ class SliderField:
 
 
 # ════════════════════════════════════════════════════════
+#  DEKODOWANIE KODOW BLEDOW Z FIRMWARE (ERR:code=N,...,active=0/1)
+# ════════════════════════════════════════════════════════
+ERR_CODES = {
+    1: "Fault termopary glownej",
+    2: "Odczyt termopary poza zakresem / szum",
+    3: "TEMP MAX - bezpieczne zatrzymanie",
+    4: "MAX31856 nie odpowiada (SPI/polaczenie)",
+}
+# Bitmaska rejestru fault MAX31856 (Adafruit_MAX31856.h)
+TC_FAULT_BITS = [
+    (0x80, "zakres zimnego zlacza (CJ range)"),
+    (0x40, "zakres termopary (TC range)"),
+    (0x20, "zimne zlacze za wysokie (CJ high)"),
+    (0x10, "zimne zlacze za niskie (CJ low)"),
+    (0x08, "termopara za goraca (TC high)"),
+    (0x04, "termopara za zimna (TC low)"),
+    (0x02, "przepiecie/niedopiecie (OV/UV)"),
+    (0x01, "obwod otwarty - przewod urwany/odlaczony"),
+]
+
+
+def decode_tc_fault(bits):
+    names = [name for mask, name in TC_FAULT_BITS if bits & mask]
+    return ", ".join(names) if names else f"bitmask 0x{bits:02X}"
+
+
+# ════════════════════════════════════════════════════════
 #  APLIKACJA GLOWNA
 # ════════════════════════════════════════════════════════
 class PeltierControl:
@@ -277,6 +304,15 @@ class PeltierControl:
         self.cal_step_times = []   # czasy rozpoczecia kolejnych krokow (do ETA)
         self.cal_win = None        # okno postepu kalibracji
         self.cal_warnings = []     # lista (temp, cycles, amp) dla punktow z relay_fail w tej sesji
+        self.cal_ramp_warnings = []  # lista (temp, ramp, err) dla ramp_track_fail w tej sesji
+
+        # Diagnostyka / log bledow - kazda linia Serial ktora nie jest znanym
+        # protokolem ani telemetria CSV trafia tutaj (zamiast byc po cichu
+        # odrzucana), a formalne ERR: sa dekodowane na czytelny opis PL.
+        self.diag_log = []        # lista (ts, level, text); level: ERR/WARN/INFO
+        self.err_active = {}      # code -> opis, aktywne (nieustapione) bledy sprzetowe
+        self.diag_unseen = 0      # licznik nowych ERR/WARN od ostatniego otwarcia okna
+        self.diag_win = None      # referencja do otwartego okna diagnostyki (albo None)
 
         # Zapis kalibracji na dysku PC
         self.cal_file = self.log_dir / "kalibracja.json"
@@ -430,11 +466,31 @@ class PeltierControl:
                     self._parse_calwarn(raw[8:])
                     continue
 
+                # Kod bledu sprzetowego/bezpieczenstwa ERR:code=1,bits=0x01,active=1
+                if raw.startswith("ERR:"):
+                    self._parse_err(raw[4:])
+                    continue
+
                 # Linia danych CSV (9 pol + opcjonalne temp2 jako 10.)
                 p = raw.split(',')
-                if len(p) < 9: continue
-                try: float(p[0])
-                except ValueError: continue
+                is_csv = len(p) >= 9
+                if is_csv:
+                    try: float(p[0])
+                    except ValueError: is_csv = False
+                if not is_csv:
+                    # Nie CSV i nie zaden ze znanych prefixow powyzej - zamiast
+                    # po cichu odrzucac (jak wczesniej), pokaz w panelu
+                    # diagnostyki. Dzieki temu widac w apce WSZYSTKO co
+                    # firmware wysyla przez Serial (np. "Flash: zapisano.",
+                    # "AUTOCAL START", "RELAY FAIL - bazowe"), a nie tylko we
+                    # wlasnym Serial Monitorze Arduino (ktory i tak nie dziala
+                    # rownolegle z apka na tym samym porcie).
+                    if raw:
+                        low = raw.upper()
+                        lvl = 'WARN' if any(k in low for k in
+                              ('FAIL', 'ERROR', '!!!', 'BLAD', 'BŁĄD')) else 'INFO'
+                        self._log_diag(lvl, raw)
+                    continue
                 try:
                     d = dict(temp=float(p[1]), sa=float(p[2]), st=float(p[3]),
                              pwm=int(p[4]), kp=float(p[5]), ki=float(p[6]),
@@ -585,6 +641,7 @@ class PeltierControl:
             self.cal_t0 = time.time()
             self.cal_step_times = []
             self.cal_warnings = []
+            self.cal_ramp_warnings = []
             self.root.after(0, self._refresh_cal_view)
         except Exception as e:
             print(f"calplan err: {e}")
@@ -607,6 +664,15 @@ class PeltierControl:
                     if rv in ('heating', 'stabil', 'relay'):
                         self.cal_phase = rv
                         self.cal_cur_ramp = 'relay'
+                    elif rv.startswith('rampprep:') or rv.startswith('ramptest:'):
+                        # Test rampowania per-rampa PO relay (dostraja Kp/Ki/Kd
+                        # grzania osobno dla kazdej rampy z calRamps) -
+                        # R=rampprep:20 (cofanie sie) / R=ramptest:20 (jazda z
+                        # tym rampem, sledzenie ASP).
+                        key, _, rate = rv.partition(':')
+                        self.cal_phase = key
+                        try: self.cal_cur_ramp = float(rate)
+                        except Exception: self.cal_cur_ramp = rate
                     else:
                         self.cal_phase = None
                         try: self.cal_cur_ramp = float(rv)
@@ -622,15 +688,23 @@ class PeltierControl:
             print(f"calstat err: {e}")
 
     def _parse_calwarn(self, txt):
-        """CALWARN:T=90,cycles=1,amp=140,relay_fail - test relay dla tej
+        """Dwa rozne ostrzezenia dziela ten sam komunikat CALWARN:
+
+        1) CALWARN:T=90,cycles=1,amp=140,relay_fail - test relay dla tej
         temperatury nie zlapal oscylacji (za mało/za szybkie przejscia przez
         setpoint) i firmware wpisal wartosci bazowe zamiast realnie
         zmierzonych. 'amp' to amplituda PWM przy ktorej test sie poddal -
         jesli to juz max (140), nawet najmocniejsze lagodne pobudzenie nie
         przepchnelo ukladu przez setpoint w obie strony (fizyczna granica
-        zakresu, nie tylko kwestia czasu/szumu). Bez tego sygnalu ten fakt
-        byl widoczny TYLKO w surowej konsoli szeregowej (ktorej nie kazdy ma
-        pod reka) jako 'RELAY FAIL - bazowe'."""
+        zakresu, nie tylko kwestia czasu/szumu).
+
+        2) CALWARN:T=50,R=20,err=2.34,ramp_track_fail - test ROMPOWANIA dla
+        konkretnej rampy (PO udanym relay) nie zszedl ponizej progu bledu
+        sledzenia ASP w czasie testu - ta JEDNA komorka (temp,rampa) zostaje
+        z profilem bazowym z relay (ktory dalej jest realnym pomiarem, NIE
+        wartosciami 10.0/0.30/0.80 - w odroznieniu od (1)!). To NIE jest to
+        samo co relay_fail i nie powinno oznaczac calej temperatury jako
+        "bazowe/fail" w tabeli - stad osobna lista (cal_ramp_warnings)."""
         try:
             d = {}
             for part in txt.split(','):
@@ -638,13 +712,101 @@ class PeltierControl:
                     k, v = part.split('=', 1)
                     d[k.strip()] = v.strip()
             temp = float(d.get('T', 'nan'))
-            cycles = int(d.get('cycles', '0'))
-            amp = int(d['amp']) if 'amp' in d else None
-            if temp == temp:  # odrzuc NaN
+            if temp != temp:  # odrzuc NaN
+                return
+            if 'R' in d and 'err' in d:
+                # (2) ramp_track_fail
+                try: ramp = float(d['R'])
+                except Exception: ramp = None
+                try: err = float(d['err'])
+                except Exception: err = None
+                self.cal_ramp_warnings.append((temp, ramp, err))
+                self._log_diag('WARN', f"Kalibracja: test rampy {ramp}°C/min "
+                               f"@ {temp}°C nie dotrzymal ASP (err={err}°C)")
+            else:
+                # (1) relay_fail
+                cycles = int(d.get('cycles', '0'))
+                amp = int(d['amp']) if 'amp' in d else None
                 self.cal_warnings.append((temp, cycles, amp))
+                self._log_diag('WARN', f"Kalibracja: test relay @ {temp}°C nie zlapal "
+                               f"oscylacji (cycles={cycles}, amp={amp}) - uzyto wartosci bazowych")
             self.root.after(0, self._refresh_cal_view)
         except Exception as e:
             print(f"calwarn err: {e}")
+
+    def _parse_err(self, txt):
+        """ERR:code=N,...,active=0/1 - kod bledu sprzetowego/bezpieczenstwa z
+        firmware. Firmware wysyla to TYLKO na zbocze (raz gdy sie pojawia, raz
+        gdy ustepuje), wiec tu tylko dekodujemy i wpisujemy do logu - zero
+        ryzyka zalania Serial. code=1/2 aktualizuja err_active (pokazywane
+        jako aktywny alarm dopoki nie przyjdzie active=0), code=3/4 to
+        zdarzenia jednorazowe ale tez trzymane w err_active do ew. wglądu."""
+        try:
+            d = {}
+            for part in txt.split(','):
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                    d[k.strip()] = v.strip()
+            code = int(d.get('code', '-1'))
+            active = d.get('active', '1') == '1'
+            base = ERR_CODES.get(code, f"Nieznany kod bledu ({code})")
+            detail = ""
+            if code == 1 and 'bits' in d:
+                try: detail = " - " + decode_tc_fault(int(d['bits'], 16))
+                except Exception: pass
+            elif code == 2 and 'val' in d:
+                detail = f" - odczyt={d['val']}°C"
+            elif code == 3:
+                detail = f" - temp={d.get('temp', '?')}°C, limit={d.get('limit', '?')}°C"
+            text = base + detail
+            if active:
+                self.err_active[code] = text
+                self._log_diag('ERR', text)
+            else:
+                self.err_active.pop(code, None)
+                self._log_diag('INFO', f"USTAPIL: {base}")
+        except Exception as e:
+            print(f"err parse err: {e}")
+
+    def _log_diag(self, level, text):
+        """Dopisz wpis do panelu diagnostyki (level: ERR/WARN/INFO) i
+        odswiez wskaznik w pasku tytulowym. Wolane zarowno z watku Serial
+        (bezposrednio) jak i z GUI - lista.append() jest bezpieczne w
+        CPythonie (GIL), a odswiezenie UI zawsze idzie przez root.after."""
+        entry = (time.time(), level, text)
+        self.diag_log.append(entry)
+        if len(self.diag_log) > 500:
+            del self.diag_log[:-500]
+        if level in ('ERR', 'WARN'):
+            self.diag_unseen += 1
+        self.root.after(0, self._refresh_diag_indicator)
+        if self.diag_win is not None:
+            self.root.after(0, lambda e=entry: self.diag_win.append_entry(e))
+
+    def _refresh_diag_indicator(self):
+        """Aktualizuje przycisk DIAG w pasku tytulowym: kolor/tekst wg tego
+        czy sa aktywne alarmy sprzetowe (err_active) i licznik nieprzeczytanych
+        wpisow (diag_unseen)."""
+        if not hasattr(self, 'btn_diag'):
+            return
+        if self.err_active:
+            n = len(self.err_active)
+            self.btn_diag.config(text=f"⚠ BLAD x{n}", bg=C['red'], fg='#ffffff')
+        elif self.diag_unseen > 0:
+            self.btn_diag.config(text=f"DIAG ({self.diag_unseen})", bg=C['orange'], fg='#1a1c1f')
+        else:
+            self.btn_diag.config(text="DIAG", bg=C['bg2'], fg=C['dim'])
+
+    def open_diag_window(self):
+        self.diag_unseen = 0
+        self._refresh_diag_indicator()
+        if self.diag_win is not None:
+            try:
+                self.diag_win.win.lift()
+                return
+            except Exception:
+                self.diag_win = None
+        self.diag_win = DiagnosticsWindow(self.root, self)
 
     def _cal_step_stats(self):
         """(avg_step_s, elapsed_w_biezacym_kroku_s) na podstawie znacznikow
@@ -760,9 +922,10 @@ class PeltierControl:
 
     def _show_cal_table_window(self, profiles):
         """Okno z tabela skalibrowanych PID (temp x rampa)"""
-        # Siatka jak w firmware (PR_N=8)
+        # Siatka jak w firmware (PR_N=9 - musi byc IDENTYCZNA z PT[]/PR[] w .ino,
+        # inaczej idx=ri*len(PR)+ci wskazuje na zle komorki)
         PT = [20, 30, 40, 50, 60, 70, 80, 90, 100]
-        PR = [2, 5, 10, 20, 30, 40, 60, 80]
+        PR = [5, 10, 20, 30, 40, 50, 60, 70, 80]
         win = tk.Toplevel(self.root)
         win.title("Calibration Table")
         win.configure(bg=C['bg'])
@@ -950,6 +1113,11 @@ class PeltierControl:
         # Status po prawej
         sf = tk.Frame(top, bg=C['bg2'])
         sf.pack(side='right', padx=16)
+        self.btn_diag = tk.Button(sf, text="DIAG", command=self.open_diag_window,
+                                   bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
+                                   relief='flat', cursor='hand2', bd=0, padx=10, pady=4,
+                                   activebackground=C['panel3'])
+        self.btn_diag.pack(side='left', padx=(0, 16))
         self.s_dot = tk.Canvas(sf, width=14, height=14, bg=C['bg2'], highlightthickness=0)
         self.s_dot.pack(side='left', padx=(0, 8))
         self._draw_dot(C['dim2'], glow=False)
@@ -1580,6 +1748,16 @@ class PeltierControl:
         if hasattr(self, 'cal_win') and self.cal_win:
             try: self.cal_win.refresh()
             except: pass
+        # TARGET/HEAT RATE/COOL RATE: firmware IGNORUJE komendy SP/RU/RD gdy
+        # trwa kalibracja (sys==CAL - patrz procCmd) - zeby przypadkowe
+        # przesuniecie suwaka nie zaburzalo trwajacego pomiaru relay. Wczesniej
+        # suwaki byly "zawsze aktywne" (patrz _set_panel_enabled), wiec user
+        # mogl je przesunac bez ostrzezenia i nic sie nie dzialo - myslal ze
+        # zmienil cel, a firmware po cichu to olewalo. Zablokuj je wizualnie
+        # na czas kalibracji, zeby bylo jasne ze sa martwe.
+        for sl in ('sl_sp', 'sl_ru', 'sl_rd'):
+            if hasattr(self, sl):
+                getattr(self, sl).set_enabled(not self.cal_running)
 
     def open_profiles(self):
         """Okno edycji profili wieloetapowych"""
@@ -2751,7 +2929,19 @@ class CalRangeDialog:
                          activebackground=C['panel3'])
             b.pack(side='left', padx=4, fill='x', expand=True)
             self.step_btns[st] = b
-        self._set_step(10)  # zaznacz domyslny krok 10 (przy max 80 = 8 ramp)
+
+        # RECOMMENDED - lista ramp nie da sie wyrazic rownym krokiem (5, potem
+        # co 10 az do 80) - to dokladnie domyslna lista z firmware
+        # (calRamps[]). Osobny przycisk zamiast probowac to wcisnac w
+        # KROK RATE powyzej.
+        self.custom_ramps = None
+        self.btn_recommended = tk.Button(
+            inner, text="RECOMMENDED (5/10/20/30/40/50/60/70/80 °C/min)",
+            command=self._use_recommended_ramps,
+            bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(10), 'bold'),
+            relief='flat', cursor='hand2', bd=0, padx=10, pady=8,
+            activebackground=C['panel3'])
+        self.btn_recommended.pack(fill='x', pady=(6, 0))
 
         # Podglad generowanej listy ramp
         self.ramps_preview = tk.Label(inner, text="", bg=C['bg'], fg=C['cyan'],
@@ -2762,7 +2952,7 @@ class CalRangeDialog:
         self.est_lbl = tk.Label(inner, text="", bg=C['bg'], fg=C['yellow'],
                                font=(FONT, fsz(10), 'bold'))
         self.est_lbl.pack(anchor='w', pady=(0, 12))
-        self._update_estimate()
+        self._use_recommended_ramps()  # domyslnie wybrana (zamiast _set_step(10)) - woala tez _update_estimate()
 
         # Przyciski
         bf = tk.Frame(inner, bg=C['bg'])
@@ -2773,17 +2963,32 @@ class CalRangeDialog:
             side='left', fill='x', expand=True, padx=(4, 0))
 
     def _set_step(self, step):
-        """Ustaw krok rate i podswietl przycisk"""
+        """Ustaw krok rate (rowny krok) i podswietl przycisk - wylacza RECOMMENDED."""
+        self.custom_ramps = None
         self.rate_step = step
         for s, b in self.step_btns.items():
             if s == step:
                 b.config(bg=C['cyan'], fg='#1a1c1f')
             else:
                 b.config(bg=C['bg2'], fg=C['dim'])
+        if hasattr(self, 'btn_recommended'):
+            self.btn_recommended.config(bg=C['bg2'], fg=C['dim'])
+        self._update_estimate()
+
+    def _use_recommended_ramps(self):
+        """Domyslna lista ramp z firmware (5, potem co 10 az do 80) - nie da
+        sie jej wyrazic rownym krokiem, stad osobna sciezka od _set_step."""
+        self.custom_ramps = [5, 10, 20, 30, 40, 50, 60, 70, 80]
+        for b in self.step_btns.values():
+            b.config(bg=C['bg2'], fg=C['dim'])
+        self.btn_recommended.config(bg=C['cyan'], fg='#1a1c1f')
         self._update_estimate()
 
     def _gen_ramps(self):
-        """Generuj liste ramp z max + krok. Np. max=20 krok=5 -> [5,10,15,20]"""
+        """Generuj liste ramp - albo RECOMMENDED (custom_ramps), albo rowny
+        krok z max+krok. Np. max=20 krok=5 -> [5,10,15,20]"""
+        if self.custom_ramps is not None:
+            return list(self.custom_ramps)
         try:
             maxr = self.sl_maxrate.get()
         except:
@@ -2804,13 +3009,18 @@ class CalRangeDialog:
             n_temps = max(1, int((tmax - tmin) / 10) + 1)
             ramps = self._gen_ramps()
             n_ramps = len(ramps)
-            total = n_temps * n_ramps
-            est_min = total * 4  # ~4 min/krok
+            # Relay: ok. 2-4 min/temperatura typowo (zalezy jak szybko zlapie
+            # cykle - do 10 min w najgorszym razie). PO relay, test
+            # rampowania per rampa: cofniecie (zwykle <1 min) + 60s test
+            # (jazda+dostrajanie) = ~1.5 min/rampa.
+            total_tests = n_temps * (1 + n_ramps)  # relay + kazda rampa, per temperatura
+            est_min = n_temps * (3 + n_ramps * 1.5)
             # Podglad listy ramp
             if hasattr(self, 'ramps_preview'):
                 self.ramps_preview.config(
                     text=f"Ramps: {', '.join(str(r) for r in ramps)} °C/min")
-            self.est_lbl.config(text=f"≈ {total} steps · ~{est_min} min total")
+            self.est_lbl.config(text=f"≈ {n_temps} temp × (relay + {n_ramps} ramp) = "
+                                      f"{total_tests} tests · ~{est_min:.0f} min total")
         except Exception as e:
             print(f"est err: {e}")
 
@@ -2824,21 +3034,26 @@ class CalRangeDialog:
             messagebox.showerror("No ramps", "Invalid rate settings.")
             return
         n_temps = int((tmax - tmin) / 10) + 1
-        total = n_temps * len(ramps)
+        total_tests = n_temps * (1 + len(ramps))
+        est_min = n_temps * (3 + len(ramps) * 1.5)
         if not messagebox.askyesno("Start calibration",
                 f"Start auto-calibration?\n\n"
                 f"Temp range: {tmin:.0f}-{tmax:.0f}°C (step 10°C)\n"
                 f"Ramps: {', '.join(str(r) for r in ramps)} °C/min\n"
-                f"Total: {total} steps\n\n"
-                "Takes several minutes. Can be stopped with STOP."):
+                f"Total: {total_tests} tests (relay + {len(ramps)} ramp per temperature)\n"
+                f"Estimated: ~{est_min:.0f} min\n\n"
+                "Takes a while. Can be stopped with STOP."):
             return
         self.app.start_autocal(tmin, tmax, ramps)
         self.win.destroy()
 
 class CalibrationWindow:
-    # Fazy jednego kroku relay (kolejnosc = przebieg w firmware)
+    # Fazy jednego kroku (kolejnosc = przebieg w firmware): relay najpierw
+    # mierzy bazowy Kp/Ki/Kd dla temperatury, potem rampprep/ramptest leca
+    # w kolko dla kazdej rampy z calRamps (dostrajaja galaz grzania per rampa).
     PHASES = [('heating', '① Grzanie'), ('stabil', '② Stabilizacja'),
-              ('relay', '③ Relay pomiar')]
+              ('relay', '③ Relay pomiar'), ('rampprep', '④ Cofanie'),
+              ('ramptest', '⑤ Test rampy')]
 
     def __init__(self, parent, app):
         self.app = app
@@ -2970,7 +3185,10 @@ class CalibrationWindow:
         # TERAZ
         if app.cal_cur_temp is not None:
             tnum = f"   ({cur}/{total})" if cur else ""
-            self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C{tnum}")
+            rtxt = ""
+            if phase in ('rampprep', 'ramptest') and isinstance(app.cal_cur_ramp, (int, float)):
+                rtxt = f"   @ {app.cal_cur_ramp:.0f}°C/min"
+            self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C{tnum}{rtxt}")
         else:
             self.lbl_now.config(text="— (czekam na urządzenie)")
 
@@ -3007,6 +3225,7 @@ class CalibrationWindow:
 
         # Ostrzezenia o punktach z nieudanym testem relay (wartosci bazowe)
         warns = getattr(app, 'cal_warnings', [])
+        lines = []
         if warns:
             def _wtxt(w):
                 t, cycles, amp = w
@@ -3014,11 +3233,23 @@ class CalibrationWindow:
                     return f"{t:.0f}°C (nawet max. moc pobudzenia nie pomogła)"
                 return f"{t:.0f}°C"
             temps_txt = ", ".join(_wtxt(w) for w in warns)
-            self.lbl_warn.config(
-                text=f"⚠ Test relay nie złapał oscylacji dla: {temps_txt} — "
-                     f"użyto wartości bazowych (10.0/0.30/0.80) zamiast realnie zmierzonych.")
-        else:
-            self.lbl_warn.config(text="")
+            lines.append(f"⚠ Test relay nie złapał oscylacji dla: {temps_txt} — "
+                         f"użyto wartości bazowych (10.0/0.30/0.80) zamiast realnie zmierzonych.")
+        # Ostrzezenia o pojedynczych rampach, ktore nie zeszly ponizej progu
+        # bledu sledzenia (test rampowania PO relay - relay tej temperatury
+        # sam w sobie sie udal, zostaje jego wynik dla tej rampy - to NIE
+        # jest to samo co powyzej, wiec osobna, mniej alarmujaca linia).
+        rwarns = getattr(app, 'cal_ramp_warnings', [])
+        if rwarns:
+            def _rwtxt(w):
+                t, r, err = w
+                rtxt = f"{r:.0f}°C/min" if r is not None else "?"
+                etxt = f", błąd {err:.1f}°C" if err is not None else ""
+                return f"{t:.0f}°C @ {rtxt}{etxt}"
+            lines.append("⚠ Test rampowania nie zbił błędu śledzenia ASP poniżej progu dla: "
+                         + ", ".join(_rwtxt(w) for w in rwarns)
+                         + " — zostaje profil bazowy z relay (dalej realnie zmierzony) dla tych ramp.")
+        self.lbl_warn.config(text="\n".join(lines))
 
         # Lista temperatur - buduj raz, potem aktualizuj statusy
         if len(self.step_widgets) != len(app.cal_plan):
@@ -3072,6 +3303,136 @@ class CalibrationWindow:
             self.app.send("STOP")
             self.app.cal_running = False
             self.win.destroy()
+
+
+# ════════════════════════════════════════════════════════
+#  OKNO DIAGNOSTYKI - log wszystkich zdarzen z firmware + aktywne alarmy
+# ════════════════════════════════════════════════════════
+class DiagnosticsWindow:
+    """Pokazuje wszystko co firmware wysyla przez Serial, nie tylko
+    telemetrie CSV: kody bledow (ERR:) zdekodowane na czytelny opis PL,
+    ostrzezenia kalibracji (CALWARN) i kazda inna linie tekstowa (np.
+    'Flash: zapisano.', 'AUTOCAL START'), ktora wczesniej byla po cichu
+    odrzucana przez apke. Ulatwia to lapanie i zglaszanie bledow, bo nie
+    trzeba juz podpinac osobnego Serial Monitora (i tak nie da sie tego
+    zrobic rownolegle z apka na tym samym porcie COM)."""
+    LEVEL_COLOR = {'ERR': 'red', 'WARN': 'orange', 'INFO': 'dim'}
+
+    def __init__(self, parent, app):
+        self.app = app
+        self.win = tk.Toplevel(parent)
+        self.win.title("Diagnostyka")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("640x560")
+        self.win.minsize(480, 360)
+        self.win.transient(parent)
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.win.update_idletasks()
+        try:
+            px = parent.winfo_rootx() + parent.winfo_width()//2 - 320
+            py = parent.winfo_rooty() + parent.winfo_height()//2 - 280
+            self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
+        except Exception:
+            pass
+
+        tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
+        inner = tk.Frame(self.win, bg=C['bg'])
+        inner.pack(fill='both', expand=True, padx=20, pady=16)
+
+        tk.Label(inner, text="DIAGNOSTYKA", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+        tk.Label(inner, text="Wszystkie zdarzenia i bledy zglaszane przez firmware",
+                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 12))
+
+        # Banner aktywnych alarmow (widoczny tylko gdy err_active nie jest puste)
+        self.active_frame = tk.Frame(inner, bg=C['bg2'])
+        self.active_frame.pack(fill='x', pady=(0, 12))
+
+        # Log - Text ze znacznikami kolorow per poziom
+        log_wrap = tk.Frame(inner, bg=C['bg2'])
+        log_wrap.pack(fill='both', expand=True)
+        sb = tk.Scrollbar(log_wrap)
+        sb.pack(side='right', fill='y')
+        self.text = tk.Text(log_wrap, bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
+                             relief='flat', bd=0, wrap='word', state='disabled',
+                             yscrollcommand=sb.set, padx=10, pady=8)
+        self.text.pack(side='left', fill='both', expand=True)
+        sb.config(command=self.text.yview)
+        self.text.tag_config('ERR', foreground=C['red'])
+        self.text.tag_config('WARN', foreground=C['orange'])
+        self.text.tag_config('INFO', foreground=C['dim'])
+        self.text.tag_config('ts', foreground=C['dim2'])
+
+        btn_row = tk.Frame(inner, bg=C['bg'])
+        btn_row.pack(fill='x', pady=(12, 0))
+        mk_btn(btn_row, "ZAPISZ DO PLIKU", self.export_log, C['cyan']).pack(side='left')
+        mk_btn_outline(btn_row, "WYCZYSC", self.clear_log, C['dim']).pack(side='left', padx=(8, 0))
+        mk_btn_outline(btn_row, "ZAMKNIJ", self._on_close, C['red']).pack(side='right')
+
+        self.refresh_active()
+        self.reload_log()
+
+    def refresh_active(self):
+        for w in self.active_frame.winfo_children():
+            w.destroy()
+        if not self.app.err_active:
+            tk.Label(self.active_frame, text="Brak aktywnych alarmow.", bg=C['bg2'],
+                     fg=C['green'], font=(FONT, fsz(9)), anchor='w').pack(
+                     fill='x', padx=10, pady=8)
+            return
+        for code, text in self.app.err_active.items():
+            row = tk.Frame(self.active_frame, bg=C['bg2'])
+            row.pack(fill='x')
+            tk.Frame(row, bg=C['red'], width=4).pack(side='left', fill='y')
+            tk.Label(row, text=f"⚠ [{code}] {text}", bg=C['bg2'], fg=C['red'],
+                     font=(FONT, fsz(9), 'bold'), anchor='w', justify='left',
+                     wraplength=560).pack(side='left', fill='x', expand=True, padx=8, pady=6)
+
+    def reload_log(self):
+        self.text.config(state='normal')
+        self.text.delete('1.0', 'end')
+        for entry in self.app.diag_log:
+            self._insert_entry(entry)
+        self.text.config(state='disabled')
+        self.text.see('end')
+
+    def append_entry(self, entry):
+        """Wywolywane z app._log_diag() gdy okno jest otwarte - dopisuje na
+        biezaco zamiast czekac na reload_log()."""
+        try:
+            self.text.config(state='normal')
+            self._insert_entry(entry)
+            self.text.config(state='disabled')
+            self.text.see('end')
+        except Exception:
+            pass
+        self.refresh_active()
+
+    def _insert_entry(self, entry):
+        ts, level, text = entry
+        tstr = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+        self.text.insert('end', f"[{tstr}] ", 'ts')
+        self.text.insert('end', f"{level:<4} ", level)
+        self.text.insert('end', f"{text}\n", level)
+
+    def clear_log(self):
+        self.app.diag_log = []
+        self.reload_log()
+
+    def export_log(self):
+        try:
+            fn = self.app.log_dir / f"diagnostyka_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            with open(fn, 'w', encoding='utf-8') as f:
+                for ts, level, text in self.app.diag_log:
+                    tstr = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                    f.write(f"[{tstr}] {level:<4} {text}\n")
+            messagebox.showinfo("Zapisano", f"Log zapisany:\n{fn}")
+        except Exception as e:
+            messagebox.showerror("Blad zapisu", str(e))
+
+    def _on_close(self):
+        self.app.diag_win = None
+        self.win.destroy()
 
 
 # ════════════════════════════════════════════════════════
