@@ -57,6 +57,12 @@ C = {
 FONT      = 'Consolas'
 FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 
+# Numer wersji APLIKACJI PC (nie mylic z FW - numerem wersji firmware, ktory
+# apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
+# Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
+# sprawdzic czy to na pewno nowy plik.
+APP_BUILD = "2026-08-25.1"
+
 # Globalny mnoznik rozmiaru fontow (ustawiany na starcie wg DPI)
 FS = 1.0
 def fsz(n):
@@ -239,7 +245,7 @@ def decode_tc_fault(bits):
 class PeltierControl:
     def __init__(self, root):
         self.root = root
-        self.root.title("PeltierControl v6.0 - BRUTALIST")
+        self.root.title(f"PeltierControl v6.0 - BRUTALIST  [APP {APP_BUILD}]")
         self.root.configure(bg=C['bg'])
         self.root.geometry("1280x800")
         self.root.minsize(1100, 720)
@@ -274,6 +280,10 @@ class PeltierControl:
         self.dev_pol_set = False
         self.dev_cal_min = 50.0
         self.dev_cal_max = 100.0
+
+        # Numer wersji firmware pobrany z plytki (komenda VER) - do
+        # weryfikacji ze na plytce jest faktycznie nowy soft
+        self.dev_fw_build = None
 
         # Sterowanie wykresem live
         self.chart_paused = False      # pauza przewijania (do zoomu)
@@ -388,8 +398,12 @@ class PeltierControl:
             self.set_status(True, f"{port} - 115200")
             self.running = True
             threading.Thread(target=self.reader, daemon=True).start()
-            # Pobierz konfiguracje startowa
+            # Pobierz konfiguracje startowa + numer wersji firmware (VER dziala
+            # od razu na komendę, wiec dziala tez gdy plytka juz dawno stoi
+            # wlaczona - w odroznieniu od BUILD: wysylanego tylko raz w setup(),
+            # ktorego apka moglaby nie zobaczyc gdyby polaczyla sie PO starcie).
             self.root.after(1500, lambda: self.send("GET"))
+            self.root.after(1600, lambda: self.send("VER"))
             # Auto-wczytaj zapisana kalibracje z PC (jesli istnieje)
             self.root.after(2200, self._auto_load_calibration)
         except Exception as e:
@@ -413,6 +427,9 @@ class PeltierControl:
             except: pass
             self.ser = None
         self.set_status(False, "")
+        self.dev_fw_build = None
+        if hasattr(self, 'fw_build_lbl'):
+            self.fw_build_lbl.config(text="FW: —", fg=C['dim2'])
 
     def clear_buf(self):
         for a in [self.t, self.temp, self.spt, self.spa,
@@ -469,6 +486,14 @@ class PeltierControl:
                 # Kod bledu sprzetowego/bezpieczenstwa ERR:code=1,bits=0x01,active=1
                 if raw.startswith("ERR:"):
                     self._parse_err(raw[4:])
+                    continue
+
+                # Numer wersji firmware - wysylany raz w setup() ORAZ na kazde
+                # zadanie "VER" (patrz connect()). Pokazany w pasku tytulowym
+                # (FW: ...) zeby od razu bylo widac, czy plytka faktycznie ma
+                # wgrany nowy soft, a nie tylko czy apka jest nowa.
+                if raw.startswith("BUILD:"):
+                    self.root.after(0, lambda b=raw[6:].strip(): self._set_fw_build(b))
                     continue
 
                 # Linia danych CSV (9 pol + opcjonalne temp2 jako 10.)
@@ -797,6 +822,16 @@ class PeltierControl:
         else:
             self.btn_diag.config(text="DIAG", bg=C['bg2'], fg=C['dim'])
 
+    def _set_fw_build(self, build):
+        """Wolane po odebraniu BUILD:<id> z plytki (przy starcie firmware
+        LUB w odpowiedzi na komende VER wyslana zaraz po polaczeniu).
+        Pokazuje numer w pasku tytulowym i loguje do diagnostyki, zeby bylo
+        widac czarno na bialym ktora wersja firmware jest faktycznie wgrana."""
+        self.dev_fw_build = build
+        if hasattr(self, 'fw_build_lbl'):
+            self.fw_build_lbl.config(text=f"FW: {build}", fg=C['green'])
+        self._log_diag('INFO', f"Polaczono - firmware build {build}")
+
     def open_diag_window(self):
         self.diag_unseen = 0
         self._refresh_diag_indicator()
@@ -1107,8 +1142,11 @@ class PeltierControl:
         tk.Frame(top, bg=C['red'], width=6).pack(side='left', fill='y')
         tk.Label(top, text="  PELTIER CONTROL", bg=C['bg2'], fg=C['text'],
                  font=(FONT, fsz(13), 'bold')).pack(side='left', padx=(8, 0))
-        tk.Label(top, text="v6.0", bg=C['bg2'], fg=C['dim2'],
+        tk.Label(top, text=f"v6.0 · APP {APP_BUILD}", bg=C['bg2'], fg=C['dim2'],
                  font=(FONT, fsz(9))).pack(side='left', padx=8)
+        self.fw_build_lbl = tk.Label(top, text="FW: —", bg=C['bg2'], fg=C['dim2'],
+                                      font=(FONT, fsz(9)))
+        self.fw_build_lbl.pack(side='left')
 
         # Status po prawej
         sf = tk.Frame(top, bg=C['bg2'])
