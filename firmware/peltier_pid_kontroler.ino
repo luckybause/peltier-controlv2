@@ -5,14 +5,23 @@
 //  BIBLIOTEKI: Adafruit MAX31856, Adafruit BusIO, U8g2,
 //              FlashStorage_SAMD
 //
-//  STEROWANIE: Czysty PID (bez FF)
-//    Rampa:   jednostronne (tylko grzanie LUB tylko chłodzenie)
-//    Cel:     pełny PID
+//  STEROWANIE: PID + feed-forward na rampie
+//    Rampa:   jednostronne (tylko grzanie LUB tylko chłodzenie), FF niesie
+//             wiekszosc ciezaru, PID tylko dokorygowuje
+//    Cel:     pełny PID (FF wylaczony po osiagnieciu celu)
+//    Anti-windup: calka w jednostkach WYJSCIA, klamrowana do prawdziwego
+//             zakresu aktuatora (0..PWM_MAX) zamiast do stalej - technika
+//             z Arduino-PID-Library (Beauregard) / QuickPID
+//    Pochodna: liczona z POMIARU (temperatury), nie z bledu - eliminuje
+//             "derivative kick" przy skokowych zmianach celu/profilu
 //  SELF-TUNE: co 2s, 60 cykli = 2 minuty
-//    Auto-start przy ON
+//    Start RECZNY z menu/apki (SELFTUNE) - NIE auto-startuje przy ON, zeby
+//    przy kazdym wlaczeniu nie nadpisywac juz zapisanych/skalibrowanych nastaw
 //    Osobny Kp/Ki/Kd dla heat i cool
 //    Zapisuje do profilu dla aktualnej temp i rampy
-//  36 PROFILI: 9 temp x 4 rampy, interpolacja bilinearna
+//  81 PROFILE: 9 temp x 9 ramp (5/10/20/30/40/50/60/70/80 C/min),
+//    interpolacja bilinearna. Kazdy punkt: RELAY (baza) + RAMP TEST
+//    (auto-dostrajanie self-tune podczas grzania z zadana rampa)
 // ============================================================
 
 #include <SPI.h>
@@ -36,7 +45,18 @@
 #define TEMP_MIN_C    -15.0f
 #define TEMP_MAX_DEF   110.0f
 #define PID_DT_MS      100
-#define INTEGRAL_MAX   400.0f
+// (dawniej byla tu INTEGRAL_MAX jako sztywny limit calki - usunieta, patrz
+// komentarz przy calkowaniu w compPID(): teraz limit calki to PRAWDZIWY
+// zakres wyjscia (0..PWM_MAX), nie arbitralna stala).
+//
+// METODYKA KIERUNKU (na zyczenie): grzanie = normalny PID w gore/w dol PWM.
+// "Chlodzenie" = PWM samo spada w kierunku zera (chlodzenie PASYWNE,
+// oddawanie ciepla do otoczenia) - to sie dzieje samo, bez osobnego
+// mechanizmu. Aktywne chlodzenie (ujemny PWM, odwrocenie Peltiera) wlacza
+// sie NATYCHMIAST, bez zadnego opoznienia/marginesu, w momencie gdy SUROWE
+// (nieprzyciete) wyjscie PID faktycznie zejdzie ponizej zera - czyli
+// dokladnie tam, gdzie musimy odwrocic polaryzacje. Patrz blok kierunku w
+// compPID() (po policzeniu "out", przed twardym obcieciem 0..PWM_MAX).
 // Feed-forward rampy: moc PWM na kazdy 1 C/min zadanego rate.
 // Wieksza wartosc = mocniejsze wyprzedzanie. 0 = wylaczone (czysty PID).
 // Przy probelach z trzymaniem rate zwieksz; przy przeregulowaniu zmniejsz.
@@ -86,23 +106,29 @@
 
 // Profile
 #define PT_N  9
-#define PR_N  8
+#define PR_N  9
 #define P_TOT (PT_N*PR_N)
 const float PT[PT_N]={20,30,40,50,60,70,80,90,100};
-const float PR[PR_N]={2,5,10,20,30,40,60,80};
+const float PR[PR_N]={5,10,20,30,40,50,60,70,80};
 
 // Konfigurowalna lista ramp do kalibracji (ustawiana z aplikacji).
 // Domyslnie = PR. Maksymalnie 10 ramp.
 #define CAL_RAMP_MAX 20
-float calRamps[CAL_RAMP_MAX]={2,5,10,20,30,40,60,80};
-int   calRampN=8;  // ile ramp aktywnych
+float calRamps[CAL_RAMP_MAX]={5,10,20,30,40,50,60,70,80};
+int   calRampN=9;  // ile ramp aktywnych
 
 struct Prof {
   float Kp_h,Ki_h,Kd_h;
   float Kp_c,Ki_c,Kd_c;
   bool  valid;
 };
-struct FD { bool cal; Prof p[P_TOT]; float ru,rd,tm; bool polSet; bool polSw; float calMin,calMax; };
+// FLASH_VER: bump gdy zmienia sie bajtowy layout FD/Prof (np. zmiana P_TOT -
+// tak jak tutaj: PR_N 8->9). Stare dane w Flash NIE pasuja bajt-w-bajt do
+// nowego struct (przesuwaja sie offsety WSZYSTKICH pol PO tablicy p[]) - bez
+// tej kontroli ldF() czytalby smieci (losowe Kp/Ki/Kd, polSw, zakres
+// kalibracji) zamiast poprawnie je zignorowac. Patrz ldF().
+#define FLASH_VER 2u
+struct FD { uint32_t ver; bool cal; Prof p[P_TOT]; float ru,rd,tm; bool polSet; bool polSw; float calMin,calMax; };
 FlashStorage(pidFlash,FD);
 
 Adafruit_MAX31856 tc=Adafruit_MAX31856(PIN_CS_TC);
@@ -120,13 +146,26 @@ float Kp_c=10,Ki_c=0.3f,Kd_c=0.3f;
 float Kp=10,Ki=0.3f,Kd=0.8f;
 float rU=2,rD=2,tMax=TEMP_MAX_DEF;
 bool  htg=true;
-bool  wasAtT=false;   // poprzedni stan "przy celu" (do przyciecia integratora)
 float dFilt=0;        // filtrowana pochodna (tlumi szum termopary)
 float pwmFilt=0;      // filtrowane wyjscie PWM (wygladza skoki mocy)
 
-float ig=0,pe=0,lT=25;
+float ig=0,peT=25,lT=25;
+// dInit: czy peT (ostatnia temperatura do pochodnej) jest juz "swieza" po
+// resecie (ig=0;dInit=false w kodzie). Bez tego pierwszy cykl PID po kazdym
+// resecie liczylby pochodna wzgledem STAREJ/zerowej wartosci peT - falszywy,
+// czasem ogromny skok pochodnej na jedna probke. Patrz komentarz w compPID().
+bool dInit=false;
 int   lPwm=0;
 bool  tcE=false;
+
+// ── KODY BLEDOW (ERR:code=N,...,active=0/1) - wysylane na zbocze (raz przy
+//    wystapieniu, raz przy ustapieniu), zeby nie zapchac Serial. Apka PC
+//    dekoduje kod na czytelny opis i pokazuje w panelu diagnostyki.
+//    1=fault termopary glownej (bitmaska SR MAX31856)
+//    2=odczyt poza zakresem/NaN (fault=0, mozliwy szum/zakloc)
+//    3=TEMP MAX - bezpieczne zatrzymanie
+//    4=MAX31856 nie odpowiada przy starcie (SPI/polaczenie)
+bool tcErrSent=false, tcRangeErrSent=false;
 
 // ── Sterowanie z PC (zamiast potencjometrow/przyciskow) ──
 bool  pcMode=true;       // true = wartosci z PC, ignoruj potencjometry
@@ -181,14 +220,36 @@ float cTmn=20,cTmx=90;
 float cTP[CPM];int cTN=0;
 float cBH=999,cBC=999;
 float cKpH,cKiH,cKdH,cKpC,cKiC,cKdC;
+// cLastOk: czy OSTATNI test relay dla biezacej temperatury naprawde sie
+// udal (prawdziwy pomiar Ku/Tu), czy tez sciagnal do wartosci bazowych
+// (KP_BASE itd. - patrz "RELAY FAIL - bazowe" w runCal). Uzywane w savCP()
+// do poprawnego ustawienia Prof.valid - patrz komentarz przy savCP().
+bool cLastOk=false;
 #define CH 10
 float cEH[CH]={},cPwH[CH]={};int cHI=0;
 unsigned long cLI=0;
 String cSt="";
-#define CA 300000  // dochodzenie do temp bazowej (5 min max)
+#define CA 300000  // dochodzenie do temp bazowej (5 min max) - uzywane tez do cofniecia sie przed testem rampy
 #define CS 15000   // stabilizacja (15s)
-#define CT 60000   // strojenie (60s = 30 iteracji)
-#define CI  2000   // co 2s analizuj
+#define CT 60000   // strojenie (60s = 30 iteracji) - dlugosc jednego testu rampowania
+#define CI  2000   // co 2s analizuj/dostrajaj w trakcie testu rampowania
+
+// ── TEST ROMPOWANIA per RAMPA (po relay, na zyczenie) ──────────────
+// Relay (wyzej) mierzy TYLKO bazowy Kp/Ki/Kd dla danej temperatury - rampa
+// nie ma na to wplywu (savCP() kopiuje ten sam wynik do wszystkich ramp).
+// Ten test to NAPRAWIA: dla KAZDEJ rampy z calRamps[] osobno grzejemy z tym
+// konkretnym rampem do celu i patrzymy, czy AT trzyma sie ASP (spA) - jesli
+// nie, dostrajamy Kp/Ki/Kd (identyczna heurystyka co self-tune, patrz
+// runST() - oscylacje/nasycenie/za wolno/gorzej - ale WLASNA kopia bo dziala
+// w CAL, nie w AUTO). Tylko galaz GRZANIA (Kp_h/Ki_h/Kd_h) - to jest
+// jednoznacznie test grzania, cool zostaje z relay. Kazda rampa startuje OD
+// NOWA od bazowego profilu z relay (nie dziedziczy po poprzedniej rampie) -
+// powtarzalnosc, kazdy wynik niezalezny od kolejnosci testowania.
+#define RAMP_TEST_DROP    8.0f   // o ile C cofnac sie przed testem, zeby bylo co wjezdzac (updRamp() nic nie robi gdy spA juz ==spT)
+#define RAMP_TEST_OK_ERR  1.5f   // najlepszy |AT-ASP| w trakcie testu musi spasc ponizej tego, zeby wynik uznac za udany
+unsigned long cRT=0;             // ostatnia analiza/dostrojenie w tescie rampowania (co CI ms)
+float cRampBestErr=999;
+float cRampBestKpH=0,cRampBestKiH=0,cRampBestKdH=0;
 
 // ── RELAY FEEDBACK AUTOTUNING (Astrom-Hagglund + Tyreus-Luyben) ──
 // Standard przemyslowy. Zamiast zgadywac nastawy, MIERZY charakterystyke
@@ -262,6 +323,10 @@ int pi_(int ti,int ri){return ti*PR_N+ri;}
 int nTi(float t){int b=0;float bd=9999;for(int i=0;i<PT_N;i++){float d=abs(PT[i]-t);if(d<bd){bd=d;b=i;}}return b;}
 int nRi(float r){int b=0;float bd=9999;for(int i=0;i<PR_N;i++){float d=abs(PR[i]-r);if(d<bd){bd=d;b=i;}}return b;}
 
+// Ostatnia (temp,ramp) dla ktorej wczytano profil - do wykrycia zmiany celu
+// w trakcie dzialania AUTO (patrz ldProfIfChanged nizej).
+float ldProfSpT=-9999,ldProfRU=-9999;
+
 void ldProf(float temp,float ramp){
   int ti0=0,ti1=0,ri0=0,ri1=0;
   for(int i=0;i<PT_N-1;i++) if(temp>=PT[i]&&temp<=PT[i+1]){ti0=i;ti1=i+1;break;}
@@ -288,12 +353,42 @@ void ldProf(float temp,float ramp){
     if(htg){Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;}else{Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;}
     Serial.print("Prof: Kp=");Serial.print(Kp,1);Serial.print(" Ki=");Serial.print(Ki,2);Serial.print(" Kd=");Serial.println(Kd,2);
   }
+  ldProfSpT=temp;ldProfRU=ramp;
 }
 
-void savF(){FD fd;fd.cal=calDone;for(int i=0;i<P_TOT;i++) fd.p[i]=prof[i];fd.ru=rU;fd.rd=rD;fd.tm=tMax;fd.polSet=polSet;fd.polSw=polSw;fd.calMin=cTmn;fd.calMax=cTmx;pidFlash.write(fd);Serial.println("Flash: zapisano.");}
-void ldF(){FD fd;pidFlash.read(fd);if(fd.cal){calDone=true;for(int i=0;i<P_TOT;i++) prof[i]=fd.p[i];rU=fd.ru;rD=fd.rd;tMax=fd.tm;Serial.println("Flash: wczytano.");}if(fd.polSet){polSet=true;polSw=fd.polSw;}if(fd.calMin>=0&&fd.calMin<fd.calMax&&fd.calMax<=115){cTmn=fd.calMin;cTmx=fd.calMax;}}
-void savePol(){FD fd;pidFlash.read(fd);fd.polSet=true;fd.polSw=polSw;pidFlash.write(fd);}
-void rst(){calDone=false;for(int i=0;i<P_TOT;i++) prof[i]={10,0.3f,0.8f,10,0.3f,0.3f,false};Kp_h=Kp_c=Kp=10;Ki_h=Ki_c=Ki=0.3f;Kd_h=0.8f;Kd_c=Kd=0.3f;rU=rD=2;tMax=TEMP_MAX_DEF;ig=0;pe=0;Serial.println("Reset.");}
+// ldProf() wczesniej byl wolany TYLKO raz, w momencie startu AUTO - jesli
+// pozniej user zmienil TARGET (suwak SP, zawsze aktywny) w trakcie dzialania,
+// Kp/Ki/Kd zostawaly ze STAREGO celu, calkowicie ignorujac tabele kalibracji
+// dla nowej temperatury. To wola sie z kazdego throttlowanego cyklu AUTO -
+// jesli cel (spT) lub rampa (rU) zmienily sie od ostatniego wczytania o
+// wiecej niz 0.5, przeladuj interpolowany profil. Uwaga: to NIE jest pelny
+// "gain scheduling" po biezacej temperaturze w trakcie rampy (celowo - zeby
+// nie wprowadzac skokowych zmian Kp/Kd w trakcie samej rampy, co mogloby
+// zaburzyc dopiero co ustabilizowane sledzenie), tylko reakcja na wyrazna
+// zmiane CELU przez uzytkownika.
+void ldProfIfChanged(){
+  if(!calDone) return;
+  if(fabs(spT-ldProfSpT)>0.5f || fabs(rU-ldProfRU)>0.5f) ldProf(spT,rU);
+}
+
+void savF(){FD fd;fd.ver=FLASH_VER;fd.cal=calDone;for(int i=0;i<P_TOT;i++) fd.p[i]=prof[i];fd.ru=rU;fd.rd=rD;fd.tm=tMax;fd.polSet=polSet;fd.polSw=polSw;fd.calMin=cTmn;fd.calMax=cTmx;pidFlash.write(fd);Serial.println("Flash: zapisano.");}
+void ldF(){
+  FD fd;pidFlash.read(fd);
+  if(fd.ver!=FLASH_VER){
+    // Stary/inny layout (np. przed zmiana siatki ramp PR_N) - bajty NIE
+    // pasuja do aktualnego struct (przesuniete offsety), czytanie ich jako
+    // biezace pola dawaloby smieci (losowe Kp/Ki/Kd, polSw, zakres
+    // kalibracji). Ignorujemy CALA zawartosc - startujemy jak na czystym
+    // urzadzeniu (kalibracja i polaryzacja do zrobienia od nowa).
+    Serial.println("Flash: stary format (zmieniona siatka) - ignoruje, potrzebna nowa kalibracja.");
+    return;
+  }
+  if(fd.cal){calDone=true;for(int i=0;i<P_TOT;i++) prof[i]=fd.p[i];rU=fd.ru;rD=fd.rd;tMax=fd.tm;Serial.println("Flash: wczytano.");}
+  if(fd.polSet){polSet=true;polSw=fd.polSw;}
+  if(fd.calMin>=0&&fd.calMin<fd.calMax&&fd.calMax<=115){cTmn=fd.calMin;cTmx=fd.calMax;}
+}
+void savePol(){FD fd;pidFlash.read(fd);fd.ver=FLASH_VER;fd.polSet=true;fd.polSw=polSw;pidFlash.write(fd);}
+void rst(){calDone=false;for(int i=0;i<P_TOT;i++) prof[i]={10,0.3f,0.8f,10,0.3f,0.3f,false};Kp_h=Kp_c=Kp=10;Ki_h=Ki_c=Ki=0.3f;Kd_h=0.8f;Kd_c=Kd=0.3f;rU=rD=2;tMax=TEMP_MAX_DEF;ig=0;dInit=false;Serial.println("Reset.");}
 
 void wPwm(int o){lPwm=o;int h=o>0?o:0,c=o<0?-o:0;if(!polSw){analogWrite(PIN_M1A,h);analogWrite(PIN_M1B,c);}else{analogWrite(PIN_M1A,c);analogWrite(PIN_M1B,h);}}
 
@@ -322,10 +417,21 @@ void updSS(){
 #define TF 4
 float tfB[TF]={25,25,25,25};int tfI=0;
 float rdT(){
-  uint8_t f=tc.readFault();if(f){tcE=true;return lT;}
+  uint8_t f=tc.readFault();
+  if(f){
+    tcE=true;
+    if(!tcErrSent){Serial.print("ERR:code=1,bits=0x");Serial.print(f,HEX);Serial.println(",active=1");tcErrSent=true;}
+    return lT;
+  }
+  if(tcErrSent){Serial.println("ERR:code=1,active=0");tcErrSent=false;}
   tcE=false;float raw=tc.readThermocoupleTemperature();
   // Ochrona przed NaN i bezsensownymi wartosciami
-  if(isnan(raw)||raw<-50.0f||raw>200.0f){tcE=true;return lT;}
+  if(isnan(raw)||raw<-50.0f||raw>200.0f){
+    tcE=true;
+    if(!tcRangeErrSent){Serial.print("ERR:code=2,val=");Serial.print(isnan(raw)?9999.0f:raw,1);Serial.println(",active=1");tcRangeErrSent=true;}
+    return lT;
+  }
+  if(tcRangeErrSent){Serial.println("ERR:code=2,active=0");tcRangeErrSent=false;}
   float prev=tfB[(tfI-1+TF)%TF];if(abs(raw-prev)>8) raw=prev;
   tfB[tfI]=raw;tfI=(tfI+1)%TF;float s=0;for(int i=0;i<TF;i++) s+=tfB[i];
   lT=s/TF+calOffset;return lT;
@@ -360,7 +466,7 @@ void stStart(){
   stBKpH=Kp_h;stBKiH=Ki_h;stBKdH=Kd_h;
   stBKpC=Kp_c;stBKiC=Ki_c;stBKdC=Kd_c;
   for(int i=0;i<ST_HIST;i++){stEH[i]=0;stPH[i]=0;}stI=0;
-  ig=0;pe=0;
+  ig=0;dInit=false;
   Serial.print("ST START SP=");Serial.print(spT,1);Serial.print(" R=");Serial.println(rU,1);
 }
 void stStop(){
@@ -370,7 +476,7 @@ void stStop(){
   if(htg){Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;}else{Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;}
   int idx=pi_(nTi(spT),nRi(htg?rU:rD));
   prof[idx]={Kp_h,Ki_h,Kd_h,Kp_c,Ki_c,Kd_c,true};
-  calDone=true;ig=0;pe=0;
+  calDone=true;ig=0;dInit=false;
   stSt="OK zapisano";
   Serial.print("ST KONIEC Kp=");Serial.print(Kp,2);Serial.print(" Ki=");Serial.print(Ki,3);Serial.print(" Kd=");Serial.println(Kd,2);
   // Auto-zapis do Flash
@@ -417,33 +523,97 @@ void runST(float temp){
 }
 
 // ── Czysty PID (uproszczony, zoptymalizowany pod gladka linie) ────
+// Ta funkcja byla kilka rund temu przeglądana i poprawiana pod katem
+// konkretnych objawow (drganie, ff). Ponizsza wersja dodatkowo wciela DWIE
+// klasyczne, bardzo dobrze sprawdzone techniki z Arduino-PID-Library Bretta
+// Beauregarda (najpopularniejsza, uzywana od 2010 biblioteka PID na Arduino,
+// https://github.com/br3ttb/Arduino-PID-Library - patrz tez jej rozwiniecie
+// QuickPID) - a NIE podmiane calego PIDu na gotowa biblioteke, bo ta nie zna
+// naszej rampy (spA), dwoch osobnych zestawow Kp/Ki/Kd (grzanie/chlodzenie)
+// ani interpolowanej tabeli profili z kalibracji - musialaby i tak zostac
+// dookola owinieta ta sama logika.
 int compPID(float temp){
   float dt=PID_DT_MS/1000.0f,err=spA-temp;
 
-  // Kierunek na podstawie rampy. Przy zmianie - reset integratora i pochodnej.
-  bool rH=(spT>(spA-1.0f));
-  if(rH!=htg){
-    ig=0;htg=rH;
-    if(htg){Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;}
-    else   {Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;}
-  }
-
   bool atT=(fabs(spA-spT)<0.5f);
 
-  // ── INTEGRACJA z ANTI-WINDUP ────────────────────────
-  // Na rampie ograniczony zakres (zapobiega windup -> dziura przy celu).
-  // Przy celu pelny zakres (precyzyjne utrzymanie).
-  float igLim = atT ? INTEGRAL_MAX : (INTEGRAL_MAX*0.5f);
-  ig=constrain(ig+err*dt, -igLim, igLim);
+  // ── CALKA w JEDNOSTKACH WYJSCIA (anti-windup jak w Arduino-PID-Library) ──
+  // Beauregard: outputSum+=ki*error; potem klamrowanie outputSum do
+  // outMin/outMax (PRAWDZIWEGO zakresu aktuatora), a nie do jakiejs osobnej
+  // stalej. Wczesniej bylo tu: calkuj surowy blad (ig+=err*dt), pomnoz przez
+  // Ki DOPIERO na koncu, a limit calki to sztywna stala INTEGRAL_MAX
+  // (400) niezalezna od Ki. Problem: po kalibracji/self-tune Ki bywa bardzo
+  // rozne (rzedy wielkosci) - ta sama stala 400 raz pozwalala na spory
+  // windup, raz byla bez sensu ciasna. Calkujac OD RAZU w jednostkach
+  // wyjscia i klamrujac do realnego 0..PWM_MAX (grzanie) / -PWM_MAX..0
+  // (chlodzenie), limit automatycznie skaluje sie z Ki - dokladnie to, co
+  // "prawdziwy" anti-windup ma robic (calka nigdy nie moze sama pchac
+  // wyjscia poza to, co aktuator i tak może dac).
+  // igScale=0.5 na rampie: FF (nizej) juz robi wiekszosc roboty; pelny
+  // autorytet calki podczas rampy potrafil nabic "dziure" tuz przy celu.
+  float igScale = atT ? 1.0f : 0.5f;
+  ig += Ki*err*dt;
+  if(htg) ig=constrain(ig, 0.0f, (float)PWM_MAX*igScale);
+  else    ig=constrain(ig, -(float)PWM_MAX*igScale, 0.0f);
 
-  // ── POCHODNA z FILTREM ──────────────────────────────
-  // Surowa pochodna wzmacnia szum termopary -> drzenie PWM -> fale.
-  // Filtr dolnoprzepustowy wygladza pochodna (EMA, alfa=0.3).
-  float dRaw=(err-pe)/dt; pe=err;
-  dFilt = dFilt + 0.3f*(dRaw - dFilt);   // filtrowana pochodna
+  // ── POCHODNA z POMIARU (derivative on measurement) + FILTR ──────────
+  // Druga technika z Arduino-PID-Library: pochodna liczona z POMIARU
+  // (temp), NIE z BLEDU (err). Sam pomiar nigdy nie skacze skokowo -
+  // w przeciwienstwie do bledu, ktory moze skoczyc przy kazdej zmianie
+  // SP/rampy albo przeladowaniu profilu (ldProfIfChanged w trakcie AUTO).
+  // Liczac pochodna z bledu (jak wczesniej: dRaw=(err-pe)/dt), taki skok
+  // od razu wchodzil w Kd jako ostry, jednorazowy impuls mocy
+  // ("derivative kick") - klasyczny, dobrze udokumentowany blad w prostych
+  // implementacjach PID.
+  // dInit chroni PIERWSZY cykl po kazdym resecie (ig=0;dInit=false) - bez
+  // tego peT (stara/startowa wartosc) dawalby fikcyjny wielki skok
+  // pochodnej na jedna probke zaraz po starcie/zmianie kierunku/wyjsciu
+  // z kalibracji.
+  float dMeas;
+  if(!dInit){ peT=temp; dInit=true; dMeas=0.0f; }
+  else      { dMeas = -(temp-peT)/dt; peT=temp; }  // -d(temp)/dt ~ d(err)/dt gdy SP nie skacze
+  dFilt = dFilt + 0.15f*(dMeas - dFilt);   // filtrowana pochodna
 
-  // Wyjscie PID (czysty PID, pochodna filtrowana)
-  float out=Kp*err + Ki*ig + Kd*dFilt;
+  // ── FEED-FORWARD rampy ──────────────────────────────
+  // Wczesniej FF_GAIN byl zdefiniowany ale NIGDZIE nieuzywany (naglowek
+  // pliku mowil wprost "Czysty PID (bez FF)") - caly ciezar podazania za
+  // rosnaca rampa spoczywal na reaktywnym PID, co przy duzym Kd = drganie
+  // zamiast plynnego "pchania w gore". FF dodaje stala, NIESZUMIACA
+  // skladowa proporcjonalna do zadanej predkosci rampy - PID musi juz
+  // tylko lekko dokorygowywac, a nie w 100% reaktywnie goni cel. Aktywny
+  // TYLKO w trakcie rampy (nie przy juz osiagnietym celu, zeby nie psul
+  // precyzyjnego trzymania temperatury w miejscu).
+  // UWAGA: kierunek FF to (spT>spA) - kierunek RAMPY (dokad zmierza spA),
+  // NIE htg (kierunek REALNIE wypuszczanej mocy) - to dwie rozne rzeczy,
+  // patrz komentarz przy przelaczaniu kierunku nizej.
+  float ff = atT ? 0.0f : FF_GAIN*((spT>spA)?rU:-rD);
+
+  // Wyjscie PID (feed-forward + P + calka-w-jednostkach-wyjscia + D),
+  // policzone JESZCZE bez twardego obciecia do 0..PWM_MAX - potrzebne
+  // surowe (nieprzyciete) do decyzji o kierunku ponizej.
+  float out=ff + Kp*err + ig + Kd*dFilt;
+
+  // ── KIERUNEK: grzanie = zwiekszamy PWM, "chlodzenie" = zmniejszamy PWM
+  //    AZ do momentu w ktorym musimy odwrocic polaryzacje ────────────
+  // Metodyka (na zyczenie, bez zadnego sztucznego opoznienia): dopoki
+  // grzejemy, PID normalnie rosnie/maleje w gore/w dol PWM. Gdy trzeba
+  // mniej mocy, PWM po prostu spada w kierunku zera - to JEST "chlodzenie
+  // samym schodzeniem z PWM" (oddawanie ciepla do otoczenia), zaden osobny
+  // mechanizm nie jest do tego potrzebny, bo to sie dzieje samo przez
+  // normalny spadek wyjscia PID. Aktywne chlodzenie (ujemny PWM, odwrocenie
+  // Peltiera) wlacza sie DOKLADNIE w momencie, w ktorym SUROWE (nieprzyciete)
+  // wyjscie PID faktycznie przechodzi na ujemne - czyli nawet PWM=0 juz nie
+  // wystarcza i regulator "chce" isc jeszcze dalej. To jest fizyczna
+  // konieczna granica ("musimy odwrocic polaryzacje"), bez zadnej stalej
+  // typu limit czasu/margines - poprzednia wersja z 20s opoznieniem zostaje
+  // usunieta na wyrazne zyczenie.
+  // Przy przelaczeniu: reset calki/pochodnej (inny profil = inna skala) i
+  // podmiana Kp/Ki/Kd na drugi (juz skalibrowany osobno) zestaw.
+  if(htg && out<0.0f){
+    htg=false; ig=0; dInit=false; Kp=Kp_c;Ki=Ki_c;Kd=Kd_c;
+  } else if(!htg && out>0.0f){
+    htg=true; ig=0; dInit=false; Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;
+  }
 
   // ── TWARDA JEDNOKIERUNKOWOSC ─────────────────────────
   // Grzanie: tylko dodatni PWM. Chlodzenie: tylko ujemny. Bez mieszania.
@@ -483,13 +653,20 @@ void runRT(float t){
 }
 
 void bldCP(){cTN=0;float t=cTmn;while(t<=cTmx+0.1f&&cTN<CPM){cTP[cTN++]=t;t+=10;}}
-void stCalS(){sys=CAL;cPh=-1;cSt="Ustaw zakres";}
+void stCalS(){
+  // stOn=false: jesli self-tune byl aktywny gdy wchodzimy do kalibracji,
+  // zostawal wlaczony "w tle" (runST tylko wychodzi wczesnie bo sys!=AUTO,
+  // ale stOn nigdy sie nie czyscil) - po powrocie do AUTO bez wyraznego
+  // SELFTUNESTOP self-tune nagle sam wskakiwal z powrotem i zaczynal
+  // dostrajac Kp/Ki/Kd bez pytania.
+  sys=CAL;cPh=-1;cSt="Ustaw zakres";stOn=false;
+}
 void stCalR(){
   bldCP();cTi=cRi=cPh=cIt=0;cPT=millis();cBH=cBC=999;
   // Start od wartosci bazowych
   Kp_h=KP_BASE;Ki_h=KI_BASE;Kd_h=KD_BASE_H;Kp_c=KP_BASE;Ki_c=KI_BASE;Kd_c=KD_BASE_C;
   cKpH=Kp_h;cKiH=Ki_h;cKdH=Kd_h;cKpC=Kp_c;cKiC=Ki_c;cKdC=Kd_c;
-  for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;cLI=0;ig=0;pe=0;
+  for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;cLI=0;ig=0;dInit=false;
   spT=cTP[0];spA=lT;rU=rD=RAMP_MAX;
   int tot=cTN;  // relay: tylko temperatury (nie temp*rampa)
   char b[24];sprintf(b,"Start 1/%d",tot);cSt=String(b);
@@ -504,31 +681,64 @@ void stCalR(){
 void savCP(){
   // Relay: profil zalezy tylko od TEMPERATURY (nie od rampy).
   // Wypelnij WSZYSTKIE rampy tej temperatury tym samym profilem.
+  //
+  // WAZNE: valid=cLastOk, NIE na sztywno true. Wczesniej kazdy punkt -
+  // rowniez ten gdzie relay test sie nie udal i uzylismy wartosci
+  // bazowych ("RELAY FAIL - bazowe") - byl zapisywany jako valid=true.
+  // ldProf()/add() ufa flagi valid bez zadnej dodatkowej weryfikacji, wiec
+  // taki "fallbackowy" punkt byl w interpolacji nie do odroznienia od
+  // naprawde skalibrowanego - agresywne wartosci bazowe (Kp=10 itd., dobrane
+  // "na oko" jako start kalibracji, nie jako cos co ma dobrze trzymac
+  // temperature) potrafily wywolac trwala oscylacje przy trzymaniu SP w
+  // AUTO w okolicy takiego punktu (lub jego interpolowanego sasiedztwa).
+  // Komentarz w ldProf() przy przeskalowaniu przez wsum zaklada wlasnie, ze
+  // niekalibrowane punkty maja valid=false i wypadaja z interpolacji - to
+  // przywraca ten zamierzony efekt.
   int ti=nTi(cTP[cTi]);
   for(int ri=0;ri<PR_N;ri++){
     int idx=pi_(ti,ri);
-    prof[idx]={cKpH,cKiH,cKdH,cKpC,cKiC,cKdC,true};
+    prof[idx]={cKpH,cKiH,cKdH,cKpC,cKiC,cKdC,cLastOk};
   }
-  Serial.print("Prof T=");Serial.print(cTP[cTi],0);Serial.print(" (wszystkie rampy) Kp=");Serial.println(cKpH,1);
+  Serial.print("Prof T=");Serial.print(cTP[cTi],0);Serial.print(" (wszystkie rampy) Kp=");Serial.print(cKpH,1);
+  Serial.println(cLastOk?"":" [FALLBACK-bazowe, valid=0]");
 }
-void nxtCS(){
-  savCP();cTi++;  // relay: idziemy tylko po temperaturach
+// startRampPrep(): przed testem KAZDEJ rampy trzeba sie cofnac ponizej celu
+// (RAMP_TEST_DROP), bo updRamp() nic nie robi gdy spA juz ==spT - test
+// rampowania musialby "jechac" z zerowego dystansu. Startuje ZAWSZE od
+// bazowego profilu z relay (cKpH itd.), nie od wyniku poprzedniej rampy -
+// powtarzalnosc, kazdy wynik niezalezny od kolejnosci testowania ramp.
+void startRampPrep(){
+  cPh=4;cPT=millis();
+  float dropTo=cTP[cTi]-RAMP_TEST_DROP;
+  if(dropTo<TEMP_MIN_C+2.0f) dropTo=TEMP_MIN_C+2.0f;  // bezpiecznik - nie schodz ponizej sensownego zakresu
+  spT=dropTo;spA=lT;rU=rD=RAMP_MAX;  // pelna predkosc cofniecia, jak dojscie do temp bazowej
+  Kp_h=cKpH;Ki_h=cKiH;Kd_h=cKdH;Kp_c=cKpC;Ki_c=cKiC;Kd_c=cKdC;
+  ig=0;dInit=false;
+  char b[32];sprintf(b,"Ramp %d/%d: cofam sie",cRi+1,calRampN);cSt=String(b);
+}
+void finishTempPoint(){
+  // Wywolywane PO relay+savCP i PO wszystkich testach rampowania dla tej
+  // temperatury (albo od razu jesli calRampN==0) - przejdz do kolejnej
+  // temperatury albo zakoncz kalibracje.
+  cTi++;
   int tot=cTN,done=cTi;
   if(cTi>=cTN){calDone=true;savF();sys=MAN;stpPel();char b[24];sprintf(b,"DONE %d/%d",tot,tot);cSt=String(b);Serial.println("=== KAL. ZAKONCZONA ===");return;}
   cPh=0;cPT=millis();
   Kp_h=KP_BASE;Ki_h=KI_BASE;Kd_h=KD_BASE_H;Kp_c=KP_BASE;Ki_c=KI_BASE;Kd_c=KD_BASE_C;
-  spT=cTP[cTi];rU=rD=RAMP_MAX;spA=lT;ig=0;pe=0;
+  spT=cTP[cTi];rU=rD=RAMP_MAX;spA=lT;ig=0;dInit=false;
   char b[24];sprintf(b,"Temp %d/%d",done+1,tot);cSt=String(b);
 }
 // ── KALIBRACJA ────────────────────────────────────────────
-// Dla kazdego punktu (temp,rampa):
-//   Faza 0: dochodzenie do temp bazowej z pelna moca (60s)
+// Dla kazdej temperatury:
+//   Faza 0: dochodzenie do temp bazowej z pelna moca
 //   Faza 1: stabilizacja na temp bazowej (15s)
 //   RELAY FEEDBACK AUTOTUNING (standard przemyslowy Astrom-Hagglund)
-//   Faza 0: dojscie do temperatury bazowej (pelna predkosc)
-//   Faza 1: stabilizacja
 //   Faza 2: RELAY - wymus oscylacje przekaznikiem, zmierz Ku i Tu
-//   Faza 3: oblicz Kp/Ki/Kd (Tyreus-Luyben), zapisz, nastepny punkt
+//   Faza 3: oblicz Kp/Ki/Kd (Tyreus-Luyben), zapisz bazowy profil (savCP)
+//   Potem, DLA KAZDEJ rampy z calRamps[] (test rampowania, patrz wyzej):
+//   Faza 4: cofniecie sie RAMP_TEST_DROP ponizej celu
+//   Faza 5: grzanie z testowanym rampem do celu, sledzenie i dostrajanie
+//   Faza 6: zapisz wynik tej rampy, nastepna rampa albo nastepna temperatura
 void runCal(float temp){
   if(sys!=CAL||cPh==-1) return;
   unsigned long now=millis(),el=now-cPT;
@@ -538,7 +748,17 @@ void runCal(float temp){
     // Dochodzenie do temperatury bazowej - PELNA predkosc (szybki dojazd)
     rU=rD=RAMP_MAX;
     if(now-tR>=DT_R){tR=now;updRamp();}
-    setPwr(compPID(temp));
+    // WAZNE: compPID() zaklada stale dt=PID_DT_MS (100ms) miedzy wywolaniami
+    // (patrz jego komentarz "float dt=PID_DT_MS/1000.0f"). runCal() jest
+    // wolane z KAZDEJ iteracji loop() (bez throttlingu), a loop() na tym
+    // procku potrafi obrocic sie tysiace razy na 100ms - bez tej bramki
+    // compPID() bylby wolany tysiace razy "na sucho" z tym samym temp/err,
+    // za kazdym razem doliczajac 100ms do calki (ig+=err*dt) tak jakby
+    // naprawde minelo 100ms. Efekt: ig natychmiast saturuje do limitu
+    // anti-windup zamiast narastac w realnym czasie - integrator przestaje
+    // dzialac jak integrator. Throttlujemy do tego samego tP/PID_DT_MS co
+    // reszta systemu (AUTO/FREEZE nizej w loop()).
+    if(now-tP>=PID_DT_MS) setPwr(compPID(temp));
     char b[32];sprintf(b,"->%.0fC T=%.1f",cTP[cTi],temp);
     cSt=String(b);
     // Status dla aplikacji co 500ms (zeby okno postepu nie milczalo)
@@ -551,12 +771,13 @@ void runCal(float temp){
     }
     if(ae<2.0f||el>CA){
       cPh=1;cPT=now;cSt="Stabilizing...";
-      ig=0;pe=0;cLI=now;
+      ig=0;dInit=false;cLI=now;
     }
   }
   else if(cPh==1){
-    // Stabilizacja na temperaturze bazowej
-    setPwr(compPID(temp));
+    // Stabilizacja na temperaturze bazowej (patrz komentarz w cPh==0 -
+    // ta sama bramka throttlingu, z tego samego powodu).
+    if(now-tP>=PID_DT_MS) setPwr(compPID(temp));
     cSt="Stabil "+String((CS-el)/1000)+"s";
     if(now-cLI>=500){
       cLI=now;
@@ -577,7 +798,7 @@ void runCal(float temp){
       relayWasAbove=(temp>spT);
       relayState=(temp<spT);
       cLI=now;  // dla throttlingu logow
-      ig=0;pe=0;
+      ig=0;dInit=false;
       cSt="Relay test...";
     }
   }
@@ -688,6 +909,7 @@ void runCal(float temp){
       Kd_new=constrain(Kd_new,KD_MIN,KD_MAX);
       cKpH=Kp_new;cKiH=Ki_new;cKdH=Kd_new;
       cKpC=Kp_new;cKiC=Ki_new;cKdC=Kd_new;
+      cLastOk=true;
       Serial.print("RELAY T=");Serial.print(cTP[cTi],0);
       Serial.print(" a=");Serial.print(aAvg,1);Serial.print(" Tu=");Serial.print(Tu,1);
       Serial.print(" Ku=");Serial.print(Ku,1);
@@ -696,6 +918,7 @@ void runCal(float temp){
     } else {
       cKpH=KP_BASE;cKiH=KI_BASE;cKdH=KD_BASE_H;
       cKpC=KP_BASE;cKiC=KI_BASE;cKdC=KD_BASE_C;
+      cLastOk=false;
       Serial.println("RELAY FAIL - bazowe");
       // Sygnal dla aplikacji PC (masz surowa konsole czy nie - to trafi do GUI):
       // ten punkt NIE zostal naprawde skalibrowany, uzyto wartosci bazowych.
@@ -710,7 +933,94 @@ void runCal(float temp){
     }
     // wyczysc tablice na nastepna temperature
     for(int i=0;i<RELAY_CYCLES;i++){relayAmps[i]=relayPers[i]=0;}
-    nxtCS();
+    savCP();  // bazowy profil z relay -> wszystkie rampy tej temperatury (fallback zanim/jesli testy rampowania je dopracuja)
+    if(calRampN>0){ cRi=0; startRampPrep(); }
+    else{ finishTempPoint(); }
+  }
+  else if(cPh==4){
+    // ── Cofniecie sie przed testem tej rampy (patrz startRampPrep()) ──
+    if(now-tR>=DT_R){tR=now;updRamp();}
+    if(now-tP>=PID_DT_MS) setPwr(compPID(temp));  // throttling - patrz komentarz w cPh==0
+    char b[32];sprintf(b,"Ramp %d/%d: ->%.0fC",cRi+1,calRampN,spT);cSt=String(b);
+    if(now-cLI>=500){
+      cLI=now;
+      int tot=cTN,done=cTi+1;
+      Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
+      Serial.print(tot);Serial.print(",T=");Serial.print(cTP[cTi],0);
+      Serial.print(",R=rampprep:");Serial.println(calRamps[cRi],0);
+    }
+    if(ae<2.0f||el>CA){
+      // Gotowe do jazdy w gore - ustaw PRAWDZIWY cel i testowany rampe.
+      cPh=5;cPT=now;cRT=now;
+      spT=cTP[cTi];rU=rD=calRamps[cRi];
+      cRampBestErr=999;cRampBestKpH=Kp_h;cRampBestKiH=Ki_h;cRampBestKdH=Kd_h;
+      for(int i=0;i<CH;i++){cEH[i]=cPwH[i]=0;}cHI=0;
+      ig=0;dInit=false;cLI=now;
+    }
+  }
+  else if(cPh==5){
+    // ── TEST ROMPOWANIA: grzej z testowanym rampem, sledz i dostrajaj ──
+    if(now-tR>=DT_R){tR=now;updRamp();}
+    if(now-tP>=PID_DT_MS) setPwr(compPID(temp));
+    char b[32];sprintf(b,"Ramp %d/%d @%.0f",cRi+1,calRampN,calRamps[cRi]);cSt=String(b);
+    // Co CI ms: identyczna heurystyka co self-tune (patrz runST()) - ale
+    // TYLKO galaz grzania (ten test explicitnie tylko grzeje, patrz
+    // komentarz przy #define RAMP_TEST_DROP wyzej). Jesli akurat htg==false
+    // (chwilowe pasywne chlodzenie przy przeregulowaniu) - pomijamy analize
+    // tego tyknienia, nie ma co dostrajac galezi ktora teraz nie steruje.
+    if(now-cRT>=CI){
+      cRT=now;
+      if(htg){
+        float e=spA-temp,ae2=fabs(e);
+        cEH[cHI]=e;cPwH[cHI]=(float)lPwm;cHI=(cHI+1)%CH;
+        int sc=0;for(int i=0;i<CH-1;i++){int a=i,b=(i+1)%CH;if(cEH[a]*cEH[b]<0)sc++;}
+        bool osc=(sc>=3);
+        int sat=0;for(int i=0;i<CH;i++) if(fabs(cPwH[i])>=PWM_MAX-5) sat++;
+        bool satd=(sat>=CH-1);
+        int pi2=(cHI-2+CH)%CH,ci2=(cHI-1+CH)%CH;
+        float tr=fabs(cEH[ci2])-fabs(cEH[pi2]);
+        bool im=(tr<-0.1f),wo=(tr>0.3f);
+        if(osc){Kp_h=constrain(Kp_h*(1-ST_ADJ*1.5f),KP_MIN,KP_MAX);Kd_h=constrain(Kd_h*(1-ST_ADJ),KD_MIN,KD_MAX);Ki_h=constrain(Ki_h*(1-ST_ADJ*0.5f),KI_MIN,KI_MAX);ig*=0.5f;}
+        else if(satd&&ae2>2){/* nasycone PWM - nic nie da sie wiecej wycisnac, czekaj */}
+        else if(ae2>8&&!im){Kp_h=constrain(Kp_h*(1+ST_ADJ*2),KP_MIN,KP_MAX);}
+        else if(ae2>3&&wo){Kp_h=constrain(Kp_h*(1+ST_ADJ),KP_MIN,KP_MAX);}
+        else if(ae2>ST_DEAD&&im){Ki_h=constrain(Ki_h*(1+ST_ADJ*0.5f),KI_MIN,KI_MAX);}
+        Kp=Kp_h;Ki=Ki_h;Kd=Kd_h;
+        if(ae2<cRampBestErr){cRampBestErr=ae2;cRampBestKpH=Kp_h;cRampBestKiH=Ki_h;cRampBestKdH=Kd_h;}
+      }
+    }
+    if(now-cLI>=500){
+      cLI=now;
+      int tot=cTN,done=cTi+1;
+      Serial.print("CALSTAT:");Serial.print(done);Serial.print("/");
+      Serial.print(tot);Serial.print(",T=");Serial.print(cTP[cTi],0);
+      Serial.print(",R=ramptest:");Serial.println(calRamps[cRi],0);
+    }
+    if(el>=CT){ cPh=6; cPT=now; }
+  }
+  else if(cPh==6){
+    // ── Zapisz wynik tej rampy (tylko galaz grzania), nastepna rampa/temp ──
+    int ti=nTi(cTP[cTi]),ri=nRi(calRamps[cRi]);
+    int idx=pi_(ti,ri);
+    bool ok=(cRampBestErr<RAMP_TEST_OK_ERR);
+    if(ok){
+      prof[idx].Kp_h=cRampBestKpH;prof[idx].Ki_h=cRampBestKiH;prof[idx].Kd_h=cRampBestKdH;
+      prof[idx].valid=true;
+      Serial.print("RAMPTEST T=");Serial.print(cTP[cTi],0);Serial.print(" R=");Serial.print(calRamps[cRi],0);
+      Serial.print(" err=");Serial.print(cRampBestErr,2);
+      Serial.print(" Kp=");Serial.print(cRampBestKpH,2);Serial.print(" Ki=");Serial.print(cRampBestKiH,3);
+      Serial.print(" Kd=");Serial.println(cRampBestKdH,2);
+    } else {
+      // Nie udalo sie zejsc ponizej progu - zostaw bazowy profil z relay
+      // (juz tam jest, savCP() go wpisal wczesniej) i ostrzez apke PC.
+      Serial.print("CALWARN:T=");Serial.print(cTP[cTi],0);
+      Serial.print(",R=");Serial.print(calRamps[cRi],0);
+      Serial.print(",err=");Serial.print(cRampBestErr,2);
+      Serial.println(",ramp_track_fail");
+    }
+    cRi++;
+    if(cRi<calRampN){ startRampPrep(); }
+    else{ finishTempPoint(); }
   }
 }
 
@@ -738,7 +1048,7 @@ void hBtn(){
         sys=AUTO;
         // Start zawsze od aktualnej temperatury (nie 30C) – brak skoku
         spA=lT;
-        ig=0;pe=0;slT=0;tR=millis();
+        ig=0;dInit=false;slT=0;tR=millis();
         if(calDone) ldProf(spT,rU);
         // BEZ auto-start self-tune – uzywaj zapisanych parametrow
         // Self-tune trzeba uruchomic recznie z menu
@@ -835,9 +1145,13 @@ void drwCal(float temp){
   oled.drawHLine(0,12,128);
   // Temp duza (y=16-36)
   oled.setFont(u8g2_font_10x20_tf);oled.drawStr(0,36,(fts(temp,1)+"C").c_str());
-  // Cel T/R - prawa strona, ponizej paska (y=28)
+  // Cel T - prawa strona, ponizej paska (y=28). Tryb relay nie ma pojecia
+  // "rampy" (jeden test na temperature, wypelnia wszystkie rampy) - wczesniej
+  // bylo tu "R%.0f" z calRamps[cRi], ale cRi nigdy sie nie zmienia w tym
+  // trybie wiec zawsze pokazywalo pierwsza z listy (2C/min), mylnie sugerujac
+  // ze akurat testujemy przy tej rampie.
   oled.setFont(u8g2_font_6x10_tf);
-  if(cTi<cTN){char b[24];sprintf(b,"T%.0f R%.0f",cTP[cTi],calRamps[cRi]);
+  if(cTi<cTN){char b[24];sprintf(b,"T%.0f",cTP[cTi]);
     int bw=oled.getStrWidth(b);oled.drawStr(128-bw,28,b);}
   oled.drawStr(0,49,cSt.c_str());
   String ps=String(htg?"H":"C")+" Kp"+fts(Kp,1)+" Ki"+fts(Ki,2);oled.drawStr(0,61,ps.c_str());
@@ -872,7 +1186,7 @@ void setup(){
   pinMode(PIN_M1A,OUTPUT);pinMode(PIN_M1B,OUTPUT);analogWrite(PIN_M1A,0);analogWrite(PIN_M1B,0);
   pinMode(PIN_M2A,OUTPUT);pinMode(PIN_M2B,OUTPUT);analogWrite(PIN_M2A,0);analogWrite(PIN_M2B,0);
   pinMode(PIN_BTN1,INPUT_PULLUP);pinMode(PIN_BTN2,INPUT_PULLUP);
-  if(!tc.begin()) Serial.println("ERROR: MAX31856!");
+  if(!tc.begin()){Serial.println("ERROR: MAX31856!");Serial.println("ERR:code=4,msg=init_fail,active=1");}
   tc.setThermocoupleType(MAX31856_TCTYPE_K);
   // Druga termopara (pomiar dodatkowy) - osobny CS, ta sama magistrala SPI.
   // Zawsze inicjalizuj i zawsze probuj czytac - jesli modulu nie ma,
@@ -940,9 +1254,15 @@ void procCmd(String c){
   key.toUpperCase();
   float fv=val.toFloat();
 
-  if(key=="SP"){ spT=constrain(fv,SP_MIN,SP_MAX); }
-  else if(key=="RU"){ rU=constrain(fv,RAMP_MIN,RAMP_MAX); }
-  else if(key=="RD"){ rD=constrain(fv,RAMP_MIN,RAMP_MAX); }
+  // SP/RU/RD podczas CAL lub FREEZE: IGNORUJ. W obu trybach spT/rU/rD sa
+  // zarzadzane WEWNETRZNIE (kalibracja: cel biezacego punktu; freeze: stala
+  // temperatura docelowa galu) - apka PC ma suwaki TARGET/RATE zawsze
+  // aktywne (mozna je ustawiac przed polaczeniem), wiec przypadkowe
+  // przesuniecie suwaka w trakcie kalibracji/freeze wczesniej po cichu
+  // psulo trwajacy pomiar / zaburzalo utrzymanie temperatury galu.
+  if(key=="SP"){ if(sys!=CAL&&sys!=FREEZE) spT=constrain(fv,SP_MIN,SP_MAX); }
+  else if(key=="RU"){ if(sys!=CAL&&sys!=FREEZE) rU=constrain(fv,RAMP_MIN,RAMP_MAX); }
+  else if(key=="RD"){ if(sys!=CAL&&sys!=FREEZE) rD=constrain(fv,RAMP_MIN,RAMP_MAX); }
   else if(key=="TMAX"){ tMax=constrain(fv,TMAX_MIN,TMAX_MAX); }
   else if(key=="KP"){ Kp=constrain(fv,KP_MIN,KP_MAX); }
   else if(key=="KI"){ Ki=constrain(fv,KI_MIN,KI_MAX); }
@@ -950,7 +1270,7 @@ void procCmd(String c){
   else if(key=="OFFSET"){ calOffset=constrain(fv,-20.0f,20.0f); }
   else if(key=="START"){
     if(sys==MAN){
-      sys=AUTO;spA=lT;ig=0;pe=0;slT=0;tR=millis();
+      sys=AUTO;spA=lT;ig=0;dInit=false;slT=0;tR=millis();
       dFilt=0;pwmFilt=0;   // reset filtrow - bez naleciaosci z poprzedniego cyklu
       rampT0=millis();
       if(calDone) ldProf(spT,rU);
@@ -969,7 +1289,7 @@ void procCmd(String c){
   else if(key=="FREEZE"){
     // Tryb zamrazania galu - lagodne zejscie do FREEZE_TARGET i AKTYWNE utrzymanie.
     // Nie wylacza Peltiera (zapobiega odbiciu ciepla i ponownemu stopieniu galu).
-    sys=FREEZE; spT=FREEZE_TARGET; spA=lT; ig=0; pe=0; slT=0;
+    sys=FREEZE; spT=FREEZE_TARGET; spA=lT; ig=0; dInit=false; slT=0;
     rU=rD=FREEZE_RAMP; stOn=false; frzReady=false; frzStableT=0;
     Serial.print("FREEZE START -> target ");Serial.print(FREEZE_TARGET,0);
     Serial.println("C (gal solid)");
@@ -996,10 +1316,18 @@ void procCmd(String c){
   else if(key=="SELFTUNE"){ if(sys==AUTO) stStart(); }
   else if(key=="SELFTUNESTOP"){ if(stOn) stStop(); }
   else if(key=="AUTOCAL"){
-    // Pelna automatyczna kalibracja wszystkich profili
-    sys=CAL; cPh=-1;
-    stCalR();  // start kalibracji od razu
-    Serial.println("AUTOCAL START");
+    // Przycisk "start kalibracji" w apce jest ZAWSZE klikalny (nawet w
+    // trakcie trwajacej kalibracji) - bez tej bramki powtorne/przypadkowe
+    // kliknieciecie po cichu restartowalo caly przebieg od zera, tracac
+    // caly dotychczasowy postep bez ostrzezenia.
+    if(sys==CAL){
+      Serial.println("AUTOCAL ignored - juz trwa (uzyj AUTOCALSTOP zeby przerwac)");
+    } else {
+      // Pelna automatyczna kalibracja wszystkich profili
+      sys=CAL; cPh=-1; stOn=false;  // patrz komentarz w stCalS()
+      stCalR();  // start kalibracji od razu
+      Serial.println("AUTOCAL START");
+    }
   }
   else if(key=="CALRANGE"){
     // CALRANGE:30,80 - ustaw zakres kalibracji (temp od, temp do)
@@ -1154,9 +1482,12 @@ void loop(){
       if(!isnan(r2) && r2>-50 && r2<200) temp2=r2;
       else temp2=NAN;
     }
-    if(temp>tMax&&sys!=MAN){stpPel();sys=MAN;stOn=false;if(fanOn){fanRunonActive=true;fanRunonT=now;}Serial.println("!!! TEMP MAX - STOP !!!");}
+    if(temp>tMax&&sys!=MAN){stpPel();sys=MAN;stOn=false;if(fanOn){fanRunonActive=true;fanRunonT=now;}
+      Serial.print("ERR:code=3,temp=");Serial.print(temp,1);Serial.print(",limit=");Serial.println(tMax,1);
+      Serial.println("!!! TEMP MAX - STOP !!!");}
     switch(sys){
       case AUTO:
+        ldProfIfChanged();  // przeladuj Kp/Ki/Kd jesli TARGET/RATE zmienily sie w locie
         if(temp<TEMP_MIN_C&&lPwm<0) stpPel();else setPwr(compPID(temp));
         Serial.print(now/1000.0f,1);Serial.print(",");Serial.print(temp,2);Serial.print(",");
         Serial.print(spA,2);Serial.print(",");Serial.print(spT,2);Serial.print(",");
