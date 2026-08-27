@@ -61,7 +61,7 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.6"
+APP_BUILD = "2026-08-25.8"
 
 # Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
 # PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
@@ -281,6 +281,27 @@ class PeltierControl:
         self.reach_time = None       # ile trwalo dotarcie [s]
         self.reach_avg_rate = None   # srednia rampa [C/min]
         self.last_setpoint_target = None
+
+        # ── OSOBNE sledzenie FAZY RAMPY (nie mylic z reach_* wyzej) ──────
+        # PROBLEM ktory to naprawia: "AVG RATE" i "avg ...C/min" w pasku
+        # liczyly sie od startu AZ DO wejscia w +/-0.5C od celu - czyli
+        # RAZEM z ogonem dochodzenia, ktory potrafi trwac dluzej niz sama
+        # rampa. Przy zadanych 30 C/min pokazywalo "avg 12.16 C/min", co
+        # wyglada jakby rampa jechala 2.5x za wolno, a w rzeczywistosci
+        # rampa jechala ~26 C/min i dopiero DOJAZD do ostatniego 0.5C
+        # zabral reszte czasu. Te dwie rzeczy trzeba mierzyc OSOBNO, bo
+        # naprawia sie je zupelnie innymi zmianami (tempo rampy = FF,
+        # ogon dojazdu = kompensacja strat + calka).
+        # Faza rampy = dopoki GENERATOR rampy (setpoint aktywny spA) jeszcze
+        # jedzie do celu. Gdy spA dojedzie, rampa sie skonczyla - niezaleznie
+        # od tego, gdzie jest realna temperatura.
+        self.ramp_t0 = None          # czas startu rampy
+        self.ramp_temp0 = None       # temp na starcie rampy
+        self.ramp_done = False       # czy generator rampy dojechal
+        self.ramp_secs = None        # ile trwala sama rampa [s]
+        self.ramp_rate = None        # REALNE tempo osiagniete w rampie [C/min]
+        self.ramp_cmd_rate = None    # tempo ZADANE (z panelu) [C/min]
+        self.ramp_lag = None         # ile brakowalo do celu gdy rampa sie skonczyla [C]
 
         # Polaryzacja i zakres kalibracji (z urzadzenia)
         self.dev_pol_swapped = False
@@ -2157,11 +2178,53 @@ class PeltierControl:
         self.series_e_return_rate = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
                                               font=(FONT, fsz(11), 'bold'), relief='flat',
                                               insertbackground=C['text'])
-        self.series_e_return_rate.insert(0, "25.0")
+        # ZMIANA po analizie logu 20260827 145616 (uskok/"garb" na starcie
+        # kazdego powrotu): domyslne 25.0 bylo WOLNIEJSZE niz naturalne
+        # (pasywne, przy wentylatorach 100%) chlodzenie obiektu zaraz po
+        # goracym hold - w danych widac realny spadek temp od razu po
+        # starcie liczacy sie w dziesiatkach C/min, znacznie szybszy niz
+        # komenderowane 25. Skutek: rampa (spA) natychmiast zostawala W
+        # TYLE ZA REALNYM spadkiem (temp<spA), PID odczytywal to jako
+        # "za zimno za wczesnie" i dogrzewal, zeby WYHAMOWAC chlodzenie do
+        # komenderowanego tempa - stad widoczny odbity "garb" (temp chwilowo
+        # ROSNIE) tuz po starcie kazdego powrotu. Firmware juz ma dokladnie
+        # ten sam wzorzec ("pelna predkosc cofniecia") dla innych powrotow
+        # do bazy (patrz rU=rD=RAMP_MAX w .ino) - tu robimy to samo: bardzo
+        # duza wartosc, ktora firmware i tak bezpiecznie przytnie do swojego
+        # RAMP_MAX (constrain(fv,RAMP_MIN,RAMP_MAX) na komendzie RD) - wiec
+        # rampa NIGDY nie jest wolniejsza od naturalnego chlodzenia i nie ma
+        # czego "wyhamowywac" dogrzewaniem. Nadal edytowalne recznie w polu
+        # (np. jesli ktos chce CELOWO wolniejszy, kontrolowany powrot).
+        self.series_e_return_rate.insert(0, "80.0")
         self.series_e_return_rate.pack(fill='x', ipady=4)
         tk.Label(lin,
                  text="wlasne, SZYBKIE tempo - niezalezne od COOL RATE na\n"
-                      "CONTROL (ten zostaje bez zmian, przywracany po serii)",
+                      "CONTROL (ten zostaje bez zmian, przywracany po serii).\n"
+                      "Domyslnie max (firmware i tak przytnie) - patrz komentarz\n"
+                      "w kodzie: wolniejsze tempo tu daje 'garb' na starcie powrotu.",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(7)), justify='left'
+                 ).pack(anchor='w', pady=(2, 0))
+
+        # Zjazd jako PELNOPRAWNY TEST, a nie tylko dojazd do pozycji startowej.
+        # PO CO: caly model mocy (FF_GAIN/FF_TEMP_GAIN w firmware) jest
+        # skalibrowany z danych GRZANIA - dla chlodzenia nie mamy zadnej
+        # rzetelnej kalibracji, bo dotychczasowe zjazdy byly robione stalym,
+        # szybkim tempem powrotu (i wczesniej w ogole nie archiwizowane).
+        # Zaznaczenie tego pola sprawia, ze zjazd po kazdym tescie leci w
+        # TYM SAMYM tempie co test - czyli seria R10..R70 daje komplet
+        # 7 przebiegow grzania I 7 przebiegow chlodzenia w roznych tempach,
+        # dokladnie to, czego potrzeba do skalibrowania galezi chlodzenia
+        # ta sama metoda co grzania.
+        self.series_cool_as_test = tk.BooleanVar(value=False)
+        tk.Checkbutton(lin, text="zjazd tez jako TEST (w tempie testu)",
+                       variable=self.series_cool_as_test,
+                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                       activebackground=C['panel'], activeforeground=C['text'],
+                       font=(FONT, fsz(8)), bd=0, highlightthickness=0,
+                       anchor='w').pack(anchor='w', fill='x', pady=(8, 0))
+        tk.Label(lin,
+                 text="daje komplet danych do kalibracji CHLODZENIA\n"
+                      "(inaczej zjazd leci max tempem = tylko powrot)",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(7)), justify='left'
                  ).pack(anchor='w', pady=(2, 0))
 
@@ -2866,6 +2929,7 @@ class PeltierControl:
                     self.reach_time = None
                     self.reach_avg_rate = None
                     self.last_setpoint_target = st
+                    self._ramp_reset(now2, temp, st)
                 elif self.cyc_on and state == 'MAN' and prev in ('AUTO', 'COOLDOWN', 'FREEZE', 'FREEZE_READY'):
                     # Koniec cyklu - przejscie z pracy do MAN (STOP).
                     # Bez cooldown teraz idzie prosto AUTO->MAN.
@@ -2880,6 +2944,18 @@ class PeltierControl:
                         self.reach_target = st
                         self.reach_done = False
                         self.last_setpoint_target = st
+                        self._ramp_reset(now2, temp, st)
+
+                # Koniec FAZY RAMPY = generator rampy (spA) dojechal do celu.
+                # Liczymy to ZANIM sprawdzimy dotarcie temperatury, zeby obie
+                # miary byly niezalezne (patrz komentarz przy self.ramp_t0).
+                if (state == 'AUTO' and not self.ramp_done
+                        and self.ramp_t0 is not None and abs(sa - st) <= 0.05):
+                    self.ramp_done = True
+                    self.ramp_secs = now2 - self.ramp_t0
+                    if self.ramp_secs > 1.0 and self.ramp_temp0 is not None:
+                        self.ramp_rate = (temp - self.ramp_temp0) / (self.ramp_secs / 60.0)
+                    self.ramp_lag = st - temp
 
                 # Sprawdz czy osiagnieto setpoint (w granicach 0.5C, stabilnie)
                 if (state == 'AUTO' and not self.reach_done
@@ -2916,6 +2992,24 @@ class PeltierControl:
 
         self.root.after(250, self.tick)
 
+    def _ramp_reset(self, t0, temp0, target):
+        """Zacznij liczyc NOWA faze rampy (patrz komentarz przy self.ramp_t0)."""
+        self.ramp_t0 = t0
+        self.ramp_temp0 = temp0
+        self.ramp_done = False
+        self.ramp_secs = None
+        self.ramp_rate = None
+        self.ramp_lag = None
+        # Tempo ZADANE bierzemy z tego suwaka, ktory odpowiada kierunkowi
+        # przejscia - w gore HEAT RATE, w dol COOL RATE.
+        try:
+            if target is not None and temp0 is not None and target < temp0:
+                self.ramp_cmd_rate = self.sl_rd.get()
+            else:
+                self.ramp_cmd_rate = self.sl_ru.get()
+        except Exception:
+            self.ramp_cmd_rate = None
+
     def update_cards(self):
         if not self.t: return
         temp = self.temp[-1]; spt = self.spt[-1]; pwm = self.pwm[-1]
@@ -2925,20 +3019,35 @@ class PeltierControl:
         if 'temp2' in self.cards:
             self.cards['temp2']['val'].config(text=f"{t2:.2f}" if t2 is not None else "--")
         self.cards['sp']['val'].config(text=f"{spt:.1f}")
-        # AVG RATE - srednie tempo przejscia (od startu dochodzenia do teraz)
-        # Bardziej uzyteczne niz chwilowe - pokazuje realna srednia rampe
+        # AVG RATE - tempo SAMEJ RAMPY (nie licząc ogona dojazdu).
+        # Wczesniej liczylo sie az do wejscia w +/-0.5C od celu, wiec ogon
+        # dojazdu zanizal wynik nawet 2.5x (patrz komentarz przy self.ramp_t0)
+        # i karta pokazywala 12.2 przy zadanych 30. Teraz: w trakcie rampy
+        # tempo liczone od jej startu, a po jej zakonczeniu ZAMROZONE na
+        # wartosci osiagnietej w rampie - dzieki temu widac wprost, czy
+        # rampa nadaza za zadanym RATE.
         avg_rate = 0.0
-        if (self.reach_start_t is not None and self.reach_start_temp is not None
+        if self.ramp_done and self.ramp_rate is not None:
+            avg_rate = self.ramp_rate
+        elif (self.ramp_t0 is not None and self.ramp_temp0 is not None
                 and self.t and self.cur_state == 'AUTO'):
-            elapsed = self.t[-1] - self.reach_start_t
+            elapsed = self.t[-1] - self.ramp_t0
             if elapsed > 2:  # min 2s zeby uniknac dzielenia przez male liczby
-                avg_rate = (temp - self.reach_start_temp) / (elapsed / 60.0)
-        # Po dotarciu pokaz finalna srednia
-        if self.reach_done and self.reach_avg_rate is not None:
-            d = getattr(self, 'reach_dir', '')
-            sign = 1 if d == 'HEAT' else -1
-            avg_rate = sign * self.reach_avg_rate
+                avg_rate = (temp - self.ramp_temp0) / (elapsed / 60.0)
         self.cards['rate']['val'].config(text=f"{avg_rate:+.1f}")
+        # Kolor karty = jak blisko ZADANEGO tempa (zielony >=95%, zolty >=85%)
+        try:
+            cmd = self.ramp_cmd_rate
+            if cmd and abs(cmd) > 0.1 and abs(avg_rate) > 0.1:
+                frac = abs(avg_rate) / abs(cmd)
+                rcol = (C['green'] if frac >= 0.95 else
+                        (C['yellow'] if frac >= 0.85 else C['red']))
+                self.cards['rate']['unit_lbl'].config(
+                    text=f"°C/min  {frac*100:.0f}% zad.", fg=rcol)
+            else:
+                self.cards['rate']['unit_lbl'].config(text="°C/min", fg=C['dim2'])
+        except Exception:
+            pass
         # PWM + kierunek (HEAT/COOL/HOLD widoczny w jednostce)
         diff = spt - temp
         arrow = "% ▲HEAT" if diff > 0.3 else ("% ▼COOL" if diff < -0.3 else "% ●HOLD")
@@ -2957,11 +3066,27 @@ class PeltierControl:
             elif self.reach_done and self.reach_time is not None:
                 m = int(self.reach_time // 60); s = int(self.reach_time % 60)
                 tstr = f"{m}m {s}s" if m > 0 else f"{s}s"
-                rate_str = f"{self.reach_avg_rate:.2f}" if self.reach_avg_rate else "?"
                 d = getattr(self, 'reach_dir', '')
                 dcol = C['red'] if d == 'HEAT' else C['cyan']
-                self.reach_lbl.config(
-                    text=f"✓ {d} REACHED in {tstr} · avg {rate_str}°C/min", fg=dcol)
+                # ROZBICIE na dwie osobne liczby zamiast jednej mylacej
+                # sredniej (patrz komentarz przy self.ramp_t0): ile jechala
+                # sama RAMPA i z jakim tempem vs zadane, a osobno ile trwal
+                # DOJAZD (ogon) po zakonczeniu rampy. To sa dwa rozne
+                # problemy i naprawia sie je czym innym.
+                if self.ramp_rate is not None and self.ramp_secs is not None:
+                    cmd = self.ramp_cmd_rate
+                    pct = (f" ({abs(self.ramp_rate)/abs(cmd)*100:.0f}% z {abs(cmd):.0f})"
+                           if cmd and abs(cmd) > 0.1 else "")
+                    tail = max(0.0, self.reach_time - self.ramp_secs)
+                    lag = f" · zostalo {self.ramp_lag:+.2f}°C" if self.ramp_lag is not None else ""
+                    self.reach_lbl.config(
+                        text=(f"✓ {d} · rampa {abs(self.ramp_rate):.1f}°C/min{pct}"
+                              f" w {self.ramp_secs:.0f}s{lag} · dojazd +{tail:.0f}s"),
+                        fg=dcol)
+                else:
+                    rate_str = f"{self.reach_avg_rate:.2f}" if self.reach_avg_rate else "?"
+                    self.reach_lbl.config(
+                        text=f"✓ {d} REACHED in {tstr} · avg {rate_str}°C/min", fg=dcol)
             elif (self.cur_state == 'AUTO' and self.reach_start_t is not None
                   and not self.reach_done):
                 # W trakcie dochodzenia - pokaz uplyniety czas
@@ -3200,7 +3325,17 @@ class PeltierControl:
         try:
             return_rate = float(self.series_e_return_rate.get().replace(',', '.'))
         except (ValueError, AttributeError):
-            return_rate = 25.0
+            return_rate = 80.0  # bezpieczny fallback = domyslny "max" (patrz build_series)
+        # Tryb "zjazd tez jako TEST" - zjezdzamy w tempie tego samego kroku
+        # serii co grzanie, zeby zebrac dane do kalibracji chlodzenia
+        # (patrz komentarz przy self.series_cool_as_test w build_series).
+        cool_is_test = False
+        try:
+            cool_is_test = bool(self.series_cool_as_test.get())
+        except AttributeError:
+            pass
+        if cool_is_test and self.series_idx < len(self.series_steps):
+            return_rate = self.series_steps[self.series_idx]['rate']
         # Wlasne SZYBKIE tempo powrotu, NIEZALEZNE od COOL RATE na CONTROL -
         # powrot miedzy testami to tylko "dojazd do pozycji startowej", nie
         # sam test, wiec nie ma powodu robic go w tempie eksperymentu.
@@ -3218,9 +3353,14 @@ class PeltierControl:
         # grzanie, zeby miec realne dane do analizy zamiast zgadywac.
         self.series_skip_archive = False
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Prefiks TEST vs POWROT w nazwie pliku, zeby dalo sie jednym
+        # spojrzeniem (i jednym filtrem przy analizie) odroznic zjazd
+        # zrobiony jako pelnoprawny test od zwyklego dojazdu do bazy.
+        kind = "cooltest" if cool_is_test else "cool"
         self.series_name_hint = (
-            f"seria_cool_toSP{self.series_base_sp:.0f}_R{return_rate:.0f}_{ts}")
-        self._series_status(f"Powrot do bazy {self.series_base_sp:.1f}°C (tempo {return_rate:.0f}°C/min)...")
+            f"seria_{kind}_toSP{self.series_base_sp:.0f}_R{return_rate:.0f}_{ts}")
+        lbl = "ZJAZD-TEST" if cool_is_test else "Powrot"
+        self._series_status(f"{lbl} do {self.series_base_sp:.1f}°C (tempo {return_rate:.0f}°C/min)...")
 
     def _series_tick(self):
         """Wywolywane z glownego tick() (co ok. 250ms) gdy seria aktywna."""
