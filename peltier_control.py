@@ -61,7 +61,7 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.3"
+APP_BUILD = "2026-08-25.4"
 
 # Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
 # PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
@@ -318,6 +318,8 @@ class PeltierControl:
         self.series_phase = None     # 'ramping' | 'holding' | None
         self.series_phase_t0 = None
         self.series_base_sp = 25.0   # do jakiej temp wracac miedzy testami
+        self.series_skip_archive = False  # True podczas nogi powrotu - patrz cyc_stop
+        self._series_saved_rd = None      # COOL RATE z CONTROL, przywracane po serii
         self.cyc_t0 = None; self.cyc_fn = None
 
         # Profile (lista etapow: dict temp/ramp/time)
@@ -2149,8 +2151,18 @@ class PeltierControl:
         self.series_e_base.bind('<FocusOut>', self._on_series_base_change)
         self.series_e_base.bind('<Return>', self._on_series_base_change)
         self.series_e_base.pack(fill='x', ipady=4)
-        tk.Label(lin, text="powrot uzywa COOL RATE z zakladki CONTROL",
-                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(7))
+
+        tk.Label(lin, text="TEMPO POWROTU (°C/min)", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(anchor='w', pady=(10, 2))
+        self.series_e_return_rate = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
+                                              font=(FONT, fsz(11), 'bold'), relief='flat',
+                                              insertbackground=C['text'])
+        self.series_e_return_rate.insert(0, "25.0")
+        self.series_e_return_rate.pack(fill='x', ipady=4)
+        tk.Label(lin,
+                 text="wlasne, SZYBKIE tempo - niezalezne od COOL RATE na\n"
+                      "CONTROL (ten zostaje bez zmian, przywracany po serii)",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(7)), justify='left'
                  ).pack(anchor='w', pady=(2, 0))
 
         tk.Label(lin, text="SZYBKIE WYPELNIENIE", bg=C['panel'], fg=C['dim'],
@@ -3054,6 +3066,15 @@ class PeltierControl:
         tmp_path = self.cyc_fn
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
         print(f"CYC STOP: {reason} ({getattr(self,'cyc_rows',0)} próbek)")
+        if getattr(self, 'series_skip_archive', False):
+            # Noga "powrot do bazy" w SERII - to nie test, tylko dojazd do
+            # pozycji startowej, wiec nie ma co archiwizowac (patrz komentarz
+            # w _series_launch_cool). Kasujemy plik tymczasowy od razu.
+            self.series_skip_archive = False
+            if tmp_path and tmp_path.exists():
+                try: tmp_path.unlink()
+                except: pass
+            return
         if had_data and tmp_path and tmp_path.exists():
             hint = self.series_name_hint
             self.series_name_hint = None
@@ -3111,16 +3132,31 @@ class PeltierControl:
             return
         self.series_running = True
         self.series_idx = 0
+        # Zapamietaj COOL RATE z panelu CONTROL - powrot miedzy testami
+        # uzywa WLASNEGO, szybkiego tempa (patrz _series_launch_cool),
+        # niezaleznie od tego co user ma ustawione do prawdziwych testow.
+        # Przywracamy oryginal po zakonczeniu/przerwaniu serii.
+        self._series_saved_rd = self.sl_rd.get()
         self._series_status(f"Start serii: {len(self.series_steps)} testow")
         self._series_launch_heat(self.series_idx)
         if hasattr(self, 'btn_series_run'):
             self.btn_series_run.config(text="■ STOP SERII", bg=C['red'])
+
+    def _series_restore_rd(self):
+        saved = getattr(self, '_series_saved_rd', None)
+        if saved is not None:
+            self.sl_rd.set(saved)
+            if self.connected:
+                self.send(f"RD:{saved:.1f}")
+            self._series_saved_rd = None
 
     def _series_abort(self, reason=""):
         self.series_running = False
         self.series_leg = None
         self.series_phase = None
         self.series_name_hint = None
+        self.series_skip_archive = False
+        self._series_restore_rd()
         self._series_status(f"Seria przerwana ({reason})" if reason else "Seria przerwana")
         if hasattr(self, 'btn_series_run'):
             self.btn_series_run.config(text="▶ START SERII", bg=C['green'])
@@ -3129,6 +3165,7 @@ class PeltierControl:
         self.series_running = False
         self.series_leg = None
         self.series_phase = None
+        self._series_restore_rd()
         self._series_status(f"Seria zakonczona - {len(self.series_steps)} testow, pliki w PeltierLogi")
         if hasattr(self, 'btn_series_run'):
             self.btn_series_run.config(text="▶ START SERII", bg=C['green'])
@@ -3160,12 +3197,24 @@ class PeltierControl:
         if not self.connected:
             self._series_abort("utracono polaczenie z urzadzeniem")
             return
+        try:
+            return_rate = float(self.series_e_return_rate.get().replace(',', '.'))
+        except (ValueError, AttributeError):
+            return_rate = 25.0
+        # Wlasne SZYBKIE tempo powrotu, NIEZALEZNE od COOL RATE na CONTROL -
+        # powrot miedzy testami to tylko "dojazd do pozycji startowej", nie
+        # sam test, wiec nie ma powodu robic go w tempie eksperymentu.
+        self.sl_rd.set(return_rate)
         self.sl_sp.set(self.series_base_sp)
         self.do_start()
         self.series_leg = 'cool'
         self.series_phase = 'ramping'
         self.series_phase_t0 = time.time()
-        self._series_status(f"Powrot do bazy {self.series_base_sp:.1f}°C...")
+        # Powrot nie jest sam w sobie danymi do analizy (nie testujemy tu
+        # nic) - pomijamy archiwizacje, zeby nie zaśmiecac PeltierLogi
+        # bezuzytecznymi plikami "seria_powrot_...".
+        self.series_skip_archive = True
+        self._series_status(f"Powrot do bazy {self.series_base_sp:.1f}°C (tempo {return_rate:.0f}°C/min)...")
 
     def _series_tick(self):
         """Wywolywane z glownego tick() (co ok. 250ms) gdy seria aktywna."""
@@ -3213,8 +3262,9 @@ class PeltierControl:
             self.root.after(600, self._series_advance)
 
     def _series_end_cool_leg(self):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.series_name_hint = f"seria_powrot_{ts}"
+        # series_skip_archive juz ustawione w _series_launch_cool - cyc_stop
+        # skasuje plik tymczasowy zamiast go archiwizowac (patrz komentarz
+        # przy _series_launch_cool).
         self.send("STOP")
         self._update_run_button(False)
         self.root.after(600, self._series_advance)
