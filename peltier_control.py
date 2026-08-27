@@ -61,7 +61,14 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.1"
+APP_BUILD = "2026-08-25.3"
+
+# Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
+# PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
+# dojazd/powrot nigdy nie osiagnal celu (np. odlaczony czujnik) - seria ma
+# przejsc dalej zamiast wisiec w nieskonczonosc.
+SERIES_HEAT_TIMEOUT_S = 20 * 60
+SERIES_COOL_TIMEOUT_S = 12 * 60
 
 # Globalny mnoznik rozmiaru fontow (ustawiany na starcie wg DPI)
 FS = 1.0
@@ -293,6 +300,24 @@ class PeltierControl:
         self.log_dir = Path.home() / "PeltierLogi"
         self.log_dir.mkdir(exist_ok=True)
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
+        # Podpowiedz nazwy dla NASTEPNEGO zapisu archiwum (patrz cyc_stop) -
+        # gdy ustawiona, pomija interaktywny dialog "SAVE CYCLE TO ARCHIVE"
+        # (ktory jest modalny - zablokowalby automatyczna SERIE pomiarow).
+        self.series_name_hint = None
+
+        # ── SERIA POMIAROW (automatyczny ciag testow SP/RATE) ────────────
+        # Cel: zamiast robic testy jeden po drugim recznie i wklejac mi
+        # zrzuty ekranu, apka sama przechodzi przez liste (SP, RATE, czas
+        # trzymania), archiwizuje kazdy test pod czytelna nazwa (bez
+        # pytania o nazwe), a ja czytam wynikowe pliki z folderu PeltierLogi
+        # (mam do niego dostep) i od razu przygotowuje poprawki.
+        self.series_steps = []       # lista dict(sp=, rate=, hold_s=)
+        self.series_idx = 0
+        self.series_running = False
+        self.series_leg = None       # 'heat' | 'cool' | None
+        self.series_phase = None     # 'ramping' | 'holding' | None
+        self.series_phase_t0 = None
+        self.series_base_sp = 25.0   # do jakiej temp wracac miedzy testami
         self.cyc_t0 = None; self.cyc_fn = None
 
         # Profile (lista etapow: dict temp/ramp/time)
@@ -530,6 +555,20 @@ class PeltierControl:
                     except: pass
                 self._latest_temp2 = d['temp2']  # do wyswietlenia na karcie
 
+                # Rozbicie skladnikow PID (10.-15. dodatkowe pole, tylko w
+                # AUTO - patrz komentarz przy "dbgFF" w firmware) - FF, P, I,
+                # D, surowy wynik PID przed obcieciem/slew, i uzyty
+                # reactScale. Trafia do archiwum cyklu (cyc_log), zeby dalsza
+                # diagnoza fali/lagow mogla bazowac na liczbach z pliku,
+                # zamiast na zgadywaniu z samego wykresu temp/PWM.
+                d['dbg'] = None
+                if len(p) >= 16:
+                    try:
+                        d['dbg'] = dict(ff=float(p[10]), p=float(p[11]),
+                                         i=float(p[12]), dd=float(p[13]),
+                                         raw=float(p[14]), react=float(p[15]))
+                    except: pass
+
                 # Czas z FIRMWARE (p[0] = czas_s) - dokladny, niezalezny od
                 # opoznien aplikacji/buforowania kolejki. Zegar komputera (time.time)
                 # rozjezdzal sie przy buforowaniu i zanizal AVG RATE.
@@ -546,7 +585,7 @@ class PeltierControl:
                     self.cyc_log(time.time() - self.cyc_t0 if self.cyc_t0 else 0,
                                 d['temp'], d['sa'], d['st'],
                                 d['pwm'], d['kp'], d['ki'], d['kd'], state,
-                                d.get('temp2'))
+                                d.get('temp2'), d.get('dbg'))
 
                 prev = self.last_state
                 self.last_state = state
@@ -1169,10 +1208,12 @@ class PeltierControl:
         t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='CONTROL')
         t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='ADVANCED')
         t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='ARCHIVE')
+        t5 = tk.Frame(nb, bg=C['bg']); nb.add(t5, text='SERIA')
         t4 = tk.Frame(nb, bg=C['bg']); nb.add(t4, text='CONNECTION')
         self.build_live(t1)
         self.build_advanced(t2)
         self.build_arch(t3)
+        self.build_series(t5)
         self.build_conn(t4)
 
     def _draw_dot(self, color, glow=True):
@@ -1634,6 +1675,11 @@ class PeltierControl:
         self._update_run_button(True)
 
     def do_stop(self):
+        # Reczny STOP przerywa tez automatyczna SERIE pomiarow, jesli akurat
+        # leci - inaczej apka za chwile sama by ja "wskrzesila" kolejnym
+        # krokiem, co bylo by mylace przy recznej interwencji.
+        if self.series_running:
+            self._series_abort("reczny STOP")
         self.send("STOP")
         self.send("AUTOCALSTOP")  # przerwij tez kalibracje jesli trwa
         if hasattr(self, 'cal_status'):
@@ -2046,6 +2092,144 @@ class PeltierControl:
         self.refresh_arch()
         # Narysuj pusty wykres od razu - inicjalizuje canvas i toolbar
         self._redraw_arch()
+
+    def build_series(self, parent):
+        """Zakladka SERIA - lista testow (SP/RATE/hold) wykonywanych automatycznie
+        jeden po drugim, z auto-archiwizacja kazdego (bez pytania o nazwe) -
+        pliki ladują w PeltierLogi gotowe do analizy."""
+        wrap = tk.Frame(parent, bg=C['bg'])
+        wrap.pack(fill='both', expand=True, padx=16, pady=16)
+
+        tk.Label(wrap, text="SERIA POMIAROW", bg=C['bg'], fg=C['text'],
+                 font=(FONT, fsz(12), 'bold')).pack(anchor='w')
+        tk.Label(wrap,
+                 text="Dodaj testy (SP/RATE/czas trzymania) - apka zrobi je po kolei,\n"
+                      "wraca do bazy miedzy testami i sama archiwizuje kazdy wynik.",
+                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left'
+                 ).pack(anchor='w', pady=(2, 12))
+
+        body = tk.Frame(wrap, bg=C['bg'])
+        body.pack(fill='both', expand=True)
+
+        # ── Lewa kolumna: dodawanie kroku + ustawienia bazy ──────────
+        left = tk.Frame(body, bg=C['panel'], width=280)
+        left.pack(side='left', fill='y', padx=(0, 12))
+        left.pack_propagate(False)
+        tk.Frame(left, bg=C['cyan'], height=3).pack(fill='x')
+        lin = tk.Frame(left, bg=C['panel'])
+        lin.pack(fill='x', padx=14, pady=12)
+
+        def _field(label, default):
+            tk.Label(lin, text=label, bg=C['panel'], fg=C['dim'],
+                     font=(FONT, fsz(9))).pack(anchor='w', pady=(8, 2))
+            e = tk.Entry(lin, bg=C['bg2'], fg=C['text'], font=(FONT, fsz(11), 'bold'),
+                         relief='flat', insertbackground=C['text'])
+            e.insert(0, default)
+            e.pack(fill='x', ipady=4)
+            return e
+
+        self.series_e_sp = _field("SP (°C)", "50.0")
+        self.series_e_rate = _field("HEAT RATE (°C/min)", "30.0")
+        self.series_e_hold = _field("TRZYMANIE PO DOJSCIU (s)", "60")
+
+        mk_btn(lin, "+ DODAJ TEST", self._on_series_add, C['cyan']
+               ).pack(fill='x', pady=(12, 4))
+        mk_btn_outline(lin, "USUN ZAZNACZONY", self._on_series_remove, C['dim']
+                       ).pack(fill='x', pady=(0, 4))
+        mk_btn_outline(lin, "WYCZYSC LISTE", self._on_series_clear, C['dim']
+                       ).pack(fill='x')
+
+        tk.Frame(lin, bg=C['border2'], height=1).pack(fill='x', pady=12)
+        tk.Label(lin, text="BAZA MIEDZY TESTAMI (°C)", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 2))
+        self.series_e_base = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
+                                       font=(FONT, fsz(11), 'bold'), relief='flat',
+                                       insertbackground=C['text'])
+        self.series_e_base.insert(0, f"{self.series_base_sp:.1f}")
+        self.series_e_base.bind('<FocusOut>', self._on_series_base_change)
+        self.series_e_base.bind('<Return>', self._on_series_base_change)
+        self.series_e_base.pack(fill='x', ipady=4)
+        tk.Label(lin, text="powrot uzywa COOL RATE z zakladki CONTROL",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(7))
+                 ).pack(anchor='w', pady=(2, 0))
+
+        tk.Label(lin, text="SZYBKIE WYPELNIENIE", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(anchor='w', pady=(16, 2))
+        mk_btn_outline(lin, "SP z pola x rampy 10/20/30/40/50/60/70",
+                       self._on_series_quickfill, C['purple']).pack(fill='x')
+
+        # ── Prawa kolumna: lista + status + start/stop ──────────
+        right = tk.Frame(body, bg=C['panel'])
+        right.pack(side='left', fill='both', expand=True)
+        tk.Frame(right, bg=C['border2'], height=3).pack(fill='x')
+
+        rhd = tk.Frame(right, bg=C['panel'])
+        rhd.pack(fill='x', padx=14, pady=(10, 4))
+        tk.Label(rhd, text="LISTA TESTOW", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+
+        self.series_listbox = tk.Listbox(right, bg=C['bg2'], fg=C['text'],
+                                          font=(FONT, fsz(10)), relief='flat',
+                                          selectbackground=C['cyan'], height=14,
+                                          highlightthickness=0, bd=0)
+        self.series_listbox.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+
+        stf = tk.Frame(right, bg=C['panel'])
+        stf.pack(fill='x', padx=14, pady=(0, 10))
+        self.series_status_lbl = tk.Label(stf, text="Seria nieaktywna",
+                                           bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
+                                           anchor='w', justify='left')
+        self.series_status_lbl.pack(fill='x', ipady=8, padx=2)
+
+        btnf = tk.Frame(right, bg=C['panel'])
+        btnf.pack(fill='x', padx=14, pady=(0, 14))
+        self.btn_series_run = mk_btn(btnf, "▶ START SERII", self._on_series_toggle, C['green'])
+        self.btn_series_run.pack(fill='x')
+
+        self._series_refresh_list()
+
+    def _on_series_add(self):
+        try:
+            sp = float(self.series_e_sp.get().replace(',', '.'))
+            rate = float(self.series_e_rate.get().replace(',', '.'))
+            hold = float(self.series_e_hold.get().replace(',', '.'))
+        except ValueError:
+            messagebox.showwarning("Bledna wartosc", "SP/RATE/hold musza byc liczbami.")
+            return
+        self.series_add_step(sp, rate, hold)
+
+    def _on_series_remove(self):
+        sel = self.series_listbox.curselection()
+        if sel:
+            self.series_remove_step(sel[0])
+
+    def _on_series_clear(self):
+        self.series_steps = []
+        self._series_refresh_list()
+
+    def _on_series_base_change(self, evt=None):
+        try:
+            self.series_base_sp = float(self.series_e_base.get().replace(',', '.'))
+        except ValueError:
+            self.series_e_base.delete(0, 'end')
+            self.series_e_base.insert(0, f"{self.series_base_sp:.1f}")
+
+    def _on_series_quickfill(self):
+        try:
+            sp = float(self.series_e_sp.get().replace(',', '.'))
+        except ValueError:
+            messagebox.showwarning("Bledna wartosc", "Wpisz najpierw SP.")
+            return
+        for rate in (10, 20, 30, 40, 50, 60, 70):
+            self.series_add_step(sp, rate, 60)
+
+    def _on_series_toggle(self):
+        if self.series_running:
+            self._series_abort("reczny STOP SERII")
+            self.send("STOP")
+            self._update_run_button(False)
+        else:
+            self.series_start()
 
     def _cycle_display_name(self, path):
         """Czytelna nazwa cyklu: usuwa prefiks c_/cykl_ i zamienia _ na spacje"""
@@ -2714,6 +2898,10 @@ class PeltierControl:
             try: self.draw_chart()
             except Exception as e: print(f"chart err: {e}")
 
+        if self.series_running:
+            try: self._series_tick()
+            except Exception as e: print(f"series err: {e}")
+
         self.root.after(250, self.tick)
 
     def update_cards(self):
@@ -2836,17 +3024,24 @@ class PeltierControl:
         self.cyc_wr = csv.writer(self.cyc_file)
         self.cyc_wr.writerow(['czas_s', 'temperatura_C', 'setpoint_aktywny',
                               'setpoint_cel', 'PWM', 'PWM_%', 'Kp', 'Ki', 'Kd', 'stan',
-                              'temperatura2_C'])
+                              'temperatura2_C', 'ff', 'p_term', 'i_term', 'd_term',
+                              'pid_raw', 'react_scale'])
         self.cyc_rows = 0
         print(f"CYC START T={temp0:.1f}")
 
-    def cyc_log(self, t, temp, sa, st, pwm, kp, ki, kd, state, temp2=None):
+    def cyc_log(self, t, temp, sa, st, pwm, kp, ki, kd, state, temp2=None, dbg=None):
         if self.cyc_wr:
             try:
                 t2str = f"{temp2:.2f}" if temp2 is not None else ""
+                if dbg:
+                    dbgvals = [f"{dbg['ff']:.2f}", f"{dbg['p']:.2f}", f"{dbg['i']:.2f}",
+                               f"{dbg['dd']:.2f}", f"{dbg['raw']:.2f}", f"{dbg['react']:.2f}"]
+                else:
+                    dbgvals = ["", "", "", "", "", ""]
                 self.cyc_wr.writerow([f"{t:.2f}", f"{temp:.2f}", f"{sa:.2f}",
                                      f"{st:.2f}", pwm, f"{pwm*100/255:.1f}",
-                                     f"{kp:.3f}", f"{ki:.4f}", f"{kd:.3f}", state, t2str])
+                                     f"{kp:.3f}", f"{ki:.4f}", f"{kd:.3f}", state, t2str,
+                                     *dbgvals])
                 self.cyc_file.flush()
                 self.cyc_rows += 1
             except: pass
@@ -2859,9 +3054,17 @@ class PeltierControl:
         tmp_path = self.cyc_fn
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
         print(f"CYC STOP: {reason} ({getattr(self,'cyc_rows',0)} próbek)")
-        # Zapytaj o nazwe i zapisz do archiwum (w watku GUI)
         if had_data and tmp_path and tmp_path.exists():
-            self.root.after(0, lambda: self._ask_save_name(tmp_path))
+            hint = self.series_name_hint
+            self.series_name_hint = None
+            if hint:
+                # SERIA: zapisz od razu pod czytelna nazwa, BEZ modalnego
+                # okna (ktore by zablokowalo dalsze automatyczne kroki -
+                # nikt nie stoi przy komputerze zeby je zamknac).
+                self.root.after(0, lambda: self.save_cycle_as(tmp_path, hint))
+            else:
+                # Zapytaj o nazwe i zapisz do archiwum (w watku GUI)
+                self.root.after(0, lambda: self._ask_save_name(tmp_path))
         elif tmp_path and tmp_path.exists():
             # Brak danych - usun plik tymczasowy
             try: tmp_path.unlink()
@@ -2870,6 +3073,162 @@ class PeltierControl:
     def _ask_save_name(self, tmp_path):
         """Okno z pytaniem o nazwe cyklu do archiwum"""
         SaveCycleDialog(self.root, self, tmp_path)
+
+    # ════════════════════════════════════════════════════════
+    #  SERIA POMIAROW - automatyczny ciag testow SP/RATE bez
+    #  reki na klawiaturze miedzy kolejnymi testami. Kazdy test to:
+    #    1) grzanie do SP z dana rampa (HEAT RATE) - do "dojechania"
+    #       (uzywa tej samej logiki reach_done co karty na CONTROL)
+    #    2) trzymanie na SP przez hold_s sekund (widac tam fale/lag)
+    #    3) STOP -> archiwizacja pod czytelna nazwa (bez pytania)
+    #    4) powrot do temperatury bazowej (COOL RATE z panelu) przed
+    #       kolejnym testem, zeby kazdy start byl z tego samego punktu
+    # ════════════════════════════════════════════════════════
+    def series_add_step(self, sp, rate, hold_s):
+        self.series_steps.append({'sp': float(sp), 'rate': float(rate), 'hold_s': float(hold_s)})
+        self._series_refresh_list()
+
+    def series_remove_step(self, idx):
+        if 0 <= idx < len(self.series_steps):
+            del self.series_steps[idx]
+            self._series_refresh_list()
+
+    def _series_refresh_list(self):
+        if hasattr(self, 'series_listbox'):
+            self.series_listbox.delete(0, 'end')
+            for i, s in enumerate(self.series_steps):
+                self.series_listbox.insert('end',
+                    f"{i+1}. SP={s['sp']:.1f}°C  RATE={s['rate']:.1f}°C/min  hold={s['hold_s']:.0f}s")
+
+    def series_start(self):
+        if not self.connected:
+            messagebox.showwarning("Not connected", "Connect to the device first.")
+            return
+        if not self.series_steps:
+            messagebox.showwarning("Pusta seria", "Dodaj przynajmniej jeden test do listy.")
+            return
+        if self.series_running:
+            return
+        self.series_running = True
+        self.series_idx = 0
+        self._series_status(f"Start serii: {len(self.series_steps)} testow")
+        self._series_launch_heat(self.series_idx)
+        if hasattr(self, 'btn_series_run'):
+            self.btn_series_run.config(text="■ STOP SERII", bg=C['red'])
+
+    def _series_abort(self, reason=""):
+        self.series_running = False
+        self.series_leg = None
+        self.series_phase = None
+        self.series_name_hint = None
+        self._series_status(f"Seria przerwana ({reason})" if reason else "Seria przerwana")
+        if hasattr(self, 'btn_series_run'):
+            self.btn_series_run.config(text="▶ START SERII", bg=C['green'])
+
+    def _series_finish(self):
+        self.series_running = False
+        self.series_leg = None
+        self.series_phase = None
+        self._series_status(f"Seria zakonczona - {len(self.series_steps)} testow, pliki w PeltierLogi")
+        if hasattr(self, 'btn_series_run'):
+            self.btn_series_run.config(text="▶ START SERII", bg=C['green'])
+
+    def _series_status(self, text):
+        print(f"SERIA: {text}")
+        if hasattr(self, 'series_status_lbl'):
+            self.series_status_lbl.config(text=text)
+
+    def _series_launch_heat(self, idx):
+        if not self.connected:
+            # Automatyczna seria dziala BEZ nadzoru - nie zostawiamy modalnego
+            # okna "not connected" zawieszonego w powietrzu, tylko po prostu
+            # przerywamy z czytelnym statusem.
+            self._series_abort("utracono polaczenie z urzadzeniem")
+            return
+        step = self.series_steps[idx]
+        self.sl_sp.set(step['sp'])
+        self.sl_ru.set(step['rate'])
+        self.do_start()
+        self.series_leg = 'heat'
+        self.series_phase = 'ramping'
+        self.series_phase_t0 = time.time()
+        self._series_status(
+            f"Test {idx+1}/{len(self.series_steps)}: SP={step['sp']:.1f}°C "
+            f"RATE={step['rate']:.1f}°C/min - grzanie...")
+
+    def _series_launch_cool(self):
+        if not self.connected:
+            self._series_abort("utracono polaczenie z urzadzeniem")
+            return
+        self.sl_sp.set(self.series_base_sp)
+        self.do_start()
+        self.series_leg = 'cool'
+        self.series_phase = 'ramping'
+        self.series_phase_t0 = time.time()
+        self._series_status(f"Powrot do bazy {self.series_base_sp:.1f}°C...")
+
+    def _series_tick(self):
+        """Wywolywane z glownego tick() (co ok. 250ms) gdy seria aktywna."""
+        if not self.series_running or self.series_idx >= len(self.series_steps):
+            return
+        now = time.time()
+        step = self.series_steps[self.series_idx]
+
+        if self.series_leg == 'heat' and self.series_phase == 'ramping':
+            if self.reach_done:
+                self.series_phase = 'holding'
+                self.series_phase_t0 = now
+                self._series_status(
+                    f"Test {self.series_idx+1}/{len(self.series_steps)}: "
+                    f"dojechano do SP={step['sp']:.1f} - trzymanie {step['hold_s']:.0f}s")
+            elif now - self.series_phase_t0 > SERIES_HEAT_TIMEOUT_S:
+                self._series_status(f"Test {self.series_idx+1}: TIMEOUT dojazdu - koncze ten test")
+                self._series_end_heat_leg(tag="TIMEOUT")
+
+        elif self.series_leg == 'heat' and self.series_phase == 'holding':
+            elapsed = now - self.series_phase_t0
+            remaining = max(0, step['hold_s'] - elapsed)
+            self._series_status(
+                f"Test {self.series_idx+1}/{len(self.series_steps)}: "
+                f"trzymanie SP={step['sp']:.1f} - jeszcze {remaining:.0f}s")
+            if elapsed >= step['hold_s']:
+                self._series_end_heat_leg(tag="OK")
+
+        elif self.series_leg == 'cool' and self.series_phase == 'ramping':
+            if self.reach_done or (now - self.series_phase_t0 > SERIES_COOL_TIMEOUT_S):
+                self._series_end_cool_leg()
+
+    def _series_end_heat_leg(self, tag="OK"):
+        step = self.series_steps[self.series_idx]
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.series_name_hint = f"seria_SP{step['sp']:.0f}_R{step['rate']:.0f}_{tag}_{ts}"
+        self.send("STOP")
+        self._update_run_button(False)
+        if abs(self.series_base_sp - step['sp']) > 0.5:
+            self.series_leg = 'cool'
+            self.series_phase = None
+            # Krotka pauza zeby STOP na pewno dotarl przed kolejnym START
+            self.root.after(600, self._series_launch_cool)
+        else:
+            self.root.after(600, self._series_advance)
+
+    def _series_end_cool_leg(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.series_name_hint = f"seria_powrot_{ts}"
+        self.send("STOP")
+        self._update_run_button(False)
+        self.root.after(600, self._series_advance)
+
+    def _series_advance(self):
+        if not self.series_running:
+            return
+        self.series_idx += 1
+        self.series_leg = None
+        self.series_phase = None
+        if self.series_idx >= len(self.series_steps):
+            self._series_finish()
+        else:
+            self._series_launch_heat(self.series_idx)
 
     def save_cycle_as(self, tmp_path, name):
         """Zapisz cykl pod nazwa = opis uzytkownika (timestamp tylko przy duplikacie)"""
