@@ -61,7 +61,7 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.5"
+APP_BUILD = "2026-08-25.6"
 
 # Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
 # PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
@@ -3210,10 +3210,16 @@ class PeltierControl:
         self.series_leg = 'cool'
         self.series_phase = 'ramping'
         self.series_phase_t0 = time.time()
-        # Powrot nie jest sam w sobie danymi do analizy (nie testujemy tu
-        # nic) - pomijamy archiwizacje, zeby nie zaśmiecac PeltierLogi
-        # bezuzytecznymi plikami "seria_powrot_...".
-        self.series_skip_archive = True
+        # WCZESNIEJ: powrot byl uznany za "nie dane do analizy" i pomijany
+        # (series_skip_archive=True), zeby nie zaśmiecac PeltierLogi. Po
+        # uwadze uzytkownika o niedobrym wygladzie CHLODZENIA ("wolalbym aby
+        # schodzilo rowno z setpointem aktualnym") - a ten wlasnie leg jest
+        # jedyna nasza rampa w dol - TERAZ archiwizujemy go tak samo jak
+        # grzanie, zeby miec realne dane do analizy zamiast zgadywac.
+        self.series_skip_archive = False
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.series_name_hint = (
+            f"seria_cool_toSP{self.series_base_sp:.0f}_R{return_rate:.0f}_{ts}")
         self._series_status(f"Powrot do bazy {self.series_base_sp:.1f}°C (tempo {return_rate:.0f}°C/min)...")
 
     def _series_tick(self):
@@ -3278,9 +3284,9 @@ class PeltierControl:
         # cale 600ms bez tego), bo kazdy test w tej serii mial base_sp!=SP,
         # wiec ZAWSZE przechodzil przez noge 'cool'.
         self.series_phase = 'ending'
-        # series_skip_archive juz ustawione w _series_launch_cool - cyc_stop
-        # skasuje plik tymczasowy zamiast go archiwizowac (patrz komentarz
-        # przy _series_launch_cool).
+        # series_name_hint juz ustawiony w _series_launch_cool - cyc_stop
+        # zarchiwizuje ten leg pod nazwa "seria_cool_..." (patrz komentarz
+        # przy _series_launch_cool - teraz chlodzenie TEZ jest danymi).
         self.send("STOP")
         self._update_run_button(False)
         self.root.after(600, self._series_advance)
