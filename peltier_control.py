@@ -61,7 +61,7 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.4"
+APP_BUILD = "2026-08-25.5"
 
 # Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
 # PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
@@ -3248,6 +3248,18 @@ class PeltierControl:
                 self._series_end_cool_leg()
 
     def _series_end_heat_leg(self, tag="OK"):
+        # BLAD ktory to powodowal (znaleziony po zgloszeniu "10/40/70 zamiast
+        # calej listy"): tick() leci co 250ms, ale nastepny krok byl
+        # planowany z opoznieniem 600ms (root.after) - a warunek, ktory tu
+        # wprowadza (reach_done / uplyniety hold_s), zostawal PRAWDZIWY przez
+        # cale te 600ms. Efekt: tick() wywolywal ta funkcje 2-3 razy zanim
+        # faza faktycznie sie zmienila, kazde wywolanie planowalo WLASNY
+        # _series_advance - serie_idx skakal o 2-3 zamiast o 1 (dlatego z
+        # listy 10/20/30/40/50/60/70 realnie leciały tylko 10, 40, 70 -
+        # skok o 3 kazdorazowo). Naprawa: ustawiamy sentinel 'ending' OD
+        # RAZU (synchronicznie), zeby warunek w tick() przestal pasowac
+        # natychmiast, a nie dopiero po 600ms.
+        self.series_phase = 'ending'
         step = self.series_steps[self.series_idx]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.series_name_hint = f"seria_SP{step['sp']:.0f}_R{step['rate']:.0f}_{tag}_{ts}"
@@ -3255,13 +3267,17 @@ class PeltierControl:
         self._update_run_button(False)
         if abs(self.series_base_sp - step['sp']) > 0.5:
             self.series_leg = 'cool'
-            self.series_phase = None
             # Krotka pauza zeby STOP na pewno dotarl przed kolejnym START
             self.root.after(600, self._series_launch_cool)
         else:
             self.root.after(600, self._series_advance)
 
     def _series_end_cool_leg(self):
+        # Ten sam sentinel-guard co w _series_end_heat_leg - patrz komentarz
+        # tam. Tu byl WLASCIWY zrodlowy bug (reach_done zostawal True przez
+        # cale 600ms bez tego), bo kazdy test w tej serii mial base_sp!=SP,
+        # wiec ZAWSZE przechodzil przez noge 'cool'.
+        self.series_phase = 'ending'
         # series_skip_archive juz ustawione w _series_launch_cool - cyc_stop
         # skasuje plik tymczasowy zamiast go archiwizowac (patrz komentarz
         # przy _series_launch_cool).
