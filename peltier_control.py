@@ -61,7 +61,7 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.10"
+APP_BUILD = "2026-08-25.11"
 
 # Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
 # PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
@@ -3408,6 +3408,70 @@ class PeltierControl:
         if hasattr(self, 'series_status_lbl'):
             self.series_status_lbl.config(text=text)
 
+    def _series_roll_cycle(self, hint):
+        """Zamknij BIEZACY plik cyklu pod nazwa `hint` i od razu otworz nowy -
+        BEZ zatrzymywania regulatora.
+
+        Wczesniej kazda noga serii byla zamykana przez STOP, bo tylko przejscie
+        AUTO->MAN zamykalo plik cyklu. To wymuszalo przerwe w regulacji -
+        patrz komentarz przy _series_switch_leg.
+        """
+        self.series_name_hint = hint
+        self.cyc_stop("koniec nogi serii")
+        temp0 = self.temp[-1] if self.temp else 0.0
+        self._cyc_start(temp0)
+
+    def _series_switch_leg(self, sp, ru=None, rd=None):
+        """Przelacz serie na nowy cel BEZ STOP/START - regulator zostaje w AUTO.
+
+        DLACZEGO (zgloszenie: "rampa chlodzenia zaczyna sie pozniej niz koniec
+        rampy grzania, a linia SP jest duzo nizej"):
+        Poprzednio miedzy nogami szlo STOP -> 600 ms -> START. Firmware na
+        STOP przechodzi w MAN i ZERUJE moc, a na START wykonuje spA=lT, czyli
+        ustawia setpoint aktywny na BIEZACY pomiar. Pomiar w tym czasie zdazyl
+        juz opasc, bo grzalka/powierzchnia Peltiera ma mala bezwladnosc i po
+        odcieciu ~60 jednostek PWM stygnie blyskawicznie.
+        Zmierzone na prawdziwych logach (5 przejsc, koniec grzania -> start
+        zjazdu): przerwa 1.4-1.7 s, a w tym czasie temperatura spadala o
+        5.6-7.0 C (50.1-50.6 -> 43.1-44.6). Dlatego rampa zjazdu startowala
+        od ~44-47 C zamiast od 50 C - dokladnie to "linia SP duzo nizej" i
+        widoczna dziura miedzy koncem grzania a poczatkiem chlodzenia.
+
+        Firmware obsluguje SP/RU/RD w trakcie AUTO (zmieniaja tylko cel i
+        tempa), a START robi cokolwiek TYLKO gdy sys==MAN. Wystarczy wiec nie
+        wychodzic z AUTO: spA plynnie przechodzi z 50 w dol, bez zerowania
+        mocy, bez przerwy i bez skoku setpointu.
+        """
+        if ru is not None:
+            self.send(f"RU:{ru:.1f}")
+        if rd is not None:
+            self.send(f"RD:{rd:.1f}")
+        self.send(f"SP:{sp:.1f}")
+        # Statystyki dojscia licza sie od nowa dla kazdej nogi. UWAGA: do_start
+        # ZERUJE reach_start_t, bo tam zaraz nastapi przejscie MAN->AUTO, ktore
+        # je ustawia. Tu takiego przejscia NIE BEDZIE (zostajemy w AUTO), wiec
+        # trzeba ustawic je SAMEMU - inaczej warunek wykrywania dojazdu w tick()
+        # (wymaga reach_start_t is not None) nigdy by nie zadzialal i noga
+        # wisialaby az do timeoutu.
+        now = self.t[-1] if self.t else time.time()
+        cur = self.temp[-1] if self.temp else None
+        self.reach_start_t = now
+        self.reach_start_temp = cur
+        self.reach_target = sp
+        self.reach_done = False
+        self.reach_time = None
+        self.reach_avg_rate = None
+        self.reach_dir = None
+        # None CELOWO: automatyczne wykrywanie zmiany setpointu w tick()
+        # porownuje telemetryczne 'st' z ta wartoscia, a przez chwile po
+        # wyslaniu SP telemetria niesie jeszcze STARY setpoint - wpisanie tu
+        # nowego celu wyzwoliloby falszywe "setpoint zmieniony" i zresetowalo
+        # dopiero co ustawione liczniki. Seria i tak sama steruje setpointem.
+        self.last_setpoint_target = None
+        self._last_reach_summary = None
+        self._ramp_reset(now, cur, sp)
+        self._update_run_button(True)
+
     def _series_launch_heat(self, idx):
         if not self.connected:
             # Automatyczna seria dziala BEZ nadzoru - nie zostawiamy modalnego
@@ -3449,7 +3513,10 @@ class PeltierControl:
         # sam test, wiec nie ma powodu robic go w tempie eksperymentu.
         self.sl_rd.set(return_rate)
         self.sl_sp.set(self.series_base_sp)
-        self.do_start()
+        # PLYNNE przejscie grzanie -> chlodzenie: BEZ STOP/START (patrz
+        # _series_switch_leg). Zjazd zaczyna sie dokladnie tam, gdzie
+        # skonczylo sie grzanie.
+        self._series_switch_leg(self.series_base_sp, rd=return_rate)
         self.series_leg = 'cool'
         self.series_phase = 'ramping'
         self.series_phase_t0 = time.time()
@@ -3516,14 +3583,19 @@ class PeltierControl:
         self.series_phase = 'ending'
         step = self.series_steps[self.series_idx]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.series_name_hint = f"seria_SP{step['sp']:.0f}_R{step['rate']:.0f}_{tag}_{ts}"
-        self.send("STOP")
-        self._update_run_button(False)
+        hint = f"seria_SP{step['sp']:.0f}_R{step['rate']:.0f}_{tag}_{ts}"
         if abs(self.series_base_sp - step['sp']) > 0.5:
+            # PLYNNIE: zamykamy plik grzania i od razu otwieramy plik zjazdu,
+            # NIE wychodzac z AUTO - dzieki temu poczatek zjazdu = koniec
+            # grzania (patrz _series_switch_leg).
+            self._series_roll_cycle(hint)
             self.series_leg = 'cool'
-            # Krotka pauza zeby STOP na pewno dotarl przed kolejnym START
-            self.root.after(600, self._series_launch_cool)
+            self._series_launch_cool()
         else:
+            # Cel = baza, wiec nie ma nogi zjazdu - tu konczymy naprawde.
+            self.series_name_hint = hint
+            self.send("STOP")
+            self._update_run_button(False)
             self.root.after(600, self._series_advance)
 
     def _series_end_cool_leg(self):
@@ -3532,12 +3604,31 @@ class PeltierControl:
         # cale 600ms bez tego), bo kazdy test w tej serii mial base_sp!=SP,
         # wiec ZAWSZE przechodzil przez noge 'cool'.
         self.series_phase = 'ending'
-        # series_name_hint juz ustawiony w _series_launch_cool - cyc_stop
-        # zarchiwizuje ten leg pod nazwa "seria_cool_..." (patrz komentarz
-        # przy _series_launch_cool - teraz chlodzenie TEZ jest danymi).
-        self.send("STOP")
-        self._update_run_button(False)
-        self.root.after(600, self._series_advance)
+        # series_name_hint juz ustawiony w _series_launch_cool - plik zjazdu
+        # archiwizuje sie pod nazwa "seria_cool_/cooltest_..." (chlodzenie
+        # tez jest danymi - patrz komentarz przy _series_launch_cool).
+        nxt = self.series_idx + 1
+        if nxt < len(self.series_steps) and self.connected:
+            # Jest kolejny test - przechodzimy PLYNNIE, bez STOP/START, wiec
+            # nastepna rampa grzania startuje dokladnie tam, gdzie skonczyl
+            # sie zjazd (patrz _series_switch_leg).
+            self._series_roll_cycle(self.series_name_hint)
+            self.series_idx = nxt
+            step = self.series_steps[nxt]
+            self.sl_sp.set(step['sp'])
+            self.sl_ru.set(step['rate'])
+            self._series_switch_leg(step['sp'], ru=step['rate'])
+            self.series_leg = 'heat'
+            self.series_phase = 'ramping'
+            self.series_phase_t0 = time.time()
+            self._series_status(
+                f"Test {nxt+1}/{len(self.series_steps)}: SP={step['sp']:.1f}°C "
+                f"RATE={step['rate']:.1f}°C/min - grzanie...")
+        else:
+            # Ostatni krok (albo utrata polaczenia) - tu naprawde zatrzymujemy.
+            self.send("STOP")
+            self._update_run_button(False)
+            self.root.after(600, self._series_advance)
 
     def _series_advance(self):
         if not self.series_running:
