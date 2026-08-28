@@ -61,7 +61,7 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.9"
+APP_BUILD = "2026-08-25.10"
 
 # Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
 # PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
@@ -1285,7 +1285,7 @@ class PeltierControl:
     # ────────────────────────────────────────────────────
     def _build_ui(self):
         # Pasek tytulowy z lampka statusu
-        top = tk.Frame(self.root, bg=C['bg2'], height=44)
+        top = tk.Frame(self.root, bg=C['bg2'], height=SC(44))
         top.pack(fill='x'); top.pack_propagate(False)
         tk.Frame(top, bg=C['red'], width=6).pack(side='left', fill='y')
         tk.Label(top, text="  PELTIER CONTROL", bg=C['bg2'], fg=C['text'],
@@ -1499,7 +1499,7 @@ class PeltierControl:
 
     def _build_panel(self, parent):
         """Prawy panel sterowania - waski pasek z przewijaniem"""
-        panel = tk.Frame(parent, bg=C['bg2'], width=312)
+        panel = tk.Frame(parent, bg=C['bg2'], width=SC(312))
         panel.pack(side='right', fill='y')
         panel.pack_propagate(False)
         tk.Frame(panel, bg=C['red'], width=6).pack(side='left', fill='y')
@@ -1595,7 +1595,9 @@ class PeltierControl:
         tk.Label(inner, text="▶ START uses panel values",
                  bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
         tk.Label(inner, text="PID tuning & calibration → ADVANCED tab",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(2, 0))
+                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 justify='left', wraplength=SC(312) - SC(44)
+                 ).pack(anchor='w', fill='x', pady=(2, 0))
 
         self._set_panel_enabled(False)
 
@@ -2108,7 +2110,7 @@ class PeltierControl:
         body.pack(fill='both', expand=True)
 
         # Lista cykli z checkboxami (do porownywania)
-        lf = tk.Frame(body, bg=C['panel'], width=340)
+        lf = tk.Frame(body, bg=C['panel'], width=SC(340))
         lf.pack(side='left', fill='y', padx=(0, 12))
         lf.pack_propagate(False)
         tk.Frame(lf, bg=C['purple'], height=3).pack(fill='x')
@@ -2212,21 +2214,35 @@ class PeltierControl:
         tk.Label(wrap, text="SERIA POMIAROW", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(anchor='w')
         tk.Label(wrap,
-                 text="Dodaj testy (SP/RATE/czas trzymania) - apka zrobi je po kolei,\n"
+                 text="Dodaj testy (SP/RATE/czas trzymania) - apka zrobi je po kolei, "
                       "wraca do bazy miedzy testami i sama archiwizuje kazdy wynik.",
-                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left'
-                 ).pack(anchor='w', pady=(2, 12))
+                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
+                 wraplength=SC(760)
+                 ).pack(anchor='w', pady=(2, SC(12)))
 
         body = tk.Frame(wrap, bg=C['bg'])
         body.pack(fill='both', expand=True)
 
         # ── Lewa kolumna: dodawanie kroku + ustawienia bazy ──────────
-        left = tk.Frame(body, bg=C['panel'], width=280)
-        left.pack(side='left', fill='y', padx=(0, 12))
+        # SZEROKOSC: byla wpisana na sztywno jako 280 PIKSELI razem z
+        # pack_propagate(False), wiec kolumna NIGDY nie rosla pod tresc.
+        # Pomiar realnymi metrykami fontu pokazal, ze przy FS=1.0 najszerszy
+        # napis ma 342 px (a z marginesami trzeba 378) - czyli tekst byl
+        # przycinany JUZ BEZ skalowania DPI, a przy FS=1.5 nie miescily sie
+        # nawet same etykiety pol ("TRZYMANIE PO DOJSCIU (s)" = 288 px).
+        # Teraz: szerokosc skalowana przez SC(), z zapasem, a dlugie opisy
+        # maja wraplength (zawijaja sie zamiast rozpychac/wystawac).
+        SER_W = SC(320)
+        SER_PAD = SC(14)
+        self._ser_wrap = SER_W - 2 * SER_PAD - SC(6)
+        left = tk.Frame(body, bg=C['panel'], width=SER_W)
+        left.pack(side='left', fill='y', padx=(0, SC(12)))
         left.pack_propagate(False)
-        tk.Frame(left, bg=C['cyan'], height=3).pack(fill='x')
-        lin = tk.Frame(left, bg=C['panel'])
-        lin.pack(fill='x', padx=14, pady=12)
+        tk.Frame(left, bg=C['cyan'], height=SC(3)).pack(fill='x')
+        # Tresc kolumny PRZEWIJALNA: przy wiekszych fontach (FS=1.5) jest
+        # wyzsza niz okno i dolne pozycje (SZYBKIE WYPELNIENIE, przycisk
+        # quickfill) byly fizycznie nieosiagalne - ucinal je dol ekranu.
+        lin = make_scrollable(left, C['panel'], padx=SER_PAD, pady=SC(12))
 
         def _field(label, default):
             tk.Label(lin, text=label, bg=C['panel'], fg=C['dim'],
@@ -2284,12 +2300,11 @@ class PeltierControl:
         self.series_e_return_rate.insert(0, "80.0")
         self.series_e_return_rate.pack(fill='x', ipady=4)
         tk.Label(lin,
-                 text="wlasne, SZYBKIE tempo - niezalezne od COOL RATE na\n"
-                      "CONTROL (ten zostaje bez zmian, przywracany po serii).\n"
-                      "Domyslnie max (firmware i tak przytnie) - patrz komentarz\n"
-                      "w kodzie: wolniejsze tempo tu daje 'garb' na starcie powrotu.",
-                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(7)), justify='left'
-                 ).pack(anchor='w', pady=(2, 0))
+                 text="Niezalezne od COOL RATE na CONTROL. Domyslnie max - "
+                      "wolniejszy powrot daje 'garb' na starcie.",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
+                 wraplength=self._ser_wrap
+                 ).pack(anchor='w', fill='x', pady=(3, 0))
 
         # Zjazd jako PELNOPRAWNY TEST, a nie tylko dojazd do pozycji startowej.
         # PO CO: caly model mocy (FF_GAIN/FF_TEMP_GAIN w firmware) jest
@@ -2302,22 +2317,29 @@ class PeltierControl:
         # dokladnie to, czego potrzeba do skalibrowania galezi chlodzenia
         # ta sama metoda co grzania.
         self.series_cool_as_test = tk.BooleanVar(value=False)
-        tk.Checkbutton(lin, text="zjazd tez jako TEST (w tempie testu)",
+        tk.Checkbutton(lin, text="zjazd tez jako TEST",
                        variable=self.series_cool_as_test,
                        bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                        activebackground=C['panel'], activeforeground=C['text'],
-                       font=(FONT, fsz(8)), bd=0, highlightthickness=0,
-                       anchor='w').pack(anchor='w', fill='x', pady=(8, 0))
+                       font=(FONT, fsz(9)), bd=0, highlightthickness=0,
+                       anchor='w').pack(anchor='w', fill='x', pady=(SC(10), 0))
         tk.Label(lin,
-                 text="daje komplet danych do kalibracji CHLODZENIA\n"
-                      "(inaczej zjazd leci max tempem = tylko powrot)",
-                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(7)), justify='left'
-                 ).pack(anchor='w', pady=(2, 0))
+                 text="Zbiera dane do kalibracji chlodzenia. Inaczej zjazd "
+                      "leci max tempem (tylko powrot).",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
+                 wraplength=self._ser_wrap
+                 ).pack(anchor='w', fill='x', pady=(3, 0))
 
         tk.Label(lin, text="SZYBKIE WYPELNIENIE", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(16, 2))
-        mk_btn_outline(lin, "SP z pola x rampy 10/20/30/40/50/60/70",
+        # Krotszy napis - pelny ("SP z pola x rampy 10/20/30/40/50/60/70")
+        # nie miescil sie w kolumnie przy wiekszych fontach, a przycisk nie
+        # zawija tekstu, wiec konce byly ucinane.
+        mk_btn_outline(lin, "SP × rampy 10…70",
                        self._on_series_quickfill, C['purple']).pack(fill='x')
+        tk.Label(lin, text="doda 7 testow: 10/20/30/40/50/60/70 °C/min",
+                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
+                 wraplength=self._ser_wrap).pack(anchor='w', fill='x', pady=(3, 0))
 
         # ── Prawa kolumna: lista + status + start/stop ──────────
         right = tk.Frame(body, bg=C['panel'])
@@ -3766,10 +3788,10 @@ class CalibrationWindow:
                  bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 10))
 
         # Pasek postepu (liczony w temperaturach)
-        self.prog_frame = tk.Frame(inner, bg=C['bg2'], height=30)
+        self.prog_frame = tk.Frame(inner, bg=C['bg2'], height=SC(30))
         self.prog_frame.pack(fill='x', pady=(0, 10))
         self.prog_frame.pack_propagate(False)
-        self.prog_bar = tk.Frame(self.prog_frame, bg=C['purple'], height=30)
+        self.prog_bar = tk.Frame(self.prog_frame, bg=C['purple'], height=SC(30))
         self.prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
         self.prog_text = tk.Label(self.prog_frame, text="0 / 0 temperatur", bg=C['bg2'],
                                   fg=C['text'], font=(FONT, fsz(11), 'bold'))
