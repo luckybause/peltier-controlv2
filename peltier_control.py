@@ -61,7 +61,7 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.8"
+APP_BUILD = "2026-08-25.9"
 
 # Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
 # PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
@@ -75,6 +75,91 @@ FS = 1.0
 def fsz(n):
     """Skaluje rozmiar fontu wg globalnego DPI."""
     return max(6, int(round(n * FS)))
+
+def SC(px):
+    """Skaluje rozmiar W PIKSELACH tym samym mnoznikiem co fonty.
+
+    PROBLEM KTORY TO NAPRAWIA: fonty byly skalowane przez FS (np. x1.5 przy
+    DPI 150%), ale rozmiary okien byly WPISANE NA SZTYWNO W PIKSELACH
+    ("640x780" itp.). Poniewaz aplikacja jest Per-Monitor DPI Aware v2,
+    Windows JEJ NIE SKALUJE - te 640x780 to fizyczne piksele, czyli na
+    ekranie o duzym DPI okno jest FIZYCZNIE MNIEJSZE, a napisy w nim
+    JEDNOCZESNIE wieksze. Efekt: tekst nie miescil sie i byl przycinany -
+    najmocniej w oknach kalibracji, bo one maja najwiecej tresci
+    (560x680 i 640x780). Teraz kazdy sztywny rozmiar przechodzi przez SC().
+    """
+    return int(round(px * FS))
+
+def make_scrollable(parent, bg, padx=0, pady=0):
+    """Zwraca ramke, ktora przewija sie w pionie gdy tresc nie miesci sie w oknie.
+
+    Po co: przy duzym DPI okna sa przycinane do wysokosci ekranu (patrz
+    size_win), wiec tresc moze byc wyzsza niz okno. Bez przewijania dolne
+    pola i przyciski sa wtedy fizycznie nieosiagalne.
+    """
+    wrap = tk.Frame(parent, bg=bg)
+    wrap.pack(fill='both', expand=True)
+    cv = tk.Canvas(wrap, bg=bg, highlightthickness=0, bd=0)
+    sb = tk.Scrollbar(wrap, orient='vertical', command=cv.yview)
+    cv.configure(yscrollcommand=sb.set)
+    sb.pack(side='right', fill='y')
+    cv.pack(side='left', fill='both', expand=True, padx=padx, pady=pady)
+    inner = tk.Frame(cv, bg=bg)
+    wid = cv.create_window((0, 0), window=inner, anchor='nw')
+
+    def _cfg(_e=None):
+        try:
+            cv.configure(scrollregion=cv.bbox('all'))
+            cv.itemconfigure(wid, width=cv.winfo_width())
+        except Exception:
+            pass
+    inner.bind('<Configure>', _cfg)
+    cv.bind('<Configure>', _cfg)
+
+    def _wheel(e):
+        try:
+            cv.yview_scroll(int(-e.delta / 120), 'units')
+        except Exception:
+            pass
+    # Kolko myszy tylko gdy kursor jest nad tym obszarem - zeby nie przejmowac
+    # przewijania calej aplikacji.
+    cv.bind('<Enter>', lambda e: cv.bind_all('<MouseWheel>', _wheel))
+    cv.bind('<Leave>', lambda e: cv.unbind_all('<MouseWheel>'))
+    return inner
+
+
+def size_win(win, w, h, minw=None, minh=None, parent=None):
+    """Ustaw rozmiar okna: przeskaluj wg DPI, przytnij do ekranu, wysrodkuj.
+
+    Przyciecie do ekranu jest istotne: po przeskalowaniu x1.5 okno 640x780
+    urosloby do 960x1170, czyli WIECEJ niz wysokosc typowego ekranu 1080p -
+    i czesc tresci (w tym przyciski) wyladowalaby poza widocznym obszarem.
+    Okna sa tez zawsze resizable, zeby dalo sie je powiekszyc recznie.
+    """
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    W = min(SC(w), max(320, sw - SC(40)))
+    H = min(SC(h), max(240, sh - SC(80)))
+    win.geometry(f"{W}x{H}")
+    if minw is not None and minh is not None:
+        win.minsize(min(SC(minw), W), min(SC(minh), H))
+    try:
+        win.resizable(True, True)
+    except Exception:
+        pass
+    try:
+        if parent is not None:
+            parent.update_idletasks()
+            px = parent.winfo_rootx() + parent.winfo_width() // 2 - W // 2
+            py = parent.winfo_rooty() + parent.winfo_height() // 2 - H // 2
+        else:
+            px = (sw - W) // 2
+            py = (sh - H) // 2
+        px = max(0, min(px, sw - W))
+        py = max(0, min(py, sh - H))
+        win.geometry(f"+{px}+{py}")
+    except Exception:
+        pass
+    return W, H
 
 def _font(size, weight='normal'):
     """Zwraca tuple fontu z fallbackiem"""
@@ -254,8 +339,9 @@ class PeltierControl:
         self.root = root
         self.root.title(f"PeltierControl v6.0 - BRUTALIST  [APP {APP_BUILD}]")
         self.root.configure(bg=C['bg'])
-        self.root.geometry("1280x800")
-        self.root.minsize(1100, 720)
+        # Rozmiar okna glownego TEZ skalowany wg DPI i przyciety do ekranu -
+        # patrz komentarz przy SC()/size_win().
+        size_win(self.root, 1280, 800, 1100, 720)
 
         # Serial
         self.ser = None
@@ -1026,7 +1112,7 @@ class PeltierControl:
         win = tk.Toplevel(self.root)
         win.title("Calibration Table")
         win.configure(bg=C['bg'])
-        win.geometry("720x520")
+        size_win(win, 720, 520, 560, 400, parent=self.root)
         tk.Label(win, text="CALIBRATION TABLE — heating PID (Kp / Ki / Kd)",
                  bg=C['bg'], fg=C['purple'], font=(FONT, fsz(12), 'bold')).pack(
                  anchor='w', padx=16, pady=(14, 4))
@@ -2747,7 +2833,7 @@ class PeltierControl:
         win = tk.Toplevel(self.root)
         win.title("Cycle statistics")
         win.configure(bg=C['bg'])
-        win.geometry("440x520")
+        size_win(win, 440, 520, 380, 380, parent=self.root)
         win.transient(self.root)
         tk.Frame(win, bg=C['purple'], height=4).pack(fill='x')
         inner = tk.Frame(win, bg=C['bg'])
@@ -3481,21 +3567,20 @@ class CalRangeDialog:
         self.win = tk.Toplevel(parent)
         self.win.title("Auto-Calibration Range")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("560x680")
-        self.win.minsize(540, 640)
+        size_win(self.win, 560, 680, 540, 520, parent=parent)
         self.win.transient(parent)
         self.win.grab_set()
-        # Wycentruj wzgledem rodzica
-        self.win.update_idletasks()
-        try:
-            px = parent.winfo_rootx() + parent.winfo_width()//2 - 280
-            py = parent.winfo_rooty() + parent.winfo_height()//2 - 340
-            self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
-        except: pass
 
         tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
-        inner = tk.Frame(self.win, bg=C['bg'])
-        inner.pack(fill='both', expand=True, padx=24, pady=20)
+        # Pasek przyciskow PRZYPIETY NA DOLE OKNA, poza obszarem przewijania -
+        # wczesniej START/CANCEL byly na koncu dlugiej listy w 'inner' i przy
+        # mniejszym oknie (albo wiekszych fontach) wychodzily poza ekran, wiec
+        # nie dalo sie kliknac "START CALIBRATION".
+        self._btnbar = tk.Frame(self.win, bg=C['bg'])
+        self._btnbar.pack(side='bottom', fill='x', padx=24, pady=(0, 16))
+        # Reszta tresci przewijalna - gwarantuje dostep do kazdego pola
+        # niezaleznie od DPI i rozmiaru okna.
+        inner = make_scrollable(self.win, C['bg'], padx=24, pady=20)
 
         tk.Label(inner, text="AUTO-CALIBRATION RANGE", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(14), 'bold')).pack(anchor='w')
@@ -3563,9 +3648,8 @@ class CalRangeDialog:
         self.est_lbl.pack(anchor='w', pady=(0, 12))
         self._use_recommended_ramps()  # domyslnie wybrana (zamiast _set_step(10)) - woala tez _update_estimate()
 
-        # Przyciski
-        bf = tk.Frame(inner, bg=C['bg'])
-        bf.pack(fill='x')
+        # Przyciski - w przypietym pasku na dole okna (patrz self._btnbar)
+        bf = self._btnbar
         mk_btn(bf, "▶ START CALIBRATION", self.start, C['purple'], fg='#fff').pack(
             side='left', fill='x', expand=True, padx=(0, 4))
         mk_btn_outline(bf, "CANCEL", self.win.destroy, C['dim']).pack(
@@ -3669,15 +3753,8 @@ class CalibrationWindow:
         self.win = tk.Toplevel(parent)
         self.win.title("Calibration progress")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("640x780")
-        self.win.minsize(600, 700)
+        size_win(self.win, 640, 780, 600, 560, parent=parent)
         self.win.transient(parent)
-        self.win.update_idletasks()
-        try:
-            px = parent.winfo_rootx() + parent.winfo_width()//2 - 320
-            py = parent.winfo_rooty() + parent.winfo_height()//2 - 390
-            self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
-        except: pass
 
         tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
         inner = tk.Frame(self.win, bg=C['bg'])
@@ -3932,17 +4009,9 @@ class DiagnosticsWindow:
         self.win = tk.Toplevel(parent)
         self.win.title("Diagnostyka")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("640x560")
-        self.win.minsize(480, 360)
+        size_win(self.win, 640, 560, 480, 360, parent=parent)
         self.win.transient(parent)
         self.win.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.win.update_idletasks()
-        try:
-            px = parent.winfo_rootx() + parent.winfo_width()//2 - 320
-            py = parent.winfo_rooty() + parent.winfo_height()//2 - 280
-            self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
-        except Exception:
-            pass
 
         tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
         inner = tk.Frame(self.win, bg=C['bg'])
@@ -4053,15 +4122,8 @@ class PresetWindow:
         self.win = tk.Toplevel(parent)
         self.win.title("Presets")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("520x560")
-        self.win.minsize(480, 480)
+        size_win(self.win, 520, 560, 460, 420, parent=parent)
         self.win.transient(parent)
-        self.win.update_idletasks()
-        try:
-            px = parent.winfo_rootx() + parent.winfo_width()//2 - 260
-            py = parent.winfo_rooty() + parent.winfo_height()//2 - 280
-            self.win.geometry(f"+{max(0,px)}+{max(0,py)}")
-        except: pass
 
         tk.Frame(self.win, bg=C['green'], height=4).pack(fill='x')
         inner = tk.Frame(self.win, bg=C['bg'])
@@ -4172,7 +4234,7 @@ class SaveCycleDialog:
         self.win = tk.Toplevel(parent)
         self.win.title("Save cycle")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("440x230")
+        size_win(self.win, 440, 230, 400, 200, parent=parent)
         self.win.transient(parent)
         self.win.grab_set()  # modalne
 
@@ -4236,7 +4298,7 @@ class ProfileWindow:
         self.win = tk.Toplevel(parent)
         self.win.title("Multi-step profiles")
         self.win.configure(bg=C['bg'])
-        self.win.geometry("520x480")
+        size_win(self.win, 520, 480, 440, 360, parent=parent)
         self.win.transient(parent)
 
         tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
@@ -4395,12 +4457,17 @@ def main():
 
     root = tk.Tk()
 
-    # Tk scaling dla widgetow ttk (Notebook itp.)
-    try:
-        if scale and scale > 1.05:
-            root.tk.call('tk', 'scaling', scale)
-    except Exception:
-        pass
+    # USUNIETE: root.tk.call('tk','scaling', scale)
+    # To bylo DRUGIE, niezalezne skalowanie nalozone na FS - i oba sie bily.
+    # Tk przelicza rozmiar fontu (podany dodatnio = w PUNKTACH) na piksele
+    # przez wlasny wspolczynnik 'tk scaling'. Kod ustawial go na dpi/96
+    # (np. 1.5), podczas gdy domyslny na Windows to 96/72 = 1.333 - a
+    # JEDNOCZESNIE mnozyl kazdy rozmiar fontu przez FS=1.5. Wychodzilo
+    # ~1.69x zamiast 1.5x, i to NIESPoJNIE miedzy widgetami (ttk kontra
+    # zwykle tk), bo nie kazdy widget przechodzi ta sama sciezka.
+    # Teraz zostaje JEDEN mnoznik: FS - fonty przez fsz(), piksele przez
+    # SC()/size_win(). Font zakladek ttk.Notebook i tak jest ustawiany
+    # jawnie w _build_styles(), wiec nic na tym nie traci.
 
     app = PeltierControl(root)
 
