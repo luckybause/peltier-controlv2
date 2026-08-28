@@ -61,7 +61,7 @@ FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
 # apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
 # Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
 # sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.11"
+APP_BUILD = "2026-08-25.12"
 
 # Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
 # PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
@@ -403,9 +403,17 @@ class PeltierControl:
         self.chart_paused = False      # pauza przewijania (do zoomu)
         self.chart_window = 0          # 0 = caly przebieg, >0 = ostatnie N sekund
 
-        # CSV cyklu
-        self.log_dir = Path.home() / "PeltierLogi"
-        self.log_dir.mkdir(exist_ok=True)
+        # ── GDZIE LADUJA DANE ────────────────────────────────────────────
+        # cfg_dir  - STALY folder aplikacji (kalibracja, presety, ustawienia).
+        #            Nie wedruje razem z danymi, zeby zmiana miejsca zapisu
+        #            pomiarow nigdy nie "zgubila" kalibracji urzadzenia.
+        # log_dir  - folder NA DANE POMIAROWE, wybierany przez uzytkownika
+        #            (zakladka ARCHIVE -> ZMIEN / NOWY). Zapamietywany miedzy
+        #            uruchomieniami w ustawienia.json.
+        self.cfg_dir = Path.home() / "PeltierLogi"
+        self.cfg_dir.mkdir(exist_ok=True)
+        self.settings_file = self.cfg_dir / "ustawienia.json"
+        self.log_dir = self._load_data_dir()
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
         # Podpowiedz nazwy dla NASTEPNEGO zapisu archiwum (patrz cyc_stop) -
         # gdy ustawiona, pomija interaktywny dialog "SAVE CYCLE TO ARCHIVE"
@@ -458,9 +466,11 @@ class PeltierControl:
         self.diag_unseen = 0      # licznik nowych ERR/WARN od ostatniego otwarcia okna
         self.diag_win = None      # referencja do otwartego okna diagnostyki (albo None)
 
-        # Zapis kalibracji na dysku PC
-        self.cal_file = self.log_dir / "kalibracja.json"
-        self.presets_file = self.log_dir / "presety.json"
+        # Zapis kalibracji na dysku PC - w STALYM cfg_dir, nie w folderze
+        # danych (patrz komentarz przy self.cfg_dir): zmiana miejsca zapisu
+        # pomiarow nie moze odciac aplikacji od kalibracji urzadzenia.
+        self.cal_file = self.cfg_dir / "kalibracja.json"
+        self.presets_file = self.cfg_dir / "presety.json"
         self._caldump_buf = []     # bufor odbieranych profili
         self._caldump_active = False
         self._caldump_purpose = None  # 'save' lub None
@@ -2099,12 +2109,33 @@ class PeltierControl:
         wrap.pack(fill='both', expand=True, padx=16, pady=16)
 
         hd = tk.Frame(wrap, bg=C['bg'])
-        hd.pack(fill='x', pady=(0, 12))
+        hd.pack(fill='x', pady=(0, 6))
         tk.Label(hd, text="CYCLE ARCHIVE", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
-        tk.Label(hd, text="  tip: tick boxes to overlay & compare cycles",
+        tk.Label(hd, text="  zaznacz cykle po lewej, wybierz krzywe i os X ponizej",
                  bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8))).pack(side='left', padx=(8, 0))
         mk_btn(hd, "REFRESH", self.refresh_arch, C['cyan']).pack(side='right')
+
+        # ── FOLDER NA DANE POMIAROWE ────────────────────────────────────
+        # Widoczny tutaj, bo to jest miejsce, w ktorym uzytkownik oglada
+        # zapisane pomiary - naturalne miejsce, zeby zobaczyc i zmienic,
+        # gdzie one w ogole ladują.
+        dd = tk.Frame(wrap, bg=C['bg2'])
+        dd.pack(fill='x', pady=(0, 10))
+        tk.Frame(dd, bg=C['green'], width=SC(4)).pack(side='left', fill='y')
+        tk.Label(dd, text="DANE:", bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(9), 'bold')).pack(side='left', padx=(10, 6), pady=6)
+        self.data_dir_lbl = tk.Label(dd, text="", bg=C['bg2'], fg=C['text'],
+                                     font=(FONT, fsz(9)), anchor='w')
+        self.data_dir_lbl.pack(side='left', fill='x', expand=True, pady=6)
+        mk_btn_outline(dd, "📂 OTWORZ", self.open_log_folder, C['dim']).pack(
+            side='right', padx=(4, 8), pady=4)
+        mk_btn_outline(dd, "＋ NOWY", self.create_data_dir, C['green']).pack(
+            side='right', padx=4, pady=4)
+        mk_btn_outline(dd, "ZMIEN…", self.choose_data_dir, C['cyan']).pack(
+            side='right', padx=4, pady=4)
+        self._update_data_dir_label()
+        self._bind_tooltip(self.data_dir_lbl, str(self.log_dir))
 
         body = tk.Frame(wrap, bg=C['bg'])
         body.pack(fill='both', expand=True)
@@ -2147,18 +2178,44 @@ class PeltierControl:
         cf = tk.Frame(body, bg=C['panel'])
         cf.pack(side='left', fill='both', expand=True)
         tk.Frame(cf, bg=C['border2'], height=3).pack(fill='x')
-        self.fig_a = Figure(figsize=(8, 6), facecolor=C['panel'], dpi=110)
+        # KOLEJNOSC PAKOWANIA JEST ISTOTNA. Figura ma WLASNY zadany rozmiar
+        # (figsize x dpi = ok. 880x500 px). Gdy canvas spakuje sie pierwszy z
+        # expand=True, pack przydziela mu ten zadany rozmiar, a wiersze
+        # spakowane PO nim dostaja to, co zostanie - czyli przy nizszym oknie
+        # dokladnie 1 piksel. Objaw: paski "OS X" i "KRZYWE" istnialy, ale
+        # mialy wymiar 1x1 i byly niewidoczne (wykryte testem geometrii przy
+        # 1600x900 i 1366x768). Dlatego wszystkie wiersze sterujace pakujemy
+        # NAJPIERW, od dolu (side='bottom'), a canvas dostaje reszte.
+        self.fig_a = Figure(figsize=(8, 4.5), facecolor=C['panel'], dpi=110)
         self.ax_a = self.fig_a.add_subplot(111)
         self.ax_a.set_facecolor(C['panel2'])
+
+        # Panel nastaw przebiegu - najnizszy wiersz
+        self.arch_settings = tk.Frame(cf, bg=C['bg2'])
+        self.arch_settings.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
+        self.arch_settings_lbl = tk.Label(self.arch_settings, text="",
+                                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
+                                         anchor='w', justify='left')
+        self.arch_settings_lbl.pack(fill='x', padx=10, pady=6)
+
+        crow = tk.Frame(cf, bg=C['panel'])
+        crow.pack(side='bottom', fill='x', padx=8, pady=(0, 6))
+        # OS X ma WLASNY wiersz - dzielenie go z przyciskami eksportu
+        # powodowalo, ze przy wiekszych fontach ostatnie opcje ("zegar PC",
+        # "start rampy", "wzgl. temperatury") nie miescily sie w szerokosci
+        # i dostawaly rozmiar 1x1, czyli znikaly.
+        xrow = tk.Frame(cf, bg=C['panel'])
+        xrow.pack(side='bottom', fill='x', padx=8, pady=(0, 4))
+        atb = tk.Frame(cf, bg=C['panel'])
+        atb.pack(side='bottom', fill='x', padx=8, pady=(2, 6))
+        tbf = tk.Frame(cf, bg='#3a3f44')
+        tbf.pack(side='bottom', fill='x', padx=8, pady=(4, 0))
+
+        # Canvas dostaje CALA pozostala przestrzen
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
         self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
         # Pierwszy rysunek PRZED toolbarem - inicjalizuje canvas
         self.cv_a.draw()
-
-        # Pasek narzedzi matplotlib - WLASNY wiersz, po draw()
-        # Toolbar musi powstac po pierwszym draw, inaczej zoom/pan nie dzialaja
-        tbf = tk.Frame(cf, bg='#3a3f44')
-        tbf.pack(fill='x', padx=8, pady=(4, 0))
         try:
             self.mpl_toolbar_a = NavigationToolbar2Tk(self.cv_a, tbf, pack_toolbar=False)
             self.mpl_toolbar_a.config(bg='#3a3f44')
@@ -2171,10 +2228,7 @@ class PeltierControl:
         except Exception as e:
             print(f"arch toolbar err: {e}")
 
-        # Przyciski eksportu - wiersz pod toolbarem
-        atb = tk.Frame(cf, bg=C['panel'])
-        atb.pack(fill='x', padx=8, pady=(2, 8))
-
+        # Przyciski eksportu - w wierszu 'atb' utworzonym wyzej
         mk_btn_outline(atb, "⤓ CSV", self.export_arch_csv, C['green']).pack(
             side='right', padx=(4, 0))
         mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(
@@ -2185,20 +2239,63 @@ class PeltierControl:
             side='right', padx=(4, 0))
         mk_btn_outline(atb, "📁", self.open_log_folder, C['dim']).pack(
             side='right', padx=(4, 0))
-        # Tryb osi X
+        # ── TRYB OSI X ──────────────────────────────────────────────────
+        # arch_align zostaje dla zgodnosci ze starym kodem (uzywa go m.in.
+        # eksport), ale sterowany jest juz trybem ponizej.
         self.arch_align = tk.BooleanVar(value=True)
-        tk.Checkbutton(atb, text="align from t=0", variable=self.arch_align,
-                      command=self._redraw_arch, bg=C['panel'], fg=C['dim'],
-                      selectcolor=C['bg2'], activebackground=C['panel'],
-                      font=(FONT, fsz(8)), bd=0, highlightthickness=0).pack(side='left')
+        self.arch_xmode = tk.StringVar(value='t0')
+        tk.Label(xrow, text="OS X:", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
+        for val, txt in (('t0', 'od startu'), ('abs', 'czas pliku'),
+                         ('pc', 'zegar PC'), ('ramp', 'start rampy'),
+                         ('temp', 'wzgl. temperatury')):
+            tk.Radiobutton(xrow, text=txt, value=val, variable=self.arch_xmode,
+                           command=self._on_xmode_change, bg=C['panel'], fg=C['dim'],
+                           selectcolor=C['bg2'], activebackground=C['panel'],
+                           activeforeground=C['text'], font=(FONT, fsz(8)),
+                           bd=0, highlightthickness=0).pack(side='left')
+        # Temperatura odniesienia dla trybu "wzgl. temperatury"
+        self.arch_treflbl = tk.Label(xrow, text="T=", bg=C['panel'], fg=C['dim'],
+                                     font=(FONT, fsz(8)))
+        self.arch_treflbl.pack(side='left', padx=(8, 2))
+        self.arch_tref = tk.Entry(xrow, width=6, bg=C['bg2'], fg=C['text'],
+                                  font=(FONT, fsz(9)), relief='flat',
+                                  insertbackground=C['text'])
+        self.arch_tref.insert(0, "40.0")
+        self.arch_tref.pack(side='left')
+        self.arch_tref.bind('<Return>', lambda e: self._redraw_arch())
+        self.arch_tref.bind('<FocusOut>', lambda e: self._redraw_arch())
 
-        # Panel nastaw przebiegu (pokazuje SP/rampy/PID zaznaczonego cyklu)
-        self.arch_settings = tk.Frame(cf, bg=C['bg2'])
-        self.arch_settings.pack(fill='x', padx=8, pady=(0, 8))
-        self.arch_settings_lbl = tk.Label(self.arch_settings, text="",
-                                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
-                                         anchor='w', justify='left')
-        self.arch_settings_lbl.pack(fill='x', padx=10, pady=6)
+        # ── KTORE KRZYWE RYSOWAC ────────────────────────────────────────
+        tk.Label(crow, text="KRZYWE:", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
+        self.arch_show = {}
+        for key, txt, dflt in (('temp', 'temperatura', True),
+                               ('sa', 'setpoint', True),
+                               ('st', 'cel', True),
+                               ('t2', 'temp 2', False),
+                               ('pwm', 'PWM', False)):
+            v = tk.BooleanVar(value=dflt)
+            self.arch_show[key] = v
+            tk.Checkbutton(crow, text=txt, variable=v, command=self._redraw_arch,
+                           bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                           activebackground=C['panel'], activeforeground=C['text'],
+                           font=(FONT, fsz(8)), bd=0, highlightthickness=0
+                           ).pack(side='left', padx=(0, 4))
+        mk_btn_outline(crow, "ZAZNACZ WSZYSTKIE", self._arch_select_all, C['dim']
+                       ).pack(side='right')
+        # Porownanie przebiegow WZGLEDEM SIEBIE: zamiast temperatur rysujemy
+        # ROZNICE kazdego przebiegu wzgledem pierwszego zaznaczonego
+        # (interpolowana na wspolna os czasu). Roznice widac duzo lepiej niz
+        # przy nakladaniu dwoch prawie identycznych krzywych.
+        self.arch_delta = tk.BooleanVar(value=False)
+        tk.Checkbutton(xrow, text="roznica wzgl. 1.", variable=self.arch_delta,
+                       command=self._redraw_arch, bg=C['panel'], fg=C['yellow'],
+                       selectcolor=C['bg2'], activebackground=C['panel'],
+                       activeforeground=C['text'], font=(FONT, fsz(8)),
+                       bd=0, highlightthickness=0).pack(side='right', padx=(0, 10))
+
+        # (panel nastaw przebiegu utworzony wyzej, jako najnizszy wiersz)
 
         self.refresh_arch()
         # Narysuj pusty wykres od razu - inicjalizuje canvas i toolbar
@@ -2316,6 +2413,30 @@ class PeltierControl:
         # 7 przebiegow grzania I 7 przebiegow chlodzenia w roznych tempach,
         # dokladnie to, czego potrzeba do skalibrowania galezi chlodzenia
         # ta sama metoda co grzania.
+        # TRYB: "seria testow" (po kazdym tescie powrot do bazy - do
+        # porownywania pojedynczych ramp) albo "program" (kroki lecą jeden po
+        # drugim od miejsca, w ktorym skonczyl sie poprzedni - do zadawania
+        # przebiegow typu: dojedz do 50, potrzymaj, zejdz do 30, potrzymaj).
+        # Kazdy krok i tak zapisuje sie jako OSOBNY, normalny pomiar w
+        # archiwum, wiec porownuje sie go dokladnie tak samo jak reczny.
+        self.series_mode = tk.StringVar(value='seria')
+        tk.Label(lin, text="TRYB", bg=C['panel'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(anchor='w', pady=(SC(10), 2))
+        for val, txt in (('seria', 'seria testow (powrot do bazy)'),
+                         ('program', 'program (krok po kroku)')):
+            tk.Radiobutton(lin, text=txt, value=val, variable=self.series_mode,
+                           bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
+                           activebackground=C['panel'], activeforeground=C['text'],
+                           font=(FONT, fsz(8)), bd=0, highlightthickness=0,
+                           anchor='w', wraplength=self._ser_wrap,
+                           justify='left').pack(anchor='w', fill='x')
+        pf = tk.Frame(lin, bg=C['panel'])
+        pf.pack(fill='x', pady=(SC(6), 0))
+        mk_btn_outline(pf, "ZAPISZ PROGRAM", self._series_save_prog, C['dim']).pack(
+            side='left', fill='x', expand=True, padx=(0, 2))
+        mk_btn_outline(pf, "WCZYTAJ", self._series_load_prog, C['dim']).pack(
+            side='left', fill='x', expand=True, padx=(2, 0))
+
         self.series_cool_as_test = tk.BooleanVar(value=False)
         tk.Checkbutton(lin, text="zjazd tez jako TEST",
                        variable=self.series_cool_as_test,
@@ -2577,6 +2698,7 @@ class PeltierControl:
         t, temp, spt, pwm = [], [], [], []
         temp2 = []
         sa_list = []
+        pc_raw = []
         for r in data:
             cz = r.get('czas_s', '')
             if not cz or cz.startswith('#'):
@@ -2603,12 +2725,49 @@ class PeltierControl:
                 temp2.append(float(t2v) if t2v else None)
             except:
                 temp2.append(None)
+            # czas PC (kolumna dodana pozniej - stare pliki jej nie maja)
+            pc_raw.append(r.get('czas_pc', '') or '')
         if not t:
             return None
         # Dolacz temp2 i setpoint aktywny jako atrybuty (kompatybilnie - zwracamy 4)
         self._last_temp2 = temp2
         self._last_sa = sa_list
+        self._last_pc = self._pc_seconds(pc_raw, t, path)
         return t, temp, spt, pwm
+
+    def _pc_seconds(self, pc_raw, t, path):
+        """Zamien kolumne czas_pc na sekundy epoki. Dla starych plikow (bez
+        tej kolumny) odtwarza os czasu z daty modyfikacji pliku: mtime to
+        moment ZAMKNIECIA, wiec start = mtime - dlugosc przebiegu."""
+        out = []
+        ok = False
+        for sraw in pc_raw:
+            v = None
+            if sraw:
+                try:
+                    dt = datetime.strptime(sraw[:23], "%Y-%m-%d %H:%M:%S.%f")
+                    v = dt.timestamp(); ok = True
+                except Exception:
+                    try:
+                        dt = datetime.strptime(sraw[:19], "%Y-%m-%d %H:%M:%S")
+                        v = dt.timestamp(); ok = True
+                    except Exception:
+                        v = None
+            out.append(v)
+        if ok:
+            # uzupelnij ewentualne dziury liniowo wzgledem czas_s
+            base = next((i for i, v in enumerate(out) if v is not None), None)
+            if base is not None:
+                t0 = out[base] - t[base]
+                out = [v if v is not None else t0 + t[i] for i, v in enumerate(out)]
+            return out
+        # fallback: z mtime pliku
+        try:
+            end = Path(path).stat().st_mtime
+            t0 = end - (t[-1] - t[0])
+            return [t0 + (x - t[0]) for x in t]
+        except Exception:
+            return [None] * len(t)
 
     def _compute_stats(self, data):
         """Oblicz pelne statystyki przebiegu. data=(t,temp,spt,pwm). Zwraca dict."""
@@ -2663,14 +2822,83 @@ class PeltierControl:
 
         return st
 
+    def _on_xmode_change(self):
+        """Radiobutton osi X -> zsynchronizuj stary arch_align i przerysuj."""
+        self.arch_align.set(self.arch_xmode.get() != 'abs')
+        self._redraw_arch()
+
+    def _arch_select_all(self):
+        """Zaznacz wszystkie cykle (a gdy juz wszystkie - odznacz)."""
+        if not self.arch_vars:
+            return
+        target = not all(v.get() for v in self.arch_vars.values())
+        for v in self.arch_vars.values():
+            v.set(target)
+        self._redraw_arch()
+
+    def _arch_t_offset(self, t, temp, mode, tref):
+        """Przesuniecie osi X dla jednego przebiegu, wg wybranego trybu."""
+        if mode == 'abs':
+            return 0.0
+        if mode == 'temp':
+            # Znajdz PIERWSZE przejscie przez tref (z interpolacja liniowa
+            # miedzy probkami) i przyjmij ten moment za zero. Dzieki temu
+            # przebiegi o roznych temperaturach startowych naklada sie
+            # dokladnie w tym samym punkcie termicznym, a nie czasowym.
+            for i in range(1, len(temp)):
+                a, b = temp[i-1], temp[i]
+                if (a - tref) * (b - tref) <= 0 and a != b:
+                    f = (tref - a) / (b - a)
+                    return t[i-1] + f * (t[i] - t[i-1])
+                if a == tref:
+                    return t[i-1]
+            return t[0]      # nie osiagnieto tref - wyrownaj od startu
+        if mode == 'ramp':
+            # Zero = moment, w ktorym rampa REALNIE rusza. Wykrywamy po
+            # setpoincie aktywnym (spA): dopoki stoi, jestesmy przed startem.
+            # To wyrownuje przebiegi o roznej dlugosci "rozbiegu" przed
+            # wlasciwa rampa (np. gdy jeden zaczal z zimnego urzadzenia).
+            sa = self._last_sa or []
+            for i in range(1, min(len(sa), len(t))):
+                if sa[i] is not None and sa[0] is not None and abs(sa[i]-sa[0]) > 0.05:
+                    return t[i]
+            # brak spA (stary plik) - fallback: pierwsza wyrazna zmiana temp
+            for i in range(1, len(temp)):
+                if abs(temp[i]-temp[0]) > 0.3:
+                    return t[i]
+            return t[0]
+        return t[0]          # 't0'
+
     def _redraw_arch(self):
         """Narysuj wszystkie zaznaczone cykle (porownanie)"""
         selected = [(p, v) for p, v in self.arch_vars.items() if v.get()]
         self.ax_a.clear()
+        # Druga os (PWM) tworzona na zadanie - kasujemy stara przy kazdym
+        # przerysowaniu, inaczej narastalyby kolejne osie.
+        if getattr(self, '_ax_pwm', None) is not None:
+            try: self._ax_pwm.remove()
+            except Exception: pass
+            self._ax_pwm = None
         self.ax_a.set_facecolor(C['panel2'])
 
+        mode = self.arch_xmode.get() if hasattr(self, 'arch_xmode') else 't0'
+        show = {k: v.get() for k, v in getattr(self, 'arch_show', {}).items()} or \
+               {'temp': True, 'sa': True, 'st': True, 't2': False, 'pwm': False}
+        try:
+            tref = float(self.arch_tref.get().replace(',', '.'))
+        except Exception:
+            tref = 40.0
+        # Pole T= ma sens tylko w trybie "wzgl. temperatury"
+        if hasattr(self, 'arch_tref'):
+            st_ = 'normal' if mode == 'temp' else 'disabled'
+            try:
+                self.arch_tref.config(state=st_)
+                self.arch_treflbl.config(fg=C['cyan'] if mode == 'temp' else C['dim2'])
+            except Exception:
+                pass
+
         if not selected:
-            self.ax_a.text(0.5, 0.5, "Tick one or more cycles to display",
+            self.ax_a.text(0.5, 0.5, "Zaznacz jeden lub wiecej cykli po lewej",
                           ha='center', va='center', color=C['dim2'],
                           fontsize=11, transform=self.ax_a.transAxes)
             self.cv_a.draw()
@@ -2680,60 +2908,155 @@ class PeltierControl:
 
         files = sorted([f for f in self.log_dir.glob("*.csv") if (f.name.startswith("cykl_") or f.name.startswith("c_")) and not f.name.startswith("_tmp")], reverse=True)
         file_order = {str(f): i for i, f in enumerate(files)}
-        align = self.arch_align.get()
 
         multi = len(selected) > 1
-        # Sprawdz maksymalny czas (do wyboru jednostki osi: s czy min)
-        max_t = 0
-        for path, _ in selected:
-            d = self._load_cycle_data(path)
-            if d and d[0]:
-                span = d[0][-1] - (d[0][0] if align else 0)
-                max_t = max(max_t, span)
-        use_min = max_t > 180  # powyzej 3 min -> osi w minutach
-        tdiv = 60.0 if use_min else 1.0
 
+        # ── Zbierz dane wszystkich zaznaczonych, policz przesuniecia ──────
+        series = []
         for path, _ in selected:
             d = self._load_cycle_data(path)
             if not d: continue
             t, temp, spt, pwm = d
-            sa = getattr(self, '_last_sa', None)
+            series.append(dict(path=path, t=t, temp=temp, spt=spt, pwm=pwm,
+                               sa=list(self._last_sa or []),
+                               t2=list(self._last_temp2 or []),
+                               pc=list(self._last_pc or [])))
+        if not series:
+            self.cv_a.draw(); return
+        # Kolejnosc = taka jak na liscie po lewej. Wazne dla trybu "roznica
+        # wzgl. 1." - odniesieniem ma byc przebieg, ktory uzytkownik widzi
+        # jako pierwszy, a nie przypadkowa kolejnosc slownika zaznaczen.
+        series.sort(key=lambda z: file_order.get(z['path'], 10**6))
+
+        if mode == 'pc':
+            # Wspolna os = zegar PC. Zero bierzemy z NAJWCZESNIEJSZEGO
+            # przebiegu, zeby liczby na osi byly male, a etykiety i tak
+            # pokazuja prawdziwa godzine (formatter nizej).
+            starts = [s['pc'][0] for s in series if s['pc'] and s['pc'][0] is not None]
+            self._pc_zero = min(starts) if starts else 0.0
+            for s in series:
+                s['off'] = 0.0
+        else:
+            for s in series:
+                s['off'] = self._arch_t_offset(s['t'], s['temp'], mode, tref)
+
+        # Jednostka osi: sekundy czy minuty
+        spans = []
+        for s in series:
+            if mode == 'pc' and s['pc'] and s['pc'][0] is not None:
+                spans.append(s['pc'][-1] - s['pc'][0])
+            else:
+                spans.append(s['t'][-1] - s['t'][0])
+        max_t = max(spans) if spans else 0
+        use_min = max_t > 180
+        tdiv = 60.0 if use_min else 1.0
+
+        # ── PORoWNANIE WZGLEDEM SIEBIE ──────────────────────────────────
+        delta_mode = bool(getattr(self, 'arch_delta', None) and self.arch_delta.get()
+                          and len(series) > 1)
+        ref = series[0] if delta_mode else None
+        ref_x, ref_name = None, ""
+        if delta_mode:
+            from pathlib import Path as _P
+            ref_name = self._cycle_display_name(_P(ref['path']))
+            if mode == 'pc' and ref['pc'] and ref['pc'][0] is not None:
+                ref_x = [((v if v is not None else 0) - self._pc_zero) / tdiv for v in ref['pc']]
+            else:
+                ref_x = [(x - ref['off']) / tdiv for x in ref['t']]
+            # W trybie roznicy setpointy tylko zaciemniaja obraz
+            show = dict(show); show['sa'] = False; show['st'] = False
+
+        def _interp(xs, ys, x):
+            """Liniowa interpolacja ys(xs) w punkcie x (poza zakresem - brzeg)."""
+            if not xs: return 0.0
+            if x <= xs[0]: return ys[0]
+            if x >= xs[-1]: return ys[-1]
+            lo, hi = 0, len(xs) - 1
+            while lo < hi - 1:
+                mid = (lo + hi) // 2
+                if xs[mid] <= x: lo = mid
+                else: hi = mid
+            dx = xs[hi] - xs[lo]
+            if dx == 0: return ys[lo]
+            f = (x - xs[lo]) / dx
+            return ys[lo] + f * (ys[hi] - ys[lo])
+
+        ax2 = None
+        for s in series:
+            path = s['path']
             ci = file_order.get(path, 0) % len(self._arch_colors)
             col = self._arch_colors[ci]
-            # Os X: od zera (align) albo absolutna, przeliczona na wybrana jednostke
-            t0 = t[0] if align else 0
-            tx = [(x - t0) / tdiv for x in t]
+            if mode == 'pc' and s['pc'] and s['pc'][0] is not None:
+                tx = [((v if v is not None else 0) - self._pc_zero) / tdiv for v in s['pc']]
+            else:
+                tx = [(x - s['off']) / tdiv for x in s['t']]
             from pathlib import Path as _P
             name = self._cycle_display_name(_P(path))
-            # Przy jednym cyklu pokaz target + setpoint-ramp + temp; przy wielu tylko temp
-            if not multi:
-                self.ax_a.plot(tx, spt, color=C['orange'], lw=1.2, ls='--',
-                              label='target', alpha=0.55)
-                # Setpoint aktywny (rampa) - kropkowana linia
-                if sa and any(v is not None for v in sa):
-                    txs = [tx[i] for i in range(len(sa)) if i < len(tx) and sa[i] is not None]
-                    sas = [v for v in sa if v is not None]
-                    if sas:
-                        self.ax_a.plot(txs, sas, color=C['cyan'], lw=1.1, ls=':',
-                                      label='setpoint (ramp)', alpha=0.7)
-                self.ax_a.plot(tx, temp, color=col, lw=2, label='temp (gal)')
-                # Druga termopara jesli dostepna
-                t2 = getattr(self, '_last_temp2', None)
-                if t2 and any(v is not None for v in t2):
-                    tx2 = [tx[i] for i in range(len(t2)) if i < len(tx) and t2[i] is not None]
-                    ty2 = [v for v in t2 if v is not None]
-                    if ty2:
-                        self.ax_a.plot(tx2, ty2, color=C['purple'], lw=1.5,
-                                      label='temp 2', alpha=0.8)
-            else:
-                self.ax_a.plot(tx, temp, color=col, lw=1.8, label=name)
+            base = f"{name} · " if multi else ""
+            if show.get('st'):
+                self.ax_a.plot(tx, s['spt'], color=C['orange'], lw=1.2, ls='--',
+                              label=(base + 'cel') if not multi else None, alpha=0.5)
+            if show.get('sa') and s['sa'] and any(v is not None for v in s['sa']):
+                xs = [tx[i] for i in range(min(len(s['sa']), len(tx))) if s['sa'][i] is not None]
+                ys = [v for v in s['sa'][:len(tx)] if v is not None]
+                if ys:
+                    self.ax_a.plot(xs, ys, color=(C['cyan'] if not multi else col),
+                                  lw=1.1, ls=':', alpha=0.75,
+                                  label=(base + 'setpoint (rampa)') if not multi else None)
+            if show.get('temp'):
+                if delta_mode and ref is not None:
+                    if s is ref:
+                        self.ax_a.axhline(0, color=C['dim2'], lw=1.0, ls='--', alpha=0.7)
+                        continue
+                    dy = [s['temp'][i] - _interp(ref_x, ref['temp'], tx[i])
+                          for i in range(len(tx))]
+                    self.ax_a.plot(tx, dy, color=col, lw=1.8,
+                                  label=f"{name} − {ref_name}")
+                else:
+                    self.ax_a.plot(tx, s['temp'], color=col, lw=(2 if not multi else 1.8),
+                                  label=(name if multi else 'temperatura'))
+            if show.get('t2') and s['t2'] and any(v is not None for v in s['t2']):
+                xs = [tx[i] for i in range(min(len(s['t2']), len(tx))) if s['t2'][i] is not None]
+                ys = [v for v in s['t2'][:len(tx)] if v is not None]
+                if ys:
+                    self.ax_a.plot(xs, ys, color=C['purple'], lw=1.5, alpha=0.8,
+                                  label=(base + 'termopara 2'))
+            if show.get('pwm'):
+                if ax2 is None:
+                    ax2 = self.ax_a.twinx(); self._ax_pwm = ax2
+                    ax2.set_ylabel('PWM [%]', color=C['dim'], fontsize=9)
+                    ax2.tick_params(colors=C['dim'], labelsize=8)
+                ax2.plot(tx, s['pwm'], color=col, lw=0.9, ls='-.', alpha=0.5)
 
-        # Opis osi czasu - z jednostka i informacja o wyrownaniu
-        unit_txt = 'minutes' if use_min else 'seconds'
-        xlabel = f'time [{unit_txt}]'
-        if align: xlabel += '  ·  aligned from 0'
+        # Linia odniesienia w trybie "wzgl. temperatury"
+        if mode == 'temp':
+            self.ax_a.axhline(tref, color=C['dim2'], lw=0.8, ls='--', alpha=0.6)
+            self.ax_a.axvline(0, color=C['dim2'], lw=0.8, ls='--', alpha=0.6)
+
+        # Etykiety osi X jako godzina zegarowa w trybie PC
+        if mode == 'pc':
+            import matplotlib.ticker as _mt
+            z = getattr(self, '_pc_zero', 0.0)
+            def _fmt(v, pos):
+                try: return datetime.fromtimestamp(z + v * tdiv).strftime("%H:%M:%S")
+                except Exception: return ""
+            self.ax_a.xaxis.set_major_formatter(_mt.FuncFormatter(_fmt))
+
+        # Opis osi czasu - jednostka + informacja o punkcie odniesienia
+        unit_txt = 'min' if use_min else 's'
+        if mode == 'pc':
+            xlabel = 'zegar PC [godz:min:s]'
+        else:
+            xlabel = f'czas [{unit_txt}]'
+            xlabel += {'t0':   '  ·  0 = start przebiegu',
+                       'abs':  '  ·  czas wlasny pliku',
+                       'ramp': '  ·  0 = start rampy',
+                       'temp': f'  ·  0 = przejscie przez {tref:.1f}°C',
+                       }.get(mode, '')
         self.ax_a.set_xlabel(xlabel, color=C['dim'], fontsize=9)
-        self.ax_a.set_ylabel('temperature [°C]', color=C['dim'], fontsize=9)
+        self.ax_a.set_ylabel(
+            (f'roznica temperatury vs {ref_name} [°C]' if delta_mode else 'temperature [°C]'),
+            color=C['dim'], fontsize=9)
         self.ax_a.tick_params(colors=C['dim'], labelsize=8)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
                         labelcolor=C['dim'], fontsize=8, loc='best')
@@ -2786,23 +3109,45 @@ class PeltierControl:
         return None
 
     def export_arch_csv(self):
-        """Eksportuj zaznaczony cykl CSV"""
-        path = self._selected_arch_path()
-        if not path:
-            messagebox.showinfo("No selection", "Tick a cycle in the list first.")
+        """Pobierz CSV zaznaczonych pomiarow.
+
+        Jeden zaznaczony -> zwykle "zapisz jako". Wiecej niz jeden -> pytamy
+        o folder i kopiujemy tam wszystkie pod oryginalnymi nazwami (bez tego
+        trzeba bylo eksportowac po jednym).
+        """
+        from pathlib import Path as _P
+        sel = [_P(p) for p, v in self.arch_vars.items() if v.get()]
+        if not sel:
+            messagebox.showinfo("Brak zaznaczenia", "Zaznacz pomiar na liscie po lewej.")
             return
+        from tkinter import filedialog
+        import shutil
         try:
-            from tkinter import filedialog
-            dest = filedialog.asksaveasfilename(
-                title="Export cycle CSV", defaultextension=".csv",
-                initialfile=path.name,
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-            if dest:
-                import shutil
-                shutil.copy(path, dest)
-                messagebox.showinfo("Exported", f"Cycle exported to:\n{dest}")
+            if len(sel) == 1:
+                dest = filedialog.asksaveasfilename(
+                    title="Pobierz CSV pomiaru", defaultextension=".csv",
+                    initialfile=sel[0].name,
+                    filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+                if not dest:
+                    return
+                shutil.copy(sel[0], dest)
+                messagebox.showinfo("Pobrano", f"Zapisano:\n{dest}")
+            else:
+                folder = filedialog.askdirectory(title=f"Gdzie zapisac {len(sel)} plikow CSV?")
+                if not folder:
+                    return
+                done, failed = 0, []
+                for f in sel:
+                    try:
+                        shutil.copy(f, _P(folder) / f.name); done += 1
+                    except Exception as e:
+                        failed.append(f"{f.name}: {e}")
+                msg = f"Zapisano {done} z {len(sel)} plikow w:\n{folder}"
+                if failed:
+                    msg += "\n\nNie udalo sie:\n" + "\n".join(failed[:5])
+                messagebox.showinfo("Pobrano", msg)
         except Exception as e:
-            messagebox.showerror("Export error", str(e))
+            messagebox.showerror("Blad eksportu", str(e))
 
     def save_arch_chart(self):
         """Zapisz aktualny wykres (z porownaniem) jako obraz"""
@@ -2821,6 +3166,116 @@ class PeltierControl:
                 messagebox.showinfo("Saved", f"Chart saved to:\n{dest}")
         except Exception as e:
             messagebox.showerror("Save error", str(e))
+
+    # ════════════════════════════════════════════════════════
+    #  FOLDER NA DANE POMIAROWE (wybierany przez uzytkownika)
+    # ════════════════════════════════════════════════════════
+    def _load_data_dir(self):
+        """Odczytaj zapamietany folder danych; gdy brak/niedostepny - domyslny."""
+        default = self.cfg_dir
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                p = d.get('data_dir')
+                if p:
+                    q = Path(p)
+                    # Nie tworzymy go tu na sile - jesli uzytkownik odlaczyl
+                    # dysk albo skasowal folder, cicho wracamy do domyslnego,
+                    # zamiast wywalac aplikacje przy starcie.
+                    if q.is_dir():
+                        return q
+                    try:
+                        q.mkdir(parents=True, exist_ok=True)
+                        return q
+                    except Exception:
+                        print(f"Folder danych '{q}' niedostepny - uzywam {default}")
+        except Exception as e:
+            print(f"ustawienia.json: {e}")
+        default.mkdir(exist_ok=True)
+        return default
+
+    def _save_data_dir(self):
+        """Zapamietaj wybrany folder danych (scalajac z reszta ustawien)."""
+        d = {}
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+        except Exception:
+            d = {}
+        d['data_dir'] = str(self.log_dir)
+        try:
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(d, f, indent=2)
+        except Exception as e:
+            messagebox.showwarning("Ustawienia", f"Nie zapisano wyboru folderu:\n{e}")
+
+    def _set_data_dir(self, newdir):
+        """Przelacz folder danych na `newdir` (Path) i odswiez archiwum."""
+        newdir = Path(newdir)
+        if newdir == self.log_dir:
+            return
+        # Nie przelaczamy w trakcie zapisu cyklu - plik tymczasowy jest juz
+        # otwarty w starym folderze i archiwizacja trafilaby w prozne.
+        if self.cyc_on:
+            messagebox.showwarning(
+                "Trwa pomiar",
+                "Nie zmieniam folderu w trakcie zapisu cyklu.\n"
+                "Zatrzymaj pomiar (STOP) i sprobuj ponownie.")
+            return
+        try:
+            newdir.mkdir(parents=True, exist_ok=True)
+            probe = newdir / ".peltier_zapis_test"
+            probe.write_text("ok", encoding='utf-8')
+            probe.unlink()
+        except Exception as e:
+            messagebox.showerror("Folder danych", f"Nie moge pisac w:\n{newdir}\n\n{e}")
+            return
+        self.log_dir = newdir
+        self._save_data_dir()
+        self._update_data_dir_label()
+        try:
+            self.refresh_arch()
+            self._redraw_arch()
+        except Exception:
+            pass
+        self._series_status(f"Dane zapisuje teraz w: {self.log_dir}")
+
+    def choose_data_dir(self):
+        """Wskaz ISTNIEJACY folder na dane pomiarowe."""
+        from tkinter import filedialog
+        p = filedialog.askdirectory(title="Wybierz folder na dane pomiarowe",
+                                    initialdir=str(self.log_dir))
+        if p:
+            self._set_data_dir(p)
+
+    def create_data_dir(self):
+        """Utworz NOWY folder na dane (pytamy o rodzica i nazwe)."""
+        from tkinter import filedialog, simpledialog
+        parent = filedialog.askdirectory(title="Gdzie utworzyc nowy folder na dane?",
+                                         initialdir=str(self.log_dir))
+        if not parent:
+            return
+        name = simpledialog.askstring("Nowy folder", "Nazwa folderu:",
+                                      initialvalue=datetime.now().strftime("Pomiary_%Y-%m-%d"),
+                                      parent=self.root)
+        if not name:
+            return
+        import re as _re
+        safe = _re.sub(r'[<>:"/\\|?*]', '_', name).strip().strip('.')
+        if not safe:
+            messagebox.showwarning("Nowy folder", "Pusta nazwa.")
+            return
+        self._set_data_dir(Path(parent) / safe)
+
+    def _update_data_dir_label(self):
+        if hasattr(self, 'data_dir_lbl'):
+            p = str(self.log_dir)
+            # Skracamy srodek dlugiej sciezki - koniec (nazwa folderu) jest
+            # najwazniejszy, a pelna sciezka i tak jest w podpowiedzi.
+            show = p if len(p) <= 52 else p[:20] + " … " + p[-29:]
+            self.data_dir_lbl.config(text=show)
 
     def open_log_folder(self):
         """Otworz folder z logami"""
@@ -3267,10 +3722,16 @@ class PeltierControl:
         self.cyc_fn = self.log_dir / f"_tmp_cykl_{ts}.csv"
         self.cyc_file = open(self.cyc_fn, 'w', newline='', encoding='utf-8')
         self.cyc_wr = csv.writer(self.cyc_file)
+        # czas_pc = zegar KOMPUTERA (YYYY-MM-DD HH:MM:SS.mmm). czas_s jest
+        # liczony od startu cyklu, wiec sam z siebie nie pozwala zestawic
+        # przebiegu z niczym poza nim samym - czas PC pozwala zlozyc kilka
+        # cykli na jednej osi rzeczywistej i skorelowac je z zdarzeniami
+        # spoza aplikacji. Kolumna dopisana NA KONCU, zeby stare pliki i
+        # dotychczasowe parsery (czytajace po indeksach) dalej dzialaly.
         self.cyc_wr.writerow(['czas_s', 'temperatura_C', 'setpoint_aktywny',
                               'setpoint_cel', 'PWM', 'PWM_%', 'Kp', 'Ki', 'Kd', 'stan',
                               'temperatura2_C', 'ff', 'p_term', 'i_term', 'd_term',
-                              'pid_raw', 'react_scale'])
+                              'pid_raw', 'react_scale', 'czas_pc'])
         self.cyc_rows = 0
         print(f"CYC START T={temp0:.1f}")
 
@@ -3283,10 +3744,12 @@ class PeltierControl:
                                f"{dbg['dd']:.2f}", f"{dbg['raw']:.2f}", f"{dbg['react']:.2f}"]
                 else:
                     dbgvals = ["", "", "", "", "", ""]
+                _n = datetime.now()   # JEDNO pobranie - dwa dalyby niespojne ms
+                pcnow = _n.strftime("%Y-%m-%d %H:%M:%S.") + f"{_n.microsecond//1000:03d}"
                 self.cyc_wr.writerow([f"{t:.2f}", f"{temp:.2f}", f"{sa:.2f}",
                                      f"{st:.2f}", pwm, f"{pwm*100/255:.1f}",
                                      f"{kp:.3f}", f"{ki:.4f}", f"{kd:.3f}", state, t2str,
-                                     *dbgvals])
+                                     *dbgvals, pcnow])
                 self.cyc_file.flush()
                 self.cyc_rows += 1
             except: pass
@@ -3407,6 +3870,60 @@ class PeltierControl:
         print(f"SERIA: {text}")
         if hasattr(self, 'series_status_lbl'):
             self.series_status_lbl.config(text=text)
+
+    def _series_save_prog(self):
+        """Zapisz liste krokow do pliku JSON (program przebiegu)."""
+        if not self.series_steps:
+            messagebox.showinfo("Pusty program", "Najpierw dodaj kroki.")
+            return
+        from tkinter import filedialog
+        dest = filedialog.asksaveasfilename(
+            title="Zapisz program", defaultextension=".json",
+            initialdir=str(self.log_dir),
+            initialfile=datetime.now().strftime("program_%Y-%m-%d.json"),
+            filetypes=[("Program (JSON)", "*.json"), ("All files", "*.*")])
+        if not dest:
+            return
+        try:
+            with open(dest, 'w', encoding='utf-8') as f:
+                json.dump({'tryb': self.series_mode.get(),
+                           'baza': self.series_base_sp,
+                           'kroki': self.series_steps}, f, indent=2)
+            self._series_status(f"Program zapisany: {dest}")
+        except Exception as e:
+            messagebox.showerror("Zapis programu", str(e))
+
+    def _series_load_prog(self):
+        """Wczytaj liste krokow z pliku JSON."""
+        from tkinter import filedialog
+        src = filedialog.askopenfilename(
+            title="Wczytaj program", initialdir=str(self.log_dir),
+            filetypes=[("Program (JSON)", "*.json"), ("All files", "*.*")])
+        if not src:
+            return
+        try:
+            with open(src, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            steps = d.get('kroki') or []
+            clean = []
+            for st in steps:
+                clean.append(dict(sp=float(st['sp']), rate=float(st['rate']),
+                                  hold_s=float(st.get('hold_s', 60))))
+            if not clean:
+                messagebox.showwarning("Program", "Plik nie zawiera krokow.")
+                return
+            self.series_steps = clean
+            if d.get('tryb') in ('seria', 'program'):
+                self.series_mode.set(d['tryb'])
+            if d.get('baza') is not None:
+                self.series_base_sp = float(d['baza'])
+                if hasattr(self, 'series_e_base'):
+                    self.series_e_base.delete(0, 'end')
+                    self.series_e_base.insert(0, f"{self.series_base_sp:.1f}")
+            self._series_refresh_list()
+            self._series_status(f"Wczytano program: {len(clean)} krokow")
+        except Exception as e:
+            messagebox.showerror("Wczytanie programu", str(e))
 
     def _series_roll_cycle(self, hint):
         """Zamknij BIEZACY plik cyklu pod nazwa `hint` i od razu otworz nowy -
@@ -3583,8 +4100,48 @@ class PeltierControl:
         self.series_phase = 'ending'
         step = self.series_steps[self.series_idx]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        hint = f"seria_SP{step['sp']:.0f}_R{step['rate']:.0f}_{tag}_{ts}"
-        if abs(self.series_base_sp - step['sp']) > 0.5:
+        # W trybie PROGRAM nazwa niesie numer kroku - inaczej kolejne kroki o
+        # tym samym SP bylyby nie do odroznienia w archiwum.
+        try: _prog = (self.series_mode.get() == 'program')
+        except AttributeError: _prog = False
+        if _prog:
+            hint = (f"prog{self.series_idx+1:02d}_SP{step['sp']:.0f}"
+                    f"_R{step['rate']:.0f}_{tag}_{ts}")
+        else:
+            hint = f"seria_SP{step['sp']:.0f}_R{step['rate']:.0f}_{tag}_{ts}"
+        prog = False
+        try: prog = (self.series_mode.get() == 'program')
+        except AttributeError: pass
+        nxt = self.series_idx + 1
+        if prog:
+            # PROGRAM: zadnego powrotu do bazy - nastepny krok startuje
+            # dokladnie tam, gdzie skonczyl sie poprzedni (plynnie, bez
+            # STOP/START - patrz _series_switch_leg).
+            if nxt < len(self.series_steps) and self.connected:
+                self._series_roll_cycle(hint)
+                self.series_idx = nxt
+                nstep = self.series_steps[nxt]
+                self.sl_sp.set(nstep['sp'])
+                cur = self.temp[-1] if self.temp else nstep['sp']
+                down = nstep['sp'] < cur - 0.5
+                if down: self.sl_rd.set(nstep['rate'])
+                else:    self.sl_ru.set(nstep['rate'])
+                self._series_switch_leg(nstep['sp'],
+                                        rd=(nstep['rate'] if down else None),
+                                        ru=(None if down else nstep['rate']))
+                self.series_leg = 'heat'      # 'heat' = noga zadana krokiem
+                self.series_phase = 'ramping'
+                self.series_phase_t0 = time.time()
+                self._series_status(
+                    f"Krok {nxt+1}/{len(self.series_steps)}: "
+                    f"{'zjazd' if down else 'dojazd'} do {nstep['sp']:.1f}°C "
+                    f"@ {nstep['rate']:.0f}°C/min")
+            else:
+                self.series_name_hint = hint
+                self.send("STOP")
+                self._update_run_button(False)
+                self.root.after(600, self._series_advance)
+        elif abs(self.series_base_sp - step['sp']) > 0.5:
             # PLYNNIE: zamykamy plik grzania i od razu otwieramy plik zjazdu,
             # NIE wychodzac z AUTO - dzieki temu poczatek zjazdu = koniec
             # grzania (patrz _series_switch_leg).
