@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PeltierControl v6.0 - BRUTALIST
-Pelny panel sterowania PID Peltiera z dwukierunkowa komunikacja.
-Sterowanie z aplikacji: setpoint, rampa, PID, kalibracja, profile.
-Wymaga firmware v19 (PC MODE) na ItsyBitsy M0.
+IGNI - Illumination & Gradient Nanoampere Instrument
+
+Control bench for photocurrent and pyrocurrent measurements: it drives the
+Peltier stage, so the sample can be held at a temperature (photocurrent, the
+illumination term) or ramped at a commanded rate (pyrocurrent, the gradient
+term dT/dt), and it archives every run.
+
+  Illumination  - the optical / photocurrent side of the experiment
+  Gradient      - the controlled dT/dt that produces the pyrocurrent
+  Nanoampere    - the magnitude of what actually gets measured
+  Instrument    - it is one, and it is treated as one
+
+Two-way link with the board: setpoint, ramps, PID, calibration, profiles.
+Requires firmware v19 (PC MODE) or newer on the ItsyBitsy M0.
 """
 
-import sys, os, time, csv, json, threading, queue
+import sys, os, time, csv, json, threading, queue, contextlib
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +29,7 @@ try:
     import tkinter as tk
     from tkinter import ttk, messagebox
 except ImportError:
-    print("brak tkinter"); input(); sys.exit(1)
+    print("tkinter not available"); input(); sys.exit(1)
 try:
     import matplotlib
     matplotlib.use('TkAgg')
@@ -29,73 +39,101 @@ except ImportError as e:
     print(f"pip install matplotlib numpy\n{e}"); input(); sys.exit(1)
 
 # ════════════════════════════════════════════════════════
-#  MOTYW BRUTALIST - beton, stal, surowe krawedzie
+#  BRUTALIST THEME - concrete, steel, raw edges
 # ════════════════════════════════════════════════════════
+# ── PALETTE ─────────────────────────────────────────────────────────────
+# Reworked in APP .15. The old palette was cold "concrete grey"; this one is
+# warmer and darker - charcoal and oiled leather with burnished bronze - and
+# every accent is picked from the Witcher-sign family, which happens to map
+# cleanly onto what this rig already needed to signal:
+#     Aard  (pale steel-blue)  -> temperature, the thing we measure
+#     Igni  (ember amber)      -> setpoint / heating, the thing we command
+#     Quen  (shield gold)      -> rate, headings, the medallion
+#     Axii  (moss green)       -> PWM / OK / START
+#     Yrden (violet)           -> calibration and profiles
+#     blood red                -> STOP, alarms, recording
+# The KEYS are unchanged, so every widget keeps its meaning; only the hues
+# moved. Contrast was checked against the panel background - the readouts a
+# safety-relevant instrument depends on stay high-contrast on purpose.
 C = {
-    'bg':       '#3a3d42',   # beton glowny
-    'bg2':      '#2b2d31',   # stal ciemna (paski, pola)
-    'panel':    '#33363b',   # karty
-    'panel2':   '#2b2d31',   # elementy wewnetrzne
-    'panel3':   '#42454a',   # hover
-    'border':   '#4a4d52',   # ramki
-    'border2':  '#5a5d63',   # ramki jasniejsze
-    'text':     '#f0f0f0',   # tekst glowny
-    'dim':      '#b0b3b8',   # tekst przygaszony
-    'dim2':     '#6a6d72',   # tekst bardzo przygaszony
-    'blue':     '#4d9fff',   # temperatura
-    'orange':   '#e8a33d',   # setpoint
-    'yellow':   '#e8c63d',   # tempo / rampa grzania
-    'green':    '#5fc77f',   # pwm / ok / start
-    'red':      '#d4452e',   # stop / grzanie / alarm (sowiecka czerwien)
-    'cyan':     '#4db8d4',   # pid / chlodzenie
-    'purple':   '#a87dd4',   # kalibracja / profile
-    'rec':      '#d4452e',   # nagrywanie
-    'grid':     '#42454a',   # siatka wykresu
+    'bg':       '#22201d',   # charcoal, faintly warm
+    'bg2':      '#191715',   # near-black (bars, fields)
+    'panel':    '#2a2724',   # cards
+    'panel2':   '#191715',   # inner elements
+    'panel3':   '#38342f',   # hover
+    'border':   '#3d3833',   # frames
+    'border2':  '#575047',   # lighter frames
+    'text':     '#efe7d8',   # parchment
+    'dim':      '#b3a892',   # dimmed parchment
+    'dim2':     '#736a5c',   # very dimmed
+    'blue':     '#7fb6d9',   # Aard  - temperature
+    'orange':   '#d98436',   # Igni  - setpoint
+    'yellow':   '#d9b036',   # Quen  - rate / headings
+    'green':    '#8fae5c',   # Axii  - pwm / ok / start
+    'red':      '#a3251f',   # blood - stop / alarm
+    'cyan':     '#6fb2b8',   # frost - cooling
+    'purple':   '#8f6bb5',   # Yrden - calibration / profiles
+    'rec':      '#a3251f',   # recording
+    'grid':     '#312d29',   # chart grid
+    'gold':     '#c8a24a',   # medallion / section rules
 }
 
-# Fonty - monospace dla brutalist
+# Fonts - monospace for brutalist
 FONT      = 'Consolas'
-FONT_UI   = 'Roboto Mono'   # fallback do Consolas jesli brak
+FONT_UI   = 'Roboto Mono'   # falls back to Consolas if not available
 
-# Numer wersji APLIKACJI PC (nie mylic z FW - numerem wersji firmware, ktory
-# apka pobiera z plytki komenda VER i pokazuje osobno w pasku tytulowym).
-# Bump przy kazdej wysylanej wersji, zeby dalo sie po pasku tytulowym od razu
-# sprawdzic czy to na pewno nowy plik.
-APP_BUILD = "2026-08-25.12"
+# Version number of the PC APPLICATION (not to be confused with FW - the
+# firmware version the app reads from the board with the VER command and shows
+# separately in the title bar). Bump it with every version sent out, so the
+# title bar immediately tells you whether this really is the new file.
+APP_BUILD = "2026-09-01.16"
 
-# Limity bezpieczenstwa dla automatycznej SERII POMIAROW (patrz klasa
-# PeltierControl, self.series_*) - zabezpieczenie na wypadek gdyby
-# dojazd/powrot nigdy nie osiagnal celu (np. odlaczony czujnik) - seria ma
-# przejsc dalej zamiast wisiec w nieskonczonosc.
+# Safety limits for the automatic MEASUREMENT SERIES (see the PeltierControl
+# class, self.series_*) - a safeguard in case the approach/return never
+# reaches its target (e.g. a disconnected sensor) - the series should move
+# on instead of hanging forever.
 SERIES_HEAT_TIMEOUT_S = 20 * 60
 SERIES_COOL_TIMEOUT_S = 12 * 60
 
-# Globalny mnoznik rozmiaru fontow (ustawiany na starcie wg DPI)
+# ── "REACHED" CRITERION ──────────────────────────────────────────────────
+# Was: a single sample within 0.5 C and done. For the DESCENT leg in a
+# SERIES (which ends immediately after reaching), this meant that EVERY
+# descent was cut off the moment it entered tolerance - in the logs from
+# 20260831 all seven descents end at 30.35-30.49 C and contain NOT A
+# SINGLE hold sample. That made it impossible to check at all whether the
+# descent gets to the target and whether it crosses it - and that is
+# exactly what we were trying to diagnose.
+# Now: |error| <= REACH_TOL_C held CONTINUOUSLY for REACH_STABLE_S.
+# A single brush against the tolerance caused by noise is no longer enough.
+REACH_TOL_C    = 0.2
+REACH_STABLE_S = 3.0
+
+# Global font size multiplier (set at startup according to DPI)
 FS = 1.0
 def fsz(n):
-    """Skaluje rozmiar fontu wg globalnego DPI."""
+    """Scales the font size according to the global DPI."""
     return max(6, int(round(n * FS)))
 
 def SC(px):
-    """Skaluje rozmiar W PIKSELACH tym samym mnoznikiem co fonty.
+    """Scales a size IN PIXELS by the same multiplier as the fonts.
 
-    PROBLEM KTORY TO NAPRAWIA: fonty byly skalowane przez FS (np. x1.5 przy
-    DPI 150%), ale rozmiary okien byly WPISANE NA SZTYWNO W PIKSELACH
-    ("640x780" itp.). Poniewaz aplikacja jest Per-Monitor DPI Aware v2,
-    Windows JEJ NIE SKALUJE - te 640x780 to fizyczne piksele, czyli na
-    ekranie o duzym DPI okno jest FIZYCZNIE MNIEJSZE, a napisy w nim
-    JEDNOCZESNIE wieksze. Efekt: tekst nie miescil sie i byl przycinany -
-    najmocniej w oknach kalibracji, bo one maja najwiecej tresci
-    (560x680 i 640x780). Teraz kazdy sztywny rozmiar przechodzi przez SC().
+    THE PROBLEM THIS FIXES: fonts were scaled by FS (e.g. x1.5 at DPI
+    150%), but window sizes were HARD-CODED IN PIXELS ("640x780" etc.).
+    Because the application is Per-Monitor DPI Aware v2, Windows DOES NOT
+    SCALE IT - those 640x780 are physical pixels, so on a high-DPI screen
+    the window is PHYSICALLY SMALLER while the text in it is AT THE SAME
+    TIME larger. The effect: the text did not fit and was clipped - worst
+    of all in the calibration windows, because they have the most content
+    (560x680 and 640x780). Now every fixed size goes through SC().
     """
     return int(round(px * FS))
 
 def make_scrollable(parent, bg, padx=0, pady=0):
-    """Zwraca ramke, ktora przewija sie w pionie gdy tresc nie miesci sie w oknie.
+    """Returns a frame that scrolls vertically when the content does not fit the window.
 
-    Po co: przy duzym DPI okna sa przycinane do wysokosci ekranu (patrz
-    size_win), wiec tresc moze byc wyzsza niz okno. Bez przewijania dolne
-    pola i przyciski sa wtedy fizycznie nieosiagalne.
+    Why: at high DPI, windows are clipped to the screen height (see
+    size_win), so the content can be taller than the window. Without
+    scrolling the bottom fields and buttons are then physically unreachable.
     """
     wrap = tk.Frame(parent, bg=bg)
     wrap.pack(fill='both', expand=True)
@@ -121,20 +159,20 @@ def make_scrollable(parent, bg, padx=0, pady=0):
             cv.yview_scroll(int(-e.delta / 120), 'units')
         except Exception:
             pass
-    # Kolko myszy tylko gdy kursor jest nad tym obszarem - zeby nie przejmowac
-    # przewijania calej aplikacji.
+    # Mouse wheel only while the cursor is over this area - so that it does not
+    # take over scrolling for the whole application.
     cv.bind('<Enter>', lambda e: cv.bind_all('<MouseWheel>', _wheel))
     cv.bind('<Leave>', lambda e: cv.unbind_all('<MouseWheel>'))
     return inner
 
 
 def size_win(win, w, h, minw=None, minh=None, parent=None):
-    """Ustaw rozmiar okna: przeskaluj wg DPI, przytnij do ekranu, wysrodkuj.
+    """Set the window size: scale by DPI, clip to the screen, center it.
 
-    Przyciecie do ekranu jest istotne: po przeskalowaniu x1.5 okno 640x780
-    urosloby do 960x1170, czyli WIECEJ niz wysokosc typowego ekranu 1080p -
-    i czesc tresci (w tym przyciski) wyladowalaby poza widocznym obszarem.
-    Okna sa tez zawsze resizable, zeby dalo sie je powiekszyc recznie.
+    Clipping to the screen matters: after x1.5 scaling a 640x780 window would
+    grow to 960x1170, that is MORE than the height of a typical 1080p screen -
+    and part of the content (buttons included) would land outside the visible
+    area. Windows are also always resizable, so they can be enlarged by hand.
     """
     sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
     W = min(SC(w), max(320, sw - SC(40)))
@@ -162,11 +200,20 @@ def size_win(win, w, h, minw=None, minh=None, parent=None):
     return W, H
 
 def _font(size, weight='normal'):
-    """Zwraca tuple fontu z fallbackiem"""
+    """Returns a font tuple with a fallback"""
     return (FONT, size, weight) if weight != 'normal' else (FONT, size)
 
+def _darken(hex_color, amount=0.30):
+    """Darkens a hex color by the given amount - the counterpart of _lighten(),
+    used for the shadow facets of the emblem."""
+    hex_color = hex_color.lstrip('#')
+    r, g, b = (int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+    f = max(0.0, 1.0 - amount)
+    return f'#{int(r*f):02x}{int(g*f):02x}{int(b*f):02x}'
+
+
 def _lighten(hex_color, amount=0.15):
-    """Rozjasnia kolor hex o zadana ilosc"""
+    """Lightens a hex color by the given amount"""
     hex_color = hex_color.lstrip('#')
     r = int(hex_color[0:2], 16)
     g = int(hex_color[2:4], 16)
@@ -177,7 +224,7 @@ def _lighten(hex_color, amount=0.15):
     return f'#{r:02x}{g:02x}{b:02x}'
 
 def mk_btn(parent, text, cmd, bg=None, fg='#1a1c1f', **kw):
-    """Brutalist button - ostre krawedzie, monospace"""
+    """Brutalist button - sharp edges, monospace"""
     bg = bg or C['green']
     b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
                   font=(FONT, fsz(10), 'bold'), padx=16, pady=8,
@@ -192,7 +239,7 @@ def mk_btn(parent, text, cmd, bg=None, fg='#1a1c1f', **kw):
     return b
 
 def mk_btn_outline(parent, text, cmd, color, **kw):
-    """Button z obramowaniem (outline) zamiast wypelnienia"""
+    """Button with an outline instead of a fill"""
     b = tk.Button(parent, text=text, command=cmd, bg=C['bg2'], fg=color,
                   font=(FONT, fsz(10), 'bold'), padx=14, pady=7,
                   relief='flat', cursor='hand2', bd=0,
@@ -203,11 +250,11 @@ def mk_btn_outline(parent, text, cmd, color, **kw):
 
 
 # ════════════════════════════════════════════════════════
-#  WIDGET: Suwak + pole liczbowe (kluczowy element panelu)
+#  WIDGET: Slider + numeric field (key panel element)
 # ════════════════════════════════════════════════════════
 class SliderField:
-    """Suwak + pole liczbowe obok. Wpisanie wartosci lub przeciagniecie suwaka.
-       on_change(value) wywolywany przy zmianie (debounced)."""
+    """Slider plus a numeric field next to it. Type a value or drag the slider.
+       on_change(value) is called on change (debounced)."""
     def __init__(self, parent, label, vmin, vmax, vinit, color,
                  unit='', decimals=1, on_change=None, width=170):
         self.vmin = vmin; self.vmax = vmax
@@ -216,11 +263,11 @@ class SliderField:
         self._last_sent = None
         self._after_id = None
 
-        # Kontener
+        # Container
         self.frame = tk.Frame(parent, bg=C['bg2'])
         self.frame.pack(fill='x', pady=(0, 14))
 
-        # Etykieta + jednostka
+        # Label + unit
         top = tk.Frame(self.frame, bg=C['bg2'])
         top.pack(fill='x')
         tk.Label(top, text=label, bg=C['bg2'], fg=C['dim'],
@@ -229,11 +276,11 @@ class SliderField:
             tk.Label(top, text=unit, bg=C['bg2'], fg=C['dim2'],
                      font=(FONT, fsz(8)), anchor='e').pack(side='right')
 
-        # Wiersz: suwak + pole
+        # Row: slider + field
         row = tk.Frame(self.frame, bg=C['bg2'])
         row.pack(fill='x', pady=(4, 0))
 
-        # Pole liczbowe (Entry) - po prawej
+        # Numeric field (Entry) - on the right
         self.entry = tk.Entry(row, width=7, bg=C['panel'], fg=color,
                               font=(FONT, fsz(12), 'bold'), justify='center',
                               relief='flat', bd=0,
@@ -244,7 +291,7 @@ class SliderField:
         self.entry.bind('<Return>', self._on_entry)
         self.entry.bind('<FocusOut>', self._on_entry)
 
-        # Suwak (Scale) - wypelnia reszte
+        # Slider (Scale) - fills the rest
         self.var = tk.DoubleVar(value=vinit)
         self.scale = tk.Scale(row, from_=vmin, to=vmax, resolution=10**(-decimals),
                              orient='horizontal', variable=self.var,
@@ -277,7 +324,7 @@ class SliderField:
             self._set_entry(self.var.get())
 
     def _debounced(self, v):
-        """Wysylaj zmiane z opoznieniem 150ms zeby nie zalac serialu"""
+        """Send the change with a 150ms delay so as not to flood the serial link"""
         if self._after_id:
             self.frame.after_cancel(self._after_id)
         self._after_id = self.frame.after(150, lambda: self._emit(v))
@@ -291,7 +338,7 @@ class SliderField:
         return self.var.get()
 
     def set(self, v, silent=True):
-        """Ustaw wartosc. silent=True nie wywoluje on_change (sync z urzadzenia)."""
+        """Set the value. silent=True does not call on_change (sync from the device)."""
         v = max(self.vmin, min(self.vmax, v))
         if silent:
             self._last_sent = v
@@ -305,26 +352,300 @@ class SliderField:
 
 
 # ════════════════════════════════════════════════════════
-#  DEKODOWANIE KODOW BLEDOW Z FIRMWARE (ERR:code=N,...,active=0/1)
+#  DECODING FIRMWARE ERROR CODES (ERR:code=N,...,active=0/1)
 # ════════════════════════════════════════════════════════
 ERR_CODES = {
-    1: "Fault termopary glownej",
-    2: "Odczyt termopary poza zakresem / szum",
-    3: "TEMP MAX - bezpieczne zatrzymanie",
-    4: "MAX31856 nie odpowiada (SPI/polaczenie)",
+    1: "Main thermocouple fault",
+    2: "Thermocouple reading out of range / noise",
+    3: "TEMP MAX - safe shutdown",
+    4: "MAX31856 not responding (SPI/connection)",
 }
-# Bitmaska rejestru fault MAX31856 (Adafruit_MAX31856.h)
+# MAX31856 fault register bitmask (Adafruit_MAX31856.h)
 TC_FAULT_BITS = [
-    (0x80, "zakres zimnego zlacza (CJ range)"),
-    (0x40, "zakres termopary (TC range)"),
-    (0x20, "zimne zlacze za wysokie (CJ high)"),
-    (0x10, "zimne zlacze za niskie (CJ low)"),
-    (0x08, "termopara za goraca (TC high)"),
-    (0x04, "termopara za zimna (TC low)"),
-    (0x02, "przepiecie/niedopiecie (OV/UV)"),
-    (0x01, "obwod otwarty - przewod urwany/odlaczony"),
+    (0x80, "cold junction range (CJ range)"),
+    (0x40, "thermocouple range (TC range)"),
+    (0x20, "cold junction too high (CJ high)"),
+    (0x10, "cold junction too low (CJ low)"),
+    (0x08, "thermocouple too hot (TC high)"),
+    (0x04, "thermocouple too cold (TC low)"),
+    (0x02, "overvoltage/undervoltage (OV/UV)"),
+    (0x01, "open circuit - wire broken/disconnected"),
 ]
 
+
+# ── CSV COLUMN NAMES: ENGLISH NOW, POLISH STILL READABLE ────────────────
+# The measurement CSV used to have Polish headers. From APP .15 new files are
+# written with English ones, but every file already sitting in the data folder
+# has the old names - and the ARCHIVE tab must keep opening them. So the
+# writer emits CSV_COLS (English) and the reader passes every row through
+# _csv_row(), which makes BOTH spellings resolve. Nothing downstream had to
+# change, and no existing measurement becomes unreadable.
+CSV_COLS = ['time_s', 'temperature_C', 'setpoint_active', 'setpoint_target',
+            'PWM', 'PWM_%', 'Kp', 'Ki', 'Kd', 'state', 'temperature2_C',
+            'ff', 'p_term', 'i_term', 'd_term', 'pid_raw', 'react_scale',
+            'amb_est', 'pc_time']
+# old (on disk) -> new (written from now on)
+CSV_ALIAS = {
+    'czas_s':            'time_s',
+    'temperatura_C':     'temperature_C',
+    'setpoint_aktywny':  'setpoint_active',
+    'setpoint_cel':      'setpoint_target',
+    'stan':              'state',
+    'temperatura2_C':    'temperature2_C',
+    'czas_pc':           'pc_time',
+}
+_CSV_ALIAS_REV = {v: k for k, v in CSV_ALIAS.items()}
+
+def _csv_row(r):
+    """One CSV row readable under BOTH the old Polish and the new English
+    column names. Cheap (a handful of dict writes per row) and it keeps the
+    whole archive - hundreds of files - working without a migration step."""
+    for old, new in CSV_ALIAS.items():
+        if old in r and new not in r:
+            r[new] = r[old]
+        elif new in r and old not in r:
+            r[old] = r[new]
+    return r
+
+# ── EMBLEM ──────────────────────────────────────────────────────────────
+# An ORIGINAL heraldic beast-head mark, defined once as polygons in a
+# normalised -1..1 space and rendered by two tiny back-ends (Tk canvas for
+# the title bar, matplotlib patches for the chart watermark). No image files
+# ship with the app and nothing is traced from anyone else's artwork.
+#
+# ON THE OBVIOUS QUESTION: this is deliberately NOT a redrawn Witcher School
+# of the Wolf medallion. Redrawing a protected logo produces a derivative
+# work, which is still protected - and that particular head is a trademark on
+# top of that. What is NOT protectable is the genre vocabulary: an angular
+# animal head, faceted planes, gold on near-black. So the vocabulary is
+# borrowed and the drawing is our own: a closed, calm, symmetrical head
+# instead of a snarling open-jawed one, swept horns instead of a spiked
+# halo, plain ring instead of a fanned crest, and no row of sign glyphs
+# underneath - that row is the part that makes their composition theirs.
+#
+# y points UP in these coordinates; the Tk renderer flips it.
+# ONE silhouette rather than a pile of overlapping pieces - the first two
+# attempts stacked separate ears/brow/cheeks/muzzle polygons and the seams
+# between them made the middle of the face mushy. Traced clockwise from the
+# left ear tip: ears with a forehead dip between them, skull, two ranks of
+# cheek ruff, and a blunt snout.
+# Control points of the head, traced clockwise from the left ear tip, in a
+# -1..1 space with y pointing UP. They are NOT drawn as a polygon: everything
+# goes through _spline() first.
+#
+# WHY A SPLINE. Two earlier attempts drew straight-edged polygons. The first
+# came out as a rat (needle snout, swept-back ears); the second, once the
+# facets were tidied up, came out as a Transformers faceplate - because hard
+# straight edges meeting at machined angles is exactly what a robot mask is.
+# Fur and bone are curved, so the outline is now interpolated into a smooth
+# closed curve and the internal "panel line" cuts are gone. The tufts are
+# deliberately NOT matched in length pair-for-pair; slight irregularity is
+# most of what separates fur from bodywork.
+EMBLEM_SOLID = [[
+    (-0.54, 1.10), (-0.34, 0.66), (-0.13, 0.70), (0.13, 0.70), (0.34, 0.66),
+    ( 0.58, 1.12), ( 0.74, 0.54), ( 0.88, 0.18), (1.02, -0.12), (0.68, -0.22),
+    ( 0.88, -0.54), ( 0.46, -0.44), (0.42, -0.66), (0.27, -0.56),
+    ( 0.24, -0.84), ( 0.00, -0.96), (-0.24, -0.84), (-0.27, -0.56),
+    (-0.40, -0.68), (-0.46, -0.44), (-0.84, -0.58), (-0.70, -0.22),
+    (-1.02, -0.12), (-0.86, 0.18), (-0.72, 0.52),
+]]
+# ── FACETS: the chiselled-metal pass ────────────────────────────────────
+# The smooth silhouette alone read flat. These are the planes the light falls
+# on, laid over the base shape with a single convention: the light comes from
+# the upper LEFT, so left-facing planes are lit and right-facing ones are in
+# shadow, with a bright ridge running down the centre of the face.
+# They are drawn WITHOUT spline smoothing on purpose - hard facet edges are
+# what makes it look chiselled rather than moulded - and they are deliberately
+# coarse: five planes per side, not twenty, because this also has to survive
+# being 10 px wide in the title bar.
+EMBLEM_LIT = [
+    [(-0.54, 1.06), (-0.34, 0.66), (-0.15, 0.73), (-0.31, 0.92)],          # ear
+    [(-0.34, 0.66), (-0.13, 0.70), (0.00, 0.22), (-0.22, -0.04),
+     (-0.64, 0.14), (-0.72, 0.46)],                                        # skull
+    [(-1.00, -0.12), (-0.66, -0.20), (-0.50, -0.42), (-0.84, -0.56)],      # ruff
+    [(-0.22, -0.04), (0.00, 0.04), (0.00, -0.90), (-0.17, -0.78),
+     (-0.27, -0.52)],                                                      # snout
+]
+EMBLEM_SHADE = [
+    [( 0.58, 1.08), ( 0.34, 0.66), ( 0.15, 0.73), ( 0.33, 0.92)],
+    [( 0.34, 0.66), ( 0.13, 0.70), (0.00, 0.22), (0.22, -0.04),
+     ( 0.64, 0.14), ( 0.74, 0.46)],
+    [( 1.00, -0.12), ( 0.66, -0.20), (0.50, -0.42), (0.86, -0.54)],
+    [( 0.22, -0.04), ( 0.00, 0.04), (0.00, -0.90), (0.18, -0.78),
+     ( 0.27, -0.52)],
+]
+# The catch-light: a narrow strip down the muzzle ridge, brightest of all.
+EMBLEM_RIDGE = [
+    [(-0.052, 0.52), (0.052, 0.52), (0.028, -0.50), (0.0, -0.60),
+     (-0.028, -0.50)],
+]
+
+# Only the eyes are punched back out. Every extra cut is one more thing that
+# reads as a seam on a mask, and at 10 px in the title bar it is also one more
+# thing that turns to mud.
+EMBLEM_VOID = [
+    [(-0.60, 0.30), (-0.34, 0.16), (-0.20, 0.00), (-0.34, -0.04), (-0.56, 0.10)],
+    [( 0.60, 0.30), ( 0.34, 0.16), ( 0.20, 0.00), ( 0.34, -0.04), ( 0.56, 0.10)],
+]
+
+
+def _spline(pts, steps=10):
+    """Closed Catmull-Rom through pts - the curve passes through every control
+    point, so the ear and tuft tips stay sharp while everything between them
+    curves. Returns a dense point list both renderers can use."""
+    n = len(pts)
+    out = []
+    for i in range(n):
+        p0 = pts[(i - 1) % n]; p1 = pts[i]
+        p2 = pts[(i + 1) % n]; p3 = pts[(i + 2) % n]
+        for j in range(steps):
+            t = j / steps
+            t2 = t * t; t3 = t2 * t
+            out.append((
+                0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t +
+                       (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
+                       (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3),
+                0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t +
+                       (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
+                       (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)))
+    return out
+
+
+def draw_medallion(cv, cx, cy, r, color, bg):
+    """Render the emblem onto a Tk canvas, centred at (cx, cy) with radius r.
+    Purely decorative - nothing in the control path depends on it."""
+    cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                   outline=color, width=max(1, int(r * 0.12)))
+    k = r * 0.62
+    def pts(poly):
+        out = []
+        for x, y in poly:
+            out += [cx + x * k, cy - y * k]       # minus: Tk y grows downward
+        return out
+    lit   = _lighten(color, 0.42)
+    shade = _darken(color, 0.34)
+    ridge = _lighten(color, 0.62)
+    for poly in EMBLEM_SOLID:
+        cv.create_polygon(*pts(_spline(poly)), fill=color, outline=color)
+    for poly in EMBLEM_SHADE:
+        cv.create_polygon(*pts(poly), fill=shade, outline=shade)
+    for poly in EMBLEM_LIT:
+        cv.create_polygon(*pts(poly), fill=lit, outline=lit)
+    for poly in EMBLEM_RIDGE:
+        cv.create_polygon(*pts(poly), fill=ridge, outline=ridge)
+    for poly in EMBLEM_VOID:
+        cv.create_polygon(*pts(_spline(poly, 6)), fill=bg, outline=bg)
+
+
+def section(parent, title, color=None, bg=None, pady=(14, 6)):
+    """One consistent section header for every tab: a hairline rule, a short
+    all-caps title and a thin coloured tick. Before .15 each tab invented its
+    own heading style (some bold labels, some coloured bars, some nothing at
+    all), which is most of why the panels read as a wall of controls."""
+    color = color or C['gold']
+    bg = bg or C['bg2']
+    head = tk.Frame(parent, bg=bg)
+    head.pack(fill='x', pady=pady)
+    tk.Frame(head, bg=color, width=SC(3), height=SC(11)).pack(side='left')
+    tk.Label(head, text=title, bg=bg, fg=color,
+             font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(SC(6), SC(8)))
+    tk.Frame(head, bg=C['border'], height=1).pack(side='left', fill='x',
+                                                  expand=True, pady=(SC(5), 0))
+    return head
+
+def medallion_watermark(fig, color=None, alpha=0.075, size=0.34,
+                        cx=0.5, cy=0.5):
+    """The same emblem (EMBLEM_SOLID/EMBLEM_VOID) as a faint watermark behind
+    the traces, so the mark in the title bar and the one on the chart are the
+    same animal.
+
+    Deliberately very low alpha: this is an instrument, and decoration that
+    competes with the curves would be a bug, not a feature. It lives in figure
+    coordinates below every axis (zorder 0), so it never moves when the data
+    rescales and never intercepts a click. print_theme() hides it entirely for
+    anything that leaves the app."""
+    from matplotlib.patches import Ellipse, Polygon
+    color = color or C['gold']
+    r = size / 2.0
+    # Figure coordinates run 0..1 on BOTH axes, so anything "round" there comes
+    # out stretched by the figure aspect. Dividing every x by ar undoes that.
+    ar = fig.get_figwidth() / max(fig.get_figheight(), 1e-6)
+    def P(x, y):
+        return (cx + x * r * 0.62 / ar, cy + y * r * 0.62)
+    ring = Ellipse((cx, cy), 2 * r / ar, 2 * r, transform=fig.transFigure,
+                   figure=fig, fill=False, ec=color, lw=r * 90, alpha=alpha,
+                   zorder=0)
+    ring.set_clip_on(False); ring.set_gid('wolf')
+    fig.patches.append(ring)
+    for poly, col, al in ([(_spline(p), color, alpha) for p in EMBLEM_SOLID] +
+                          [(_spline(p, 6), fig.get_facecolor(), 1.0)
+                           for p in EMBLEM_VOID]):
+        pa = Polygon([P(x, y) for x, y in poly], closed=True,
+                     transform=fig.transFigure, figure=fig,
+                     fc=col, ec='none', alpha=al, zorder=0)
+        pa.set_clip_on(False); pa.set_gid('wolf')
+        fig.patches.append(pa)
+
+
+# ── PRINT / EXPORT PALETTE ──────────────────────────────────────────────
+# Anything that LEAVES the app - a saved PNG, an SVG, a PDF report, a chart
+# pasted into a thesis or a mail - must be readable on white paper. The
+# on-screen theme is deliberately dark, so exporting the screen colours gave
+# a black rectangle with parchment-coloured text: fine on a monitor, useless
+# printed, and a waste of toner.
+# The keys are identical to C, so every drawing routine keeps working - only
+# the values swap for the duration of the export (see print_theme()).
+C_PRINT = {
+    'bg':       '#ffffff',
+    'bg2':      '#ffffff',
+    'panel':    '#ffffff',
+    'panel2':   '#ffffff',
+    'panel3':   '#f0f0f0',
+    'border':   '#9a9a9a',
+    'border2':  '#c0c0c0',
+    'text':     '#101010',
+    'dim':      '#2a2a2a',   # axis labels/ticks - near-black, not grey
+    'dim2':     '#666666',
+    'blue':     '#1f6fb4',   # temperature
+    'orange':   '#d2691e',   # setpoint
+    'yellow':   '#b8860b',   # rate
+    'green':    '#2e7d32',   # pwm
+    'red':      '#b3261e',
+    'cyan':     '#00796b',   # cooling / second trace
+    'purple':   '#6a3fa0',
+    'rec':      '#b3261e',
+    'grid':     '#cccccc',
+    'gold':     '#8a7326',
+}
+
+
+@contextlib.contextmanager
+def print_theme(*figures):
+    """Swap the whole app palette to the print one for the duration of a save.
+
+    Every drawing routine reads C[...] at DRAW time, so mutating C in place
+    and re-running the redraw is enough to restyle both charts completely -
+    lines, ticks, labels, legend, grid and spines - without maintaining a
+    second copy of the plotting code. The medallion watermark is hidden as
+    well: it is chrome for the screen, and it has no business on a figure
+    that ends up in a report."""
+    saved = dict(C)
+    saved_faces = [(f, f.get_facecolor()) for f in figures]
+    hidden = []
+    C.update(C_PRINT)
+    for f in figures:
+        f.set_facecolor('white')
+        for pt in f.patches:
+            if pt.get_gid() == 'wolf' and pt.get_visible():
+                pt.set_visible(False); hidden.append(pt)
+    try:
+        yield
+    finally:
+        C.clear(); C.update(saved)
+        for f, fc in saved_faces:
+            f.set_facecolor(fc)
+        for pt in hidden:
+            pt.set_visible(True)
 
 def decode_tc_fault(bits):
     names = [name for mask, name in TC_FAULT_BITS if bits & mask]
@@ -332,15 +653,15 @@ def decode_tc_fault(bits):
 
 
 # ════════════════════════════════════════════════════════
-#  APLIKACJA GLOWNA
+#  MAIN APPLICATION
 # ════════════════════════════════════════════════════════
 class PeltierControl:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"PeltierControl v6.0 - BRUTALIST  [APP {APP_BUILD}]")
+        self.root.title(f"IGNI - photocurrent & pyrocurrent bench  [APP {APP_BUILD}]")
         self.root.configure(bg=C['bg'])
-        # Rozmiar okna glownego TEZ skalowany wg DPI i przyciety do ekranu -
-        # patrz komentarz przy SC()/size_win().
+        # The main window size is ALSO scaled by DPI and clipped to the screen -
+        # see the comment at SC()/size_win().
         size_win(self.root, 1280, 800, 1100, 720)
 
         # Serial
@@ -350,7 +671,7 @@ class PeltierControl:
         self.running = False
         self.connected = False
 
-        # Dane pomiarowe (bufory)
+        # Measurement data (buffers)
         self.maxlen = 3000
         self.t = []; self.temp = []; self.spt = []; self.spa = []
         self.pwm = []; self.kp = []; self.ki = []; self.kd = []; self.states = []
@@ -359,135 +680,136 @@ class PeltierControl:
         self.last_state = 'MAN'
         self.cur_state = 'MAN'
 
-        # Sledzenie dotarcia do setpointu (statystyki)
-        self.reach_start_t = None    # czas startu dojscia (s)
-        self.reach_start_temp = None # temp na starcie
-        self.reach_target = None     # docelowa temp
-        self.reach_done = False      # czy osiagnieto
-        self.reach_time = None       # ile trwalo dotarcie [s]
-        self.reach_avg_rate = None   # srednia rampa [C/min]
+        # Tracking the approach to the setpoint (statistics)
+        self.reach_start_t = None    # approach start time (s)
+        self.reach_start_temp = None # temp at the start
+        self.reach_target = None     # target temp
+        self.reach_done = False      # whether it was reached
+        self.reach_in_tol_t = None   # since when we have been within tolerance
+                                     # (see REACH_TOL_C/REACH_STABLE_S)
+        self.reach_time = None       # how long the approach took [s]
+        self.reach_avg_rate = None   # average ramp [C/min]
         self.last_setpoint_target = None
 
-        # ── OSOBNE sledzenie FAZY RAMPY (nie mylic z reach_* wyzej) ──────
-        # PROBLEM ktory to naprawia: "AVG RATE" i "avg ...C/min" w pasku
-        # liczyly sie od startu AZ DO wejscia w +/-0.5C od celu - czyli
-        # RAZEM z ogonem dochodzenia, ktory potrafi trwac dluzej niz sama
-        # rampa. Przy zadanych 30 C/min pokazywalo "avg 12.16 C/min", co
-        # wyglada jakby rampa jechala 2.5x za wolno, a w rzeczywistosci
-        # rampa jechala ~26 C/min i dopiero DOJAZD do ostatniego 0.5C
-        # zabral reszte czasu. Te dwie rzeczy trzeba mierzyc OSOBNO, bo
-        # naprawia sie je zupelnie innymi zmianami (tempo rampy = FF,
-        # ogon dojazdu = kompensacja strat + calka).
-        # Faza rampy = dopoki GENERATOR rampy (setpoint aktywny spA) jeszcze
-        # jedzie do celu. Gdy spA dojedzie, rampa sie skonczyla - niezaleznie
-        # od tego, gdzie jest realna temperatura.
-        self.ramp_t0 = None          # czas startu rampy
-        self.ramp_temp0 = None       # temp na starcie rampy
-        self.ramp_done = False       # czy generator rampy dojechal
-        self.ramp_secs = None        # ile trwala sama rampa [s]
-        self.ramp_rate = None        # REALNE tempo osiagniete w rampie [C/min]
-        self.ramp_cmd_rate = None    # tempo ZADANE (z panelu) [C/min]
-        self.ramp_lag = None         # ile brakowalo do celu gdy rampa sie skonczyla [C]
+        # ── SEPARATE tracking of the RAMP PHASE (not reach_* above) ──────
+        # THE PROBLEM THIS FIXES: "AVG RATE" and "avg ...C/min" in the bar
+        # were counted from the start UP TO entering +/-0.5C of the target -
+        # that is, TOGETHER with the approach tail, which can last longer
+        # than the ramp itself. With 30 C/min commanded it showed "avg
+        # 12.16 C/min", which looks as if the ramp ran 2.5x too slow, while
+        # in reality the ramp ran at ~26 C/min and only the APPROACH over
+        # the last 0.5C took the rest. These two things must be measured
+        # SEPARATELY, because they are fixed by completely different changes
+        # (ramp rate = FF, approach tail = loss compensation + integrator).
+        # Ramp phase = as long as the ramp GENERATOR (active setpoint spA) is
+        # still travelling to the target. Once spA arrives, the ramp is over -
+        # regardless of where the real temperature is.
+        self.ramp_t0 = None          # ramp start time
+        self.ramp_temp0 = None       # temp at the start of the ramp
+        self.ramp_done = False       # whether the ramp generator arrived
+        self.ramp_secs = None        # how long the ramp itself took [s]
+        self.ramp_rate = None        # REAL rate achieved during the ramp [C/min]
+        self.ramp_cmd_rate = None    # COMMANDED rate (from the panel) [C/min]
+        self.ramp_lag = None         # how far from the target when the ramp ended [C]
 
-        # Polaryzacja i zakres kalibracji (z urzadzenia)
+        # Polarity and calibration range (from the device)
         self.dev_pol_swapped = False
         self.dev_pol_set = False
         self.dev_cal_min = 50.0
         self.dev_cal_max = 100.0
 
-        # Numer wersji firmware pobrany z plytki (komenda VER) - do
-        # weryfikacji ze na plytce jest faktycznie nowy soft
+        # Firmware version number read from the board (VER command) - to
+        # verify that the board really does have the new software
         self.dev_fw_build = None
 
-        # Sterowanie wykresem live
-        self.chart_paused = False      # pauza przewijania (do zoomu)
-        self.chart_window = 0          # 0 = caly przebieg, >0 = ostatnie N sekund
+        # Live chart control
+        self.chart_paused = False      # scrolling paused (for zooming)
+        self.chart_window = 0          # 0 = whole run, >0 = last N seconds
 
-        # ── GDZIE LADUJA DANE ────────────────────────────────────────────
-        # cfg_dir  - STALY folder aplikacji (kalibracja, presety, ustawienia).
-        #            Nie wedruje razem z danymi, zeby zmiana miejsca zapisu
-        #            pomiarow nigdy nie "zgubila" kalibracji urzadzenia.
-        # log_dir  - folder NA DANE POMIAROWE, wybierany przez uzytkownika
-        #            (zakladka ARCHIVE -> ZMIEN / NOWY). Zapamietywany miedzy
-        #            uruchomieniami w ustawienia.json.
+        # ── WHERE THE DATA ENDS UP ───────────────────────────────────────
+        # cfg_dir  - PERMANENT app folder (calibration, presets, settings).
+        #            It does not travel with the data, so changing where
+        #            measurements are saved never "loses" the calibration.
+        # log_dir  - folder FOR MEASUREMENT DATA, chosen by the user (ARCHIVE
+        #            tab -> CHANGE / NEW). Remembered between runs in
+        #            ustawienia.json.
         self.cfg_dir = Path.home() / "PeltierLogi"
         self.cfg_dir.mkdir(exist_ok=True)
         self.settings_file = self.cfg_dir / "ustawienia.json"
         self.log_dir = self._load_data_dir()
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
-        # Podpowiedz nazwy dla NASTEPNEGO zapisu archiwum (patrz cyc_stop) -
-        # gdy ustawiona, pomija interaktywny dialog "SAVE CYCLE TO ARCHIVE"
-        # (ktory jest modalny - zablokowalby automatyczna SERIE pomiarow).
+        # Name hint for the NEXT archive save (see cyc_stop) - when set, it
+        # skips the interactive "SAVE CYCLE TO ARCHIVE" dialog (which is
+        # modal - it would block the automatic measurement SERIES).
         self.series_name_hint = None
 
-        # ── SERIA POMIAROW (automatyczny ciag testow SP/RATE) ────────────
-        # Cel: zamiast robic testy jeden po drugim recznie i wklejac mi
-        # zrzuty ekranu, apka sama przechodzi przez liste (SP, RATE, czas
-        # trzymania), archiwizuje kazdy test pod czytelna nazwa (bez
-        # pytania o nazwe), a ja czytam wynikowe pliki z folderu PeltierLogi
-        # (mam do niego dostep) i od razu przygotowuje poprawki.
-        self.series_steps = []       # lista dict(sp=, rate=, hold_s=)
+        # ── MEASUREMENT SERIES (automatic chain of SP/RATE tests) ────────
+        # Goal: instead of running the tests one after another by hand and
+        # pasting me screenshots, the app walks the list itself (SP, RATE,
+        # hold time), archives each test under a readable name (without
+        # asking for a name), and I read the resulting files from the
+        # PeltierLogi folder (I have access to it) and prepare fixes at once.
+        self.series_steps = []       # list of dict(sp=, rate=, hold_s=)
         self.series_idx = 0
         self.series_running = False
         self.series_leg = None       # 'heat' | 'cool' | None
         self.series_phase = None     # 'ramping' | 'holding' | None
         self.series_phase_t0 = None
-        self.series_base_sp = 25.0   # do jakiej temp wracac miedzy testami
-        self.series_skip_archive = False  # True podczas nogi powrotu - patrz cyc_stop
-        self._series_saved_rd = None      # COOL RATE z CONTROL, przywracane po serii
+        self.series_base_sp = 25.0   # which temp to return to between tests
+        self.series_skip_archive = False  # True during the return leg - see cyc_stop
+        self._series_saved_rd = None      # COOL RATE from CONTROL, restored after the series
         self.cyc_t0 = None; self.cyc_fn = None
 
-        # Profile (lista etapow: dict temp/ramp/time)
+        # Profiles (list of stages: dict temp/ramp/time)
         self.profile_steps = []
 
-        # Status synchronizacji z urzadzeniem
-        self.dev_cal = False       # czy urzadzenie ma kalibracje
+        # Device synchronization status
+        self.dev_cal = False       # whether the device has a calibration
         self.last_cfg_time = 0
 
-        # Stan kalibracji
-        self.cal_plan = []         # lista (temp, ramp) wszystkich krokow
-        self.cal_total = 0         # liczba krokow
-        self.cal_current = 0       # aktualny krok (1-based)
+        # Calibration state
+        self.cal_plan = []         # list of (temp, ramp) for all steps
+        self.cal_total = 0         # number of steps
+        self.cal_current = 0       # current step (1-based)
         self.cal_cur_temp = None
         self.cal_cur_ramp = None
-        self.cal_phase = None      # faza biezacego kroku: 'heating'/'stabil'/'relay'
+        self.cal_phase = None      # phase of the current step: 'heating'/'stabil'/'relay'
         self.cal_running = False
-        self.cal_t0 = None         # czas startu kalibracji
-        self.cal_step_times = []   # czasy rozpoczecia kolejnych krokow (do ETA)
-        self.cal_win = None        # okno postepu kalibracji
-        self.cal_warnings = []     # lista (temp, cycles, amp) dla punktow z relay_fail w tej sesji
-        self.cal_ramp_warnings = []  # lista (temp, ramp, err) dla ramp_track_fail w tej sesji
+        self.cal_t0 = None         # calibration start time
+        self.cal_step_times = []   # start times of consecutive steps (for the ETA)
+        self.cal_win = None        # calibration progress window
+        self.cal_warnings = []     # list of (temp, cycles, amp) for points with relay_fail in this session
+        self.cal_ramp_warnings = []  # list of (temp, ramp, err) for ramp_track_fail in this session
 
-        # Diagnostyka / log bledow - kazda linia Serial ktora nie jest znanym
-        # protokolem ani telemetria CSV trafia tutaj (zamiast byc po cichu
-        # odrzucana), a formalne ERR: sa dekodowane na czytelny opis PL.
-        self.diag_log = []        # lista (ts, level, text); level: ERR/WARN/INFO
-        self.err_active = {}      # code -> opis, aktywne (nieustapione) bledy sprzetowe
-        self.diag_unseen = 0      # licznik nowych ERR/WARN od ostatniego otwarcia okna
-        self.diag_win = None      # referencja do otwartego okna diagnostyki (albo None)
+        # Diagnostics / error log - every Serial line that is neither a known
+        # protocol message nor CSV telemetry ends up here (instead of being
+        # silently discarded), and formal ERR: lines are decoded into text.
+        self.diag_log = []        # list of (ts, level, text); level: ERR/WARN/INFO
+        self.err_active = {}      # code -> description, active (uncleared) hardware errors
+        self.diag_unseen = 0      # counter of new ERR/WARN since the window was last opened
+        self.diag_win = None      # reference to the open diagnostics window (or None)
 
-        # Zapis kalibracji na dysku PC - w STALYM cfg_dir, nie w folderze
-        # danych (patrz komentarz przy self.cfg_dir): zmiana miejsca zapisu
-        # pomiarow nie moze odciac aplikacji od kalibracji urzadzenia.
+        # Calibration saved on the PC disk - in the PERMANENT cfg_dir, not the
+        # data folder (see the comment at self.cfg_dir): changing where the
+        # measurements go must not cut the app off from the device calibration.
         self.cal_file = self.cfg_dir / "kalibracja.json"
         self.presets_file = self.cfg_dir / "presety.json"
-        self._caldump_buf = []     # bufor odbieranych profili
+        self._caldump_buf = []     # buffer of received profiles
         self._caldump_active = False
-        self._caldump_purpose = None  # 'save' lub None
-        self._pending_offset = None   # offset do zapisania z dumpem
+        self._caldump_purpose = None  # 'save' or None
+        self._pending_offset = None   # offset to be saved with the dump
 
-        # Pulsowanie statusu
+        # Status pulsing
         self._pulse_state = 0
 
         self._build_styles()
         self._build_ui()
         self._pulse()
         self.tick()
-        # Auto-polaczenie: sprobuj polaczyc z urzadzeniem po starcie
+        # Auto-connect: try to connect to the device after startup
         self.root.after(800, self._auto_connect)
-
     def _auto_connect(self):
-        """Automatyczne polaczenie - wykryj i polacz z ItsyBitsy"""
+        """Automatic connection - detect and connect to the ItsyBitsy"""
         if self.connected:
             return
         try:
@@ -496,7 +818,7 @@ class PeltierControl:
             return
         if not ports:
             return
-        # Priorytet: porty z opisem pasujacym do ItsyBitsy/Adafruit/USB
+        # Priority: ports whose description matches ItsyBitsy/Adafruit/USB
         def score(p):
             d = (p.description or '').lower()
             m = (p.manufacturer or '').lower() if hasattr(p, 'manufacturer') else ''
@@ -507,7 +829,7 @@ class PeltierControl:
             if hasattr(p, 'vid') and p.vid == 0x239A: s += 20
             return s
         best = max(ports, key=score)
-        # Polacz tylko jesli cos sensownego (jakikolwiek port jesli jeden)
+        # Connect only if something sensible (any port if there is only one)
         if score(best) > 0 or len(ports) == 1:
             self.connect(best.device)
 
@@ -516,17 +838,24 @@ class PeltierControl:
         try: st.theme_use('clam')
         except: pass
         st.configure('TNotebook', background=C['bg2'], borderwidth=0, tabmargins=[0,0,0,0])
-        st.configure('TNotebook.Tab', background=C['bg2'], foreground=C['dim'],
-                     padding=[20, 10], font=(FONT, fsz(10), 'bold'), borderwidth=0)
+        st.configure('TNotebook.Tab', background=C['bg2'], foreground=C['dim2'],
+                     padding=[SC(18), SC(10)], font=(FONT, fsz(10), 'bold'),
+                     borderwidth=0)
+        # The selected tab is marked by BOTH a lighter ground and gold text -
+        # on the darker .15 background a background change alone was too
+        # subtle to spot at a glance.
         st.map('TNotebook.Tab',
-               background=[('selected', C['bg'])],
-               foreground=[('selected', C['text'])])
+               background=[('selected', C['bg']), ('active', C['panel3'])],
+               foreground=[('selected', C['gold']), ('active', C['text'])])
+        st.configure('Vertical.TScrollbar', background=C['panel3'],
+                     troughcolor=C['bg2'], bordercolor=C['bg2'],
+                     arrowcolor=C['dim2'], borderwidth=0)
 
     # ────────────────────────────────────────────────────
-    #  KOMUNIKACJA SERIAL
+    #  SERIAL COMMUNICATION
     # ────────────────────────────────────────────────────
     def send(self, cmd):
-        """Wyslij komende do urzadzenia"""
+        """Send a command to the device"""
         if self.ser and self.ser.is_open:
             try:
                 self.ser.write((cmd + '\n').encode())
@@ -538,34 +867,34 @@ class PeltierControl:
             self.ser = serial.Serial(port, self.baud, timeout=0.5)
             self.port_name = port
             self.clear_buf()
-            self._cfg_synced = False  # pozwol na jednorazowa synchronizacje suwakow
+            self._cfg_synced = False  # allow a one-time slider synchronisation
             self.set_status(True, f"{port} - 115200")
             self.running = True
             threading.Thread(target=self.reader, daemon=True).start()
-            # Pobierz konfiguracje startowa + numer wersji firmware (VER dziala
-            # od razu na komendę, wiec dziala tez gdy plytka juz dawno stoi
-            # wlaczona - w odroznieniu od BUILD: wysylanego tylko raz w setup(),
-            # ktorego apka moglaby nie zobaczyc gdyby polaczyla sie PO starcie).
+            # Fetch the startup configuration + firmware version number (VER responds
+            # to the command immediately, so it also works when the board has been
+            # powered on for a long time - unlike BUILD:, which is sent only once in
+            # setup() and which the app could miss if it connected AFTER startup).
             self.root.after(1500, lambda: self.send("GET"))
             self.root.after(1600, lambda: self.send("VER"))
-            # Auto-wczytaj zapisana kalibracje z PC (jesli istnieje)
+            # Auto-load the calibration saved on the PC (if one exists)
             self.root.after(2200, self._auto_load_calibration)
         except Exception as e:
             messagebox.showerror("Error", f"{port}:\n{e}")
             self.set_status(False, "")
 
     def _auto_load_calibration(self):
-        """Przy polaczeniu - automatycznie wgraj zapisana kalibracje"""
+        """On connection - automatically upload the saved calibration"""
         if not self.connected:
             return
         if self.cal_file.exists():
             ok = self.load_calibration_from_pc()
             if ok:
-                print("Auto-wgrano kalibracje z PC przy polaczeniu")
+                print("Auto-loaded calibration from PC on connection")
 
     def disconnect(self):
         self.running = False
-        if self.cyc_on: self.cyc_stop("Rozlaczono")
+        if self.cyc_on: self.cyc_stop("Disconnected")
         if self.ser:
             try: self.ser.close()
             except: pass
@@ -582,7 +911,7 @@ class PeltierControl:
         self.t0 = None
 
     def reader(self):
-        """Watek czytajacy serial - parsuje CSV i CFG"""
+        """Serial reader thread - parses CSV and CFG"""
         if self.ser and self.ser.is_open:
             self.ser.reset_input_buffer()
         while self.running:
@@ -591,69 +920,69 @@ class PeltierControl:
                 raw = self.ser.readline().decode('utf-8', errors='ignore').strip()
                 if not raw: continue
 
-                # Linia konfiguracji CFG:SP=...,RU=...
+                # Configuration line CFG:SP=...,RU=...
                 if raw.startswith("CFG:"):
                     self._parse_cfg(raw[4:])
                     continue
 
-                # Plan kalibracji CALPLAN:24,temps=50/60/70,ramps=2/5/10/20
+                # Calibration plan CALPLAN:24,temps=50/60/70,ramps=2/5/10/20
                 if raw.startswith("CALPLAN:"):
                     self._parse_calplan(raw[8:])
                     continue
 
-                # Dump kalibracji - poczatek
+                # Calibration dump - start
                 if raw.startswith("CALDUMP:"):
                     self._caldump_buf = []
                     self._caldump_active = True
                     continue
-                # Pojedynczy profil PROF:idx,KpH,...
+                # A single profile PROF:idx,KpH,...
                 if raw.startswith("PROF:") and self._caldump_active:
                     self._caldump_buf.append(raw[5:])
                     continue
-                # Koniec dumpu
+                # End of the dump
                 if raw == "CALDUMPEND":
                     self._caldump_active = False
                     self.root.after(0, self._finish_caldump_save)
                     continue
 
-                # Status kalibracji CALSTAT:5/24,T=40,R=2
+                # Calibration status CALSTAT:5/24,T=40,R=2
                 if raw.startswith("CALSTAT:"):
                     self._parse_calstat(raw[8:])
                     continue
 
-                # Ostrzezenie: test relay nie zlapal oscylacji, uzyto wartosci
-                # bazowych CALWARN:T=90,cycles=1,relay_fail
+                # Warning: the relay test did not catch oscillation, base values
+                # were used CALWARN:T=90,cycles=1,relay_fail
                 if raw.startswith("CALWARN:"):
                     self._parse_calwarn(raw[8:])
                     continue
 
-                # Kod bledu sprzetowego/bezpieczenstwa ERR:code=1,bits=0x01,active=1
+                # Hardware/safety error code ERR:code=1,bits=0x01,active=1
                 if raw.startswith("ERR:"):
                     self._parse_err(raw[4:])
                     continue
 
-                # Numer wersji firmware - wysylany raz w setup() ORAZ na kazde
-                # zadanie "VER" (patrz connect()). Pokazany w pasku tytulowym
-                # (FW: ...) zeby od razu bylo widac, czy plytka faktycznie ma
-                # wgrany nowy soft, a nie tylko czy apka jest nowa.
+                # Firmware version number - sent once in setup() AND on every
+                # "VER" request (see connect()). Shown in the title bar
+                # (FW: ...) so it is immediately visible whether the board really
+                # has the new software flashed, not just whether the app is new.
                 if raw.startswith("BUILD:"):
                     self.root.after(0, lambda b=raw[6:].strip(): self._set_fw_build(b))
                     continue
 
-                # Linia danych CSV (9 pol + opcjonalne temp2 jako 10.)
+                # CSV data line (9 fields + optional temp2 as the 10th)
                 p = raw.split(',')
                 is_csv = len(p) >= 9
                 if is_csv:
                     try: float(p[0])
                     except ValueError: is_csv = False
                 if not is_csv:
-                    # Nie CSV i nie zaden ze znanych prefixow powyzej - zamiast
-                    # po cichu odrzucac (jak wczesniej), pokaz w panelu
-                    # diagnostyki. Dzieki temu widac w apce WSZYSTKO co
-                    # firmware wysyla przez Serial (np. "Flash: zapisano.",
-                    # "AUTOCAL START", "RELAY FAIL - bazowe"), a nie tylko we
-                    # wlasnym Serial Monitorze Arduino (ktory i tak nie dziala
-                    # rownolegle z apka na tym samym porcie).
+                    # Not CSV and not any of the known prefixes above - instead
+                    # of silently discarding it (as before), show it in the
+                    # diagnostics panel. That way the app shows EVERYTHING the
+                    # firmware sends over Serial (e.g. "Flash: zapisano.",
+                    # "AUTOCAL START", "RELAY FAIL - bazowe"), not only in
+                    # Arduino's own Serial Monitor (which cannot run in
+                    # parallel with the app on the same port anyway).
                     if raw:
                         low = raw.upper()
                         lvl = 'WARN' if any(k in low for k in
@@ -665,38 +994,43 @@ class PeltierControl:
                              pwm=int(p[4]), kp=float(p[5]), ki=float(p[6]),
                              kd=float(p[7]), state=p[8].strip())
                 except: continue
-                # temp2 - druga termopara (10. pole, jesli obecne)
+                # temp2 - the second thermocouple (10th field, if present)
                 d['temp2'] = None
                 if len(p) >= 10:
                     try:
                         v2 = float(p[9])
-                        d['temp2'] = v2 if v2 != 0 else None  # 0 = brak/blad
+                        d['temp2'] = v2 if v2 != 0 else None  # 0 = none/error
                     except: pass
-                self._latest_temp2 = d['temp2']  # do wyswietlenia na karcie
+                self._latest_temp2 = d['temp2']  # for display on the card
 
-                # Rozbicie skladnikow PID (10.-15. dodatkowe pole, tylko w
-                # AUTO - patrz komentarz przy "dbgFF" w firmware) - FF, P, I,
-                # D, surowy wynik PID przed obcieciem/slew, i uzyty
-                # reactScale. Trafia do archiwum cyklu (cyc_log), zeby dalsza
-                # diagnoza fali/lagow mogla bazowac na liczbach z pliku,
-                # zamiast na zgadywaniu z samego wykresu temp/PWM.
+                # Breakdown of the PID components (10th-15th extra fields, only in
+                # AUTO - see the comment next to "dbgFF" in the firmware) - FF, P, I,
+                # D, the raw PID result before clamping/slew, and the applied
+                # reactScale. It goes into the run archive (cyc_log) so that further
+                # diagnosis of oscillation/lag can rely on numbers from the file
+                # instead of guessing from the temp/PWM chart alone.
                 d['dbg'] = None
                 if len(p) >= 16:
                     try:
                         d['dbg'] = dict(ff=float(p[10]), p=float(p[11]),
                                          i=float(p[12]), dd=float(p[13]),
-                                         raw=float(p[14]), react=float(p[15]))
+                                         raw=float(p[14]), react=float(p[15]),
+                                         # 17th column (since FW .29): estimated
+                                         # temperature of the other side of the Peltier.
+                                         # Older firmware does not send it -
+                                         # then it stays None and the CSV has a blank.
+                                         amb=(float(p[16]) if len(p) >= 17 else None))
                     except: pass
 
-                # Czas z FIRMWARE (p[0] = czas_s) - dokladny, niezalezny od
-                # opoznien aplikacji/buforowania kolejki. Zegar komputera (time.time)
-                # rozjezdzal sie przy buforowaniu i zanizal AVG RATE.
+                # Time from the FIRMWARE (p[0] = czas_s) - accurate, independent of
+                # application delays/queue buffering. The computer clock (time.time)
+                # drifted during buffering and understated AVG RATE.
                 try:
                     fw_time = float(p[0])
                 except:
                     fw_time = 0
                 if self.t0 is None:
-                    self.t0 = fw_time  # pierwszy czas firmware = punkt zero
+                    self.t0 = fw_time  # first firmware timestamp = zero point
                 now = fw_time - self.t0
                 state = d['state']
 
@@ -709,14 +1043,14 @@ class PeltierControl:
                 prev = self.last_state
                 self.last_state = state
                 self.cur_state = state
-                # SELF-TUNE: gdy stan to ST-..., self-tune zmienia PID na zywo.
-                # Przepisz nowe Kp/Ki/Kd na suwaki, zeby tabela sie aktualizowala.
+                # SELF-TUNE: when the state is ST-..., self-tune changes the PID live.
+                # Copy the new Kp/Ki/Kd onto the sliders so the table stays updated.
                 if state.startswith('ST') or state.startswith('CAL'):
                     self._st_pid_update = (d['kp'], d['ki'], d['kd'])
-                # Wykryj koniec kalibracji (CAL/CAL-N -> MAN)
+                # Detect the end of calibration (CAL/CAL-N -> MAN)
                 if self.cal_running and 'CAL' in prev and state == 'MAN':
                     self.cal_running = False
-                    self.cal_current = self.cal_total  # ukoncz pasek
+                    self.cal_current = self.cal_total  # complete the bar
                     self.root.after(0, self._cal_finished)
                 self.data_queue.put((now, d['temp'], d['st'], d['sa'],
                                     d['pwm']*100/255, d['kp'], d['ki'],
@@ -724,26 +1058,26 @@ class PeltierControl:
 
             except serial.SerialException:
                 self.running = False
-                self.root.after(0, lambda: self.set_status(False, "Utracono polaczenie"))
+                self.root.after(0, lambda: self.set_status(False, "Connection lost"))
                 break
             except Exception as e:
                 if self.running: print(f"reader err: {e}")
                 time.sleep(0.3)
 
     def _parse_cfg(self, cfg):
-        """Parsuje CFG:SP=25.5,RU=2.0,... i synchronizuje suwaki"""
+        """Parses CFG:SP=25.5,RU=2.0,... and synchronises the sliders"""
         d = {}
         for part in cfg.split(','):
             if '=' in part:
                 k, v = part.split('=', 1)
                 d[k.strip()] = v.strip()
-        # Synchronizuj suwaki (silent - bez wysylania z powrotem)
+        # Synchronise the sliders (silent - without sending back)
         self.root.after(0, lambda: self._apply_cfg(d))
 
     def _apply_cfg(self, d):
         try:
-            # Suwaki synchronizuj TYLKO przy pierwszym CFG po polaczeniu.
-            # Potem nastawy uzytkownika maja zostawac (nie nadpisuj po STOP itp.)
+            # Synchronise the sliders ONLY on the first CFG after connecting.
+            # Afterwards the user's settings must stay (do not overwrite after STOP etc.)
             if not getattr(self, '_cfg_synced', False):
                 if 'SP' in d and hasattr(self, 'sl_sp'):    self.sl_sp.set(float(d['SP']))
                 if 'RU' in d and hasattr(self, 'sl_ru'):    self.sl_ru.set(float(d['RU']))
@@ -760,17 +1094,17 @@ class PeltierControl:
                 self.dev_cal = (d['CAL'] == '1')
             if 'STATE' in d:
                 self.cur_state = d['STATE']
-            # Polaryzacja
+            # Polarity
             if 'POL' in d:
                 self.dev_pol_swapped = (d['POL'] == '1')
             if 'POLSET' in d:
                 self.dev_pol_set = (d['POLSET'] == '1')
-            # Zakres kalibracji
+            # Calibration range
             if 'CALMIN' in d:
                 self.dev_cal_min = float(d['CALMIN'])
             if 'CALMAX' in d:
                 self.dev_cal_max = float(d['CALMAX'])
-            # Stan wentylatorow
+            # Fan state
             if 'FAN' in d:
                 fan_val = int(float(d['FAN']))
                 self.fan_on = (fan_val > 0)
@@ -783,15 +1117,15 @@ class PeltierControl:
                     else:
                         self.btn_fan.config(text="○ OFF", fg=C['dim2'],
                                            highlightbackground=C['dim'])
-            # Zaktualizuj wskaznik polaryzacji w UI jesli istnieje
+            # Update the polarity indicator in the UI if it exists
             if hasattr(self, '_update_pol_indicator'):
                 self._update_pol_indicator()
         except Exception as e:
             print(f"apply_cfg err: {e}")
 
     def _parse_calplan(self, txt):
-        """CALPLAN:9,temps=20/30/.../90,ramps=relay - buduj liste krokow.
-        Relay: jeden test na temperature (ramps=relay), nie siatka temp×rampa."""
+        """CALPLAN:9,temps=20/30/.../90,ramps=relay - build the step list.
+        Relay: one test per temperature (ramps=relay), not a temp x ramp grid."""
         try:
             d = {}
             parts = txt.split(',')
@@ -806,10 +1140,10 @@ class PeltierControl:
                         relay_mode = True
                     else:
                         ramps = [float(x) for x in rv.split('/') if x]
-            # Buduj plan
+            # Build the plan
             plan = []
             if relay_mode:
-                # Relay: jeden krok na temperature
+                # Relay: one step per temperature
                 for t in temps:
                     plan.append((t, 'relay'))
             else:
@@ -830,7 +1164,7 @@ class PeltierControl:
             print(f"calplan err: {e}")
 
     def _parse_calstat(self, txt):
-        """CALSTAT:5/24,T=40,R=2 - aktualizuj postep"""
+        """CALSTAT:5/24,T=40,R=2 - update the progress"""
         try:
             d = {}
             parts = txt.split(',')
@@ -843,15 +1177,15 @@ class PeltierControl:
                     self.cal_cur_temp = float(part[2:])
                 elif part.startswith('R='):
                     rv = part[2:].strip()
-                    # Relay: R= to FAZA kroku (heating/stabil/relay), nie rampa.
+                    # Relay: R= is the step PHASE (heating/stabil/relay), not the ramp.
                     if rv in ('heating', 'stabil', 'relay'):
                         self.cal_phase = rv
                         self.cal_cur_ramp = 'relay'
                     elif rv.startswith('rampprep:') or rv.startswith('ramptest:'):
-                        # Test rampowania per-rampa PO relay (dostraja Kp/Ki/Kd
-                        # grzania osobno dla kazdej rampy z calRamps) -
-                        # R=rampprep:20 (cofanie sie) / R=ramptest:20 (jazda z
-                        # tym rampem, sledzenie ASP).
+                        # Per-ramp ramping test AFTER relay (tunes the heating
+                        # Kp/Ki/Kd separately for every ramp from calRamps) -
+                        # R=rampprep:20 (backing off) / R=ramptest:20 (running at
+                        # that ramp, tracking ASP).
                         key, _, rate = rv.partition(':')
                         self.cal_phase = key
                         try: self.cal_cur_ramp = float(rate)
@@ -860,7 +1194,7 @@ class PeltierControl:
                         self.cal_phase = None
                         try: self.cal_cur_ramp = float(rv)
                         except: self.cal_cur_ramp = rv
-            # Jesli zmienil sie krok - zapisz czas (do ETA)
+            # If the step has changed - record the time (for the ETA)
             if new_current != self.cal_current:
                 if self.cal_t0:
                     self.cal_step_times.append(time.time())
@@ -871,23 +1205,23 @@ class PeltierControl:
             print(f"calstat err: {e}")
 
     def _parse_calwarn(self, txt):
-        """Dwa rozne ostrzezenia dziela ten sam komunikat CALWARN:
+        """Two different warnings share the same CALWARN message:
 
-        1) CALWARN:T=90,cycles=1,amp=140,relay_fail - test relay dla tej
-        temperatury nie zlapal oscylacji (za mało/za szybkie przejscia przez
-        setpoint) i firmware wpisal wartosci bazowe zamiast realnie
-        zmierzonych. 'amp' to amplituda PWM przy ktorej test sie poddal -
-        jesli to juz max (140), nawet najmocniejsze lagodne pobudzenie nie
-        przepchnelo ukladu przez setpoint w obie strony (fizyczna granica
-        zakresu, nie tylko kwestia czasu/szumu).
+        1) CALWARN:T=90,cycles=1,amp=140,relay_fail - the relay test for this
+        temperature did not catch oscillation (too few/too fast crossings of the
+        setpoint) and the firmware wrote base values instead of really
+        measured ones. 'amp' is the PWM amplitude at which the test gave up -
+        if that is already the max (140), even the strongest gentle excitation did
+        not push the system across the setpoint in both directions (a physical
+        limit of the range, not just a matter of time/noise).
 
-        2) CALWARN:T=50,R=20,err=2.34,ramp_track_fail - test ROMPOWANIA dla
-        konkretnej rampy (PO udanym relay) nie zszedl ponizej progu bledu
-        sledzenia ASP w czasie testu - ta JEDNA komorka (temp,rampa) zostaje
-        z profilem bazowym z relay (ktory dalej jest realnym pomiarem, NIE
-        wartosciami 10.0/0.30/0.80 - w odroznieniu od (1)!). To NIE jest to
-        samo co relay_fail i nie powinno oznaczac calej temperatury jako
-        "bazowe/fail" w tabeli - stad osobna lista (cal_ramp_warnings)."""
+        2) CALWARN:T=50,R=20,err=2.34,ramp_track_fail - the RAMPING test for a
+        specific ramp (AFTER a successful relay) did not get below the ASP
+        tracking error threshold during the test - this ONE cell (temp,ramp) keeps
+        the base profile from relay (which is still a real measurement, NOT the
+        values 10.0/0.30/0.80 - unlike (1)!). This is NOT the
+        same as relay_fail and should not mark the whole temperature as
+        "base/fail" in the table - hence a separate list (cal_ramp_warnings)."""
         try:
             d = {}
             for part in txt.split(','):
@@ -895,7 +1229,7 @@ class PeltierControl:
                     k, v = part.split('=', 1)
                     d[k.strip()] = v.strip()
             temp = float(d.get('T', 'nan'))
-            if temp != temp:  # odrzuc NaN
+            if temp != temp:  # reject NaN
                 return
             if 'R' in d and 'err' in d:
                 # (2) ramp_track_fail
@@ -904,26 +1238,26 @@ class PeltierControl:
                 try: err = float(d['err'])
                 except Exception: err = None
                 self.cal_ramp_warnings.append((temp, ramp, err))
-                self._log_diag('WARN', f"Kalibracja: test rampy {ramp}°C/min "
-                               f"@ {temp}°C nie dotrzymal ASP (err={err}°C)")
+                self._log_diag('WARN', f"Calibration: ramp test {ramp}°C/min "
+                               f"@ {temp}°C did not keep up with ASP (err={err}°C)")
             else:
                 # (1) relay_fail
                 cycles = int(d.get('cycles', '0'))
                 amp = int(d['amp']) if 'amp' in d else None
                 self.cal_warnings.append((temp, cycles, amp))
-                self._log_diag('WARN', f"Kalibracja: test relay @ {temp}°C nie zlapal "
-                               f"oscylacji (cycles={cycles}, amp={amp}) - uzyto wartosci bazowych")
+                self._log_diag('WARN', f"Calibration: relay test @ {temp}°C did not catch "
+                               f"oscillation (cycles={cycles}, amp={amp}) - base values used")
             self.root.after(0, self._refresh_cal_view)
         except Exception as e:
             print(f"calwarn err: {e}")
 
     def _parse_err(self, txt):
-        """ERR:code=N,...,active=0/1 - kod bledu sprzetowego/bezpieczenstwa z
-        firmware. Firmware wysyla to TYLKO na zbocze (raz gdy sie pojawia, raz
-        gdy ustepuje), wiec tu tylko dekodujemy i wpisujemy do logu - zero
-        ryzyka zalania Serial. code=1/2 aktualizuja err_active (pokazywane
-        jako aktywny alarm dopoki nie przyjdzie active=0), code=3/4 to
-        zdarzenia jednorazowe ale tez trzymane w err_active do ew. wglądu."""
+        """ERR:code=N,...,active=0/1 - hardware/safety error code from the
+        firmware. The firmware sends this ONLY on an edge (once when it appears, once
+        when it clears), so here we only decode it and write it to the log - zero
+        risk of flooding Serial. code=1/2 update err_active (shown
+        as an active alarm until active=0 arrives), code=3/4 are
+        one-off events but are also kept in err_active for later reference."""
         try:
             d = {}
             for part in txt.split(','):
@@ -932,13 +1266,13 @@ class PeltierControl:
                     d[k.strip()] = v.strip()
             code = int(d.get('code', '-1'))
             active = d.get('active', '1') == '1'
-            base = ERR_CODES.get(code, f"Nieznany kod bledu ({code})")
+            base = ERR_CODES.get(code, f"Unknown error code ({code})")
             detail = ""
             if code == 1 and 'bits' in d:
                 try: detail = " - " + decode_tc_fault(int(d['bits'], 16))
                 except Exception: pass
             elif code == 2 and 'val' in d:
-                detail = f" - odczyt={d['val']}°C"
+                detail = f" - reading={d['val']}°C"
             elif code == 3:
                 detail = f" - temp={d.get('temp', '?')}°C, limit={d.get('limit', '?')}°C"
             text = base + detail
@@ -947,15 +1281,15 @@ class PeltierControl:
                 self._log_diag('ERR', text)
             else:
                 self.err_active.pop(code, None)
-                self._log_diag('INFO', f"USTAPIL: {base}")
+                self._log_diag('INFO', f"CLEARED: {base}")
         except Exception as e:
             print(f"err parse err: {e}")
 
     def _log_diag(self, level, text):
-        """Dopisz wpis do panelu diagnostyki (level: ERR/WARN/INFO) i
-        odswiez wskaznik w pasku tytulowym. Wolane zarowno z watku Serial
-        (bezposrednio) jak i z GUI - lista.append() jest bezpieczne w
-        CPythonie (GIL), a odswiezenie UI zawsze idzie przez root.after."""
+        """Append an entry to the diagnostics panel (level: ERR/WARN/INFO) and
+        refresh the indicator in the title bar. Called both from the Serial thread
+        (directly) and from the GUI - list.append() is safe in
+        CPython (GIL), and the UI refresh always goes through root.after."""
         entry = (time.time(), level, text)
         self.diag_log.append(entry)
         if len(self.diag_log) > 500:
@@ -967,28 +1301,28 @@ class PeltierControl:
             self.root.after(0, lambda e=entry: self.diag_win.append_entry(e))
 
     def _refresh_diag_indicator(self):
-        """Aktualizuje przycisk DIAG w pasku tytulowym: kolor/tekst wg tego
-        czy sa aktywne alarmy sprzetowe (err_active) i licznik nieprzeczytanych
-        wpisow (diag_unseen)."""
+        """Updates the DIAG button in the title bar: colour/text according to
+        whether there are active hardware alarms (err_active) and the count of unread
+        entries (diag_unseen)."""
         if not hasattr(self, 'btn_diag'):
             return
         if self.err_active:
             n = len(self.err_active)
-            self.btn_diag.config(text=f"⚠ BLAD x{n}", bg=C['red'], fg='#ffffff')
+            self.btn_diag.config(text=f"⚠ ERROR x{n}", bg=C['red'], fg='#ffffff')
         elif self.diag_unseen > 0:
             self.btn_diag.config(text=f"DIAG ({self.diag_unseen})", bg=C['orange'], fg='#1a1c1f')
         else:
             self.btn_diag.config(text="DIAG", bg=C['bg2'], fg=C['dim'])
 
     def _set_fw_build(self, build):
-        """Wolane po odebraniu BUILD:<id> z plytki (przy starcie firmware
-        LUB w odpowiedzi na komende VER wyslana zaraz po polaczeniu).
-        Pokazuje numer w pasku tytulowym i loguje do diagnostyki, zeby bylo
-        widac czarno na bialym ktora wersja firmware jest faktycznie wgrana."""
+        """Called after receiving BUILD:<id> from the board (at firmware startup
+        OR in response to the VER command sent right after connecting).
+        Shows the number in the title bar and logs it to diagnostics, so it is
+        plain to see which firmware version is actually flashed."""
         self.dev_fw_build = build
         if hasattr(self, 'fw_build_lbl'):
             self.fw_build_lbl.config(text=f"FW: {build}", fg=C['green'])
-        self._log_diag('INFO', f"Polaczono - firmware build {build}")
+        self._log_diag('INFO', f"Connected - firmware build {build}")
 
     def open_diag_window(self):
         self.diag_unseen = 0
@@ -1002,9 +1336,9 @@ class PeltierControl:
         self.diag_win = DiagnosticsWindow(self.root, self)
 
     def _cal_step_stats(self):
-        """(avg_step_s, elapsed_w_biezacym_kroku_s) na podstawie znacznikow
-        czasu rozpoczecia kolejnych krokow. avg_step=None, gdy nie ma jeszcze
-        zadnego ukonczonego kroku do usrednienia."""
+        """(avg_step_s, elapsed_in_current_step_s) based on the timestamps
+        of the starts of successive steps. avg_step=None when there is not yet
+        any completed step to average."""
         times = self.cal_step_times
         now = time.time()
         if len(times) >= 2:
@@ -1021,12 +1355,12 @@ class PeltierControl:
         return avg_step, elapsed_in_step
 
     def _cal_eta(self):
-        """Szacowany pozostaly czas kalibracji [s].
-        None = brak jeszcze danych do oszacowania.
-        0 tylko gdy kalibracja NAPRAWDE sie skonczyla (cal_running=False) -
-        wczesniej cur==total (ostatni punkt dopiero SIE ZACZAL) tez dawalo 0,
-        co wygladalo jak "gotowe" mimo ze test relay mogl jeszcze trwac
-        kilka-kilkanascie minut."""
+        """Estimated remaining calibration time [s].
+        None = not enough data yet to make an estimate.
+        0 only when the calibration has REALLY finished (cal_running=False) -
+        previously cur==total (the last point had only JUST STARTED) also gave 0,
+        which looked like "done" even though the relay test could still be running
+        for another several or a dozen-odd minutes."""
         if not self.cal_t0 or self.cal_total < 1:
             return None
         if not self.cal_running:
@@ -1041,10 +1375,10 @@ class PeltierControl:
         return max(0, remaining)
 
     def _cal_progress_fraction(self):
-        """Uamek wypelnienia paska postepu (0..1). Rosnie plynnie w trakcie
-        biezacego kroku zamiast skakac na 100% w chwili, gdy OSTATNI punkt
-        dopiero sie zaczyna (cal_current juz rowne cal_total, ale realnie
-        mogl dopiero wystartowac)."""
+        """Fill fraction of the progress bar (0..1). It grows smoothly during the
+        current step instead of jumping to 100% at the moment the LAST point
+        has only just started (cal_current already equals cal_total, but in reality
+        it may have only just begun)."""
         if not self.cal_total:
             return 0.0
         if not self.cal_running and self.cal_current >= self.cal_total:
@@ -1057,21 +1391,21 @@ class PeltierControl:
         return min(1.0, (completed + step_frac) / self.cal_total)
 
     def _cal_finished(self):
-        """Kalibracja zakonczona"""
+        """Calibration finished"""
         self._refresh_cal_view()
         if hasattr(self, 'cal_status'):
             self.cal_status.config(text="✓ Calibration done - saving to PC...")
         self.dev_cal = True
-        # Pobierz zaktualizowane nastawy
+        # Fetch the updated settings
         self.send("GET")
-        # Automatycznie pobierz profile i zapisz na dysk PC
+        # Automatically fetch the profiles and save them to the PC disk
         self.root.after(800, lambda: self.dump_calibration_to_pc(silent=False))
 
     # ────────────────────────────────────────────────────
-    #  KALIBRACJA - ZAPIS/ODCZYT NA DYSKU PC
+    #  CALIBRATION - SAVE/LOAD ON THE PC DISK
     # ────────────────────────────────────────────────────
     def _manual_load_cal(self):
-        """Reczne wgranie kalibracji z PC (z potwierdzeniem)"""
+        """Manual upload of the calibration from the PC (with confirmation)"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
@@ -1081,7 +1415,7 @@ class PeltierControl:
                 "Run calibration first, or save it with\n"
                 "the 'SAVE CAL TO PC' button.")
             return
-        # Pokaz date zapisu
+        # Show the save date
         try:
             with open(self.cal_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -1097,7 +1431,7 @@ class PeltierControl:
             self.load_calibration_from_pc()
 
     def show_cal_table(self):
-        """Pobierz profile z urzadzenia i pokaz tabele Kp/Ki/Kd"""
+        """Fetch the profiles from the device and show the Kp/Ki/Kd table"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
@@ -1105,18 +1439,18 @@ class PeltierControl:
         self._caldump_active = False
         self._caldump_purpose = 'view'
         self.send("DUMPCAL")
-        print("Pobieranie tabeli kalibracji...")
+        print("Fetching the calibration table...")
 
-    # Wartosci bazowe z firmware (KP_BASE/KI_BASE/KD_BASE_H) - to jest to, co
-    # firmware wpisuje jako profil, gdy test relay NIE zlapal oscylacji
-    # ("RELAY FAIL - bazowe"). Kazda kalibrowana komorka, ktora trafia
-    # dokladnie w te liczby, prawie na pewno nie jest realnym pomiarem.
+    # Base values from the firmware (KP_BASE/KI_BASE/KD_BASE_H) - this is what
+    # the firmware writes as the profile when the relay test did NOT catch oscillation
+    # ("RELAY FAIL - bazowe"). Every calibrated cell that lands
+    # exactly on these numbers is almost certainly not a real measurement.
     _CAL_BASE_KP, _CAL_BASE_KI, _CAL_BASE_KD = 10.0, 0.3, 0.8
 
     def _show_cal_table_window(self, profiles):
-        """Okno z tabela skalibrowanych PID (temp x rampa)"""
-        # Siatka jak w firmware (PR_N=9 - musi byc IDENTYCZNA z PT[]/PR[] w .ino,
-        # inaczej idx=ri*len(PR)+ci wskazuje na zle komorki)
+        """Window with the table of calibrated PID values (temp x ramp)"""
+        # Grid as in the firmware (PR_N=9 - must be IDENTICAL to PT[]/PR[] in the .ino,
+        # otherwise idx=ri*len(PR)+ci points at the wrong cells)
         PT = [20, 30, 40, 50, 60, 70, 80, 90, 100]
         PR = [5, 10, 20, 30, 40, 50, 60, 70, 80]
         win = tk.Toplevel(self.root)
@@ -1137,9 +1471,9 @@ class PeltierControl:
         tk.Label(win, text=info_txt,
                  bg=C['bg'], fg=(C['red'] if n_fallback else C['dim']),
                  font=(FONT, fsz(9)), justify='left').pack(anchor='w', padx=16)
-        # Mapa idx -> profil
+        # Map idx -> profile
         pmap = {p['idx']: p for p in profiles}
-        # Tabela przewijalna
+        # Scrollable table
         frame = tk.Frame(win, bg=C['bg'])
         frame.pack(fill='both', expand=True, padx=16, pady=12)
         canvas = tk.Canvas(frame, bg=C['bg2'], highlightthickness=0)
@@ -1150,7 +1484,7 @@ class PeltierControl:
         canvas.config(yscrollcommand=sb.set)
         canvas.pack(side='left', fill='both', expand=True)
         sb.pack(side='right', fill='y')
-        # Naglowek: rampy
+        # Header: ramps
         tk.Label(inner, text="Temp\\Ramp", bg=C['panel'], fg=C['cyan'],
                  font=(FONT, fsz(9), 'bold'), width=10, anchor='w').grid(
                  row=0, column=0, sticky='nsew', padx=1, pady=1)
@@ -1158,7 +1492,7 @@ class PeltierControl:
             tk.Label(inner, text=f"{r}°C/min", bg=C['panel'], fg=C['cyan'],
                      font=(FONT, fsz(9), 'bold'), width=16).grid(
                      row=0, column=ci+1, sticky='nsew', padx=1, pady=1)
-        # Wiersze: temperatury
+        # Rows: temperatures
         for ri, t in enumerate(PT):
             tk.Label(inner, text=f"{t}°C", bg=C['panel'], fg=C['orange'],
                      font=(FONT, fsz(9), 'bold'), width=10, anchor='w').grid(
@@ -1179,7 +1513,7 @@ class PeltierControl:
                 tk.Label(inner, text=txt, bg=bg, fg=fg,
                          font=(FONT, fsz(8)), width=16).grid(
                          row=ri+1, column=ci+1, sticky='nsew', padx=1, pady=1)
-        # Stopka
+        # Footer
         tk.Label(win, text="Each cell: Kp / Ki / Kd for that temperature and ramp rate.\n"
                  "On START, the app interpolates between the 4 nearest points automatically.\n"
                  "⚠ = identical to the base defaults - almost certainly a failed relay test "
@@ -1188,9 +1522,9 @@ class PeltierControl:
                  anchor='w', padx=16, pady=(0, 12))
 
     def _is_base_profile(self, p):
-        """True jesli Kp/Ki/Kd tego profilu sa (w granicach bledu zaokraglenia)
-        dokladnie wartosciami bazowymi z firmware - czyli prawie na pewno
-        fallback po nieudanym tescie relay, a nie realny pomiar."""
+        """True if this profile's Kp/Ki/Kd are (within rounding error)
+        exactly the base values from the firmware - that is, almost certainly a
+        fallback after a failed relay test rather than a real measurement."""
         try:
             return (abs(p['KpH'] - self._CAL_BASE_KP) < 0.05 and
                     abs(p['KiH'] - self._CAL_BASE_KI) < 0.01 and
@@ -1199,21 +1533,21 @@ class PeltierControl:
             return False
 
     def dump_calibration_to_pc(self, silent=True):
-        """Poprosi urzadzenie o profile i offset, zapisze do JSON"""
+        """Asks the device for the profiles and offset, saves them to JSON"""
         if not self.connected:
             return
         self._caldump_purpose = 'save'
-        # Zapamietaj offset z aktualnego suwaka
+        # Remember the offset from the current slider
         try:
             self._pending_offset = self.sl_off.get()
         except:
             self._pending_offset = 0.0
         self.send("DUMPCAL")
         if not silent:
-            print("Pobieranie profili z urzadzenia...")
+            print("Fetching the profiles from the device...")
 
     def _finish_caldump_save(self):
-        """Po odebraniu wszystkich profili - zapisz do pliku JSON"""
+        """After receiving all the profiles - save them to a JSON file"""
         try:
             profiles = []
             for line in self._caldump_buf:
@@ -1234,7 +1568,7 @@ class PeltierControl:
             with open(self.cal_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
             n_valid = sum(1 for p in profiles if p['valid'])
-            print(f"Kalibracja zapisana: {self.cal_file.name} ({n_valid}/{len(profiles)} profili)")
+            print(f"Calibration saved: {self.cal_file.name} ({n_valid}/{len(profiles)} profiles)")
             if hasattr(self, 'cal_status'):
                 self.cal_status.config(text=f"✓ Calibration saved to PC ({n_valid} profiles)")
             if self._caldump_purpose == 'save':
@@ -1245,14 +1579,14 @@ class PeltierControl:
                         "They will be auto-loaded on next connection.")
                 except: pass
             elif self._caldump_purpose == 'view':
-                # Pokaz tabele w oknie
+                # Show the table in a window
                 self._show_cal_table_window(profiles)
         except Exception as e:
-            print(f"Blad zapisu kalibracji: {e}")
+            print(f"Calibration save error: {e}")
         self._caldump_purpose = None
 
     def load_calibration_from_pc(self):
-        """Wczytaj kalibracje z pliku JSON i wyslij do urzadzenia"""
+        """Load the calibration from the JSON file and send it to the device"""
         if not self.cal_file.exists():
             return False
         try:
@@ -1262,77 +1596,104 @@ class PeltierControl:
             offset = data.get('offset', 0.0)
             if not profiles:
                 return False
-            # Wyslij offset
+            # Send the offset
             self.send(f"OFFSET:{offset:.1f}")
-            # Wyslij kazdy profil (z malym odstepem zeby nie zalac bufora)
+            # Send every profile (with a small gap so the buffer is not flooded)
             def send_profiles(i=0):
                 if i >= len(profiles):
-                    # Po wszystkich - oznacz kalibracje jako gotowa
+                    # After all of them - mark the calibration as ready
                     self.send("SETCALDONE:1")
                     self.dev_cal = True
                     if hasattr(self, 'cal_status'):
                         self.cal_status.config(
                             text=f"✓ Loaded calibration from PC ({len(profiles)} profiles)")
-                    print(f"Wgrano {len(profiles)} profili z PC do urzadzenia")
+                    print(f"Uploaded {len(profiles)} profiles from PC to the device")
                     return
                 p = profiles[i]
                 self.send(f"SETPROF:{p['idx']},{p['KpH']:.3f},{p['KiH']:.4f},"
                          f"{p['KdH']:.3f},{p['KpC']:.3f},{p['KiC']:.4f},"
                          f"{p['KdC']:.3f},{1 if p['valid'] else 0}")
-                # Nastepny profil za 40ms
+                # Next profile in 40ms
                 self.root.after(40, lambda: send_profiles(i + 1))
             send_profiles(0)
             saved = data.get('saved', '?')
-            print(f"Ladowanie kalibracji z PC (zapisana: {saved})")
+            print(f"Loading calibration from PC (saved: {saved})")
             return True
         except Exception as e:
-            print(f"Blad ladowania kalibracji: {e}")
+            print(f"Calibration load error: {e}")
             return False
 
 
     # ────────────────────────────────────────────────────
-    #  BUDOWA UI
+    #  UI CONSTRUCTION
     # ────────────────────────────────────────────────────
     def _build_ui(self):
-        # Pasek tytulowy z lampka statusu
-        top = tk.Frame(self.root, bg=C['bg2'], height=SC(44))
+        # ── TITLE BAR ───────────────────────────────────────────────────
+        # Three zones, left to right: identity (medallion + name + versions),
+        # a stretch of nothing, and live state (diagnostics + link light).
+        # Before .15 the versions and the state were crammed together on the
+        # left and the eye had to hunt for the connection light.
+        top = tk.Frame(self.root, bg=C['bg2'], height=SC(48))
         top.pack(fill='x'); top.pack_propagate(False)
-        tk.Frame(top, bg=C['red'], width=6).pack(side='left', fill='y')
-        tk.Label(top, text="  PELTIER CONTROL", bg=C['bg2'], fg=C['text'],
-                 font=(FONT, fsz(13), 'bold')).pack(side='left', padx=(8, 0))
-        tk.Label(top, text=f"v6.0 · APP {APP_BUILD}", bg=C['bg2'], fg=C['dim2'],
-                 font=(FONT, fsz(9))).pack(side='left', padx=8)
-        self.fw_build_lbl = tk.Label(top, text="FW: —", bg=C['bg2'], fg=C['dim2'],
-                                      font=(FONT, fsz(9)))
+        tk.Frame(top, bg=C['gold'], width=SC(4)).pack(side='left', fill='y')
+
+        badge = tk.Canvas(top, width=SC(30), height=SC(30), bg=C['bg2'],
+                          highlightthickness=0)
+        badge.pack(side='left', padx=(SC(10), SC(8)))
+        draw_medallion(badge, SC(15), SC(15), SC(12), C['gold'], C['bg2'])
+
+        idbox = tk.Frame(top, bg=C['bg2'])
+        idbox.pack(side='left')
+        nrow = tk.Frame(idbox, bg=C['bg2'])
+        nrow.pack(anchor='w')
+        tk.Label(nrow, text="IGNI", bg=C['bg2'], fg=C['text'],
+                 font=(FONT, fsz(15), 'bold')).pack(side='left')
+        tk.Label(nrow, text="  photocurrent & pyrocurrent bench",
+                 bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(9))).pack(side='left', pady=(SC(4), 0))
+        vrow = tk.Frame(idbox, bg=C['bg2'])
+        vrow.pack(anchor='w')
+        tk.Label(vrow, text=f"APP {APP_BUILD}", bg=C['bg2'], fg=C['dim2'],
+                 font=(FONT, fsz(8))).pack(side='left')
+        tk.Label(vrow, text="·", bg=C['bg2'], fg=C['dim2'],
+                 font=(FONT, fsz(8))).pack(side='left', padx=SC(5))
+        self.fw_build_lbl = tk.Label(vrow, text="FW —", bg=C['bg2'], fg=C['dim2'],
+                                      font=(FONT, fsz(8)))
         self.fw_build_lbl.pack(side='left')
 
-        # Status po prawej
+        # Live state on the right
         sf = tk.Frame(top, bg=C['bg2'])
-        sf.pack(side='right', padx=16)
+        sf.pack(side='right', padx=SC(16))
         self.btn_diag = tk.Button(sf, text="DIAG", command=self.open_diag_window,
                                    bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
-                                   relief='flat', cursor='hand2', bd=0, padx=10, pady=4,
+                                   relief='flat', cursor='hand2', bd=0, padx=SC(10), pady=SC(4),
                                    activebackground=C['panel3'])
-        self.btn_diag.pack(side='left', padx=(0, 16))
-        self.s_dot = tk.Canvas(sf, width=14, height=14, bg=C['bg2'], highlightthickness=0)
-        self.s_dot.pack(side='left', padx=(0, 8))
+        self.btn_diag.pack(side='left', padx=(0, SC(16)))
+        self.s_dot = tk.Canvas(sf, width=SC(14), height=SC(14), bg=C['bg2'],
+                               highlightthickness=0)
+        self.s_dot.pack(side='left', padx=(0, SC(8)))
         self._draw_dot(C['dim2'], glow=False)
         self.s_lbl = tk.Label(sf, text="DISCONNECTED", bg=C['bg2'], fg=C['dim'],
                               font=(FONT, fsz(10)))
         self.s_lbl.pack(side='left')
 
-        # Notebook
+        # ── TABS, ORDERED BY HOW OFTEN THEY ARE USED ────────────────────
+        # Was: CONTROL / ADVANCED / ARCHIVE / SERIES / CONNECTION - which put
+        # the every-day SERIES tab fourth, behind two you touch rarely, and
+        # hid PID work behind the vague word "ADVANCED". New order follows the
+        # actual workflow: run it -> automate it -> look at what came out ->
+        # tune it -> deal with the hardware.
         nb = ttk.Notebook(self.root)
         nb.pack(fill='both', expand=True, padx=0, pady=0)
-        t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='CONTROL')
-        t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='ADVANCED')
-        t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='ARCHIVE')
-        t5 = tk.Frame(nb, bg=C['bg']); nb.add(t5, text='SERIA')
-        t4 = tk.Frame(nb, bg=C['bg']); nb.add(t4, text='CONNECTION')
+        t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='  CONTROL  ')
+        t5 = tk.Frame(nb, bg=C['bg']); nb.add(t5, text='  SERIES  ')
+        t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='  ARCHIVE  ')
+        t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='  TUNING  ')
+        t4 = tk.Frame(nb, bg=C['bg']); nb.add(t4, text='  DEVICE  ')
         self.build_live(t1)
-        self.build_advanced(t2)
-        self.build_arch(t3)
         self.build_series(t5)
+        self.build_arch(t3)
+        self.build_advanced(t2)
         self.build_conn(t4)
 
     def _draw_dot(self, color, glow=True):
@@ -1357,19 +1718,19 @@ class PeltierControl:
         else:
             self._draw_dot(C['dim2'], glow=False)
             self.s_lbl.config(text=msg or "DISCONNECTED", fg=C['dim'])
-        # Aktywuj/dezaktywuj panel
+        # Enable/disable the panel
         if hasattr(self, 'btn_run'):
             self._set_panel_enabled(connected)
 
     # ────────────────────────────────────────────────────
-    #  EKRAN LIVE: wykres (lewo) + panel sterowania (prawo)
+    #  LIVE SCREEN: chart (left) + control panel (right)
     # ────────────────────────────────────────────────────
     def build_live(self, parent):
-        # Gorny pasek: kompaktowe karty statystyk + przyciski START/STOP
+        # Top bar: compact stat cards + START/STOP buttons
         topbar = tk.Frame(parent, bg=C['bg'])
         topbar.pack(fill='x', padx=16, pady=(10, 6))
 
-        # Karty (lewa czesc, rozciagane)
+        # Cards (left part, stretched)
         cards = tk.Frame(topbar, bg=C['bg'])
         cards.pack(side='left', fill='x', expand=True)
         self.cards = {}
@@ -1379,16 +1740,16 @@ class PeltierControl:
         self.cards['rate'] = self._stat_card(cards, "AVG RATE", "°C/min", C['yellow'])
         self.cards['pwm']  = self._stat_card(cards, "PWM", "%", C['green'])
 
-        # Przyciski START/STOP/E-STOP (prawa czesc paska) - zawsze widoczne
+        # START/STOP/E-STOP buttons (right part of the bar) - always visible
         ctrl = tk.Frame(topbar, bg=C['bg'])
         ctrl.pack(side='right', padx=(8, 0))
-        self.is_running = False  # stan: czy cykl trwa
+        self.is_running = False  # state: is a run in progress
         self.btn_run = tk.Button(ctrl, text="▶ START", command=self.toggle_run,
                                  bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(12), 'bold'),
                                  relief='flat', cursor='hand2', bd=0, padx=16, pady=12,
                                  activebackground=_lighten(C['green'], 0.15))
         self.btn_run.pack(side='left', padx=(0, 4), fill='y')
-        # FREEZE - zamroz gal do wymiany probki
+        # FREEZE - freeze the gal for a sample swap
         self.btn_freeze = tk.Button(ctrl, text="❄ FREEZE", command=self.do_freeze,
                                     bg=C['bg2'], fg=C['cyan'], font=(FONT, fsz(12), 'bold'),
                                     relief='flat', cursor='hand2', bd=0, padx=12, pady=12,
@@ -1401,34 +1762,39 @@ class PeltierControl:
                                    activebackground=_lighten(C['red'], 0.15))
         self.btn_estop.pack(side='left', fill='y')
 
-        # Glowny obszar: wykres + panel
+        # Main area: chart + panel
         main = tk.Frame(parent, bg=C['bg'])
         main.pack(fill='both', expand=True, padx=16, pady=(0, 12))
 
-        # PRAWO - panel sterowania (pakowany PIERWSZY!)
-        # Stala szerokosc 312px rezerwuje miejsce z prawej ZANIM rozszerzajacy sie
-        # wykres zajmie cavity. Inaczej canvas matplotlib przy przerysowaniu (zoom/
-        # home/resize) zada pelnego rozmiaru i zgniata panel pakowany pozniej -> panel znika.
+        # RIGHT - control panel (packed FIRST!)
+        # The fixed 312px width reserves space on the right BEFORE the expanding
+        # chart claims the cavity. Otherwise the matplotlib canvas, on a redraw (zoom/
+        # home/resize), demands its full size and crushes the panel packed later -> panel vanishes.
         self._build_panel(main)
-        # LEWO - wykres (wypelnia pozostala przestrzen)
+        # LEFT - chart (fills the remaining space)
         self._build_chart(main)
 
     def _stat_card(self, parent, title, unit, color):
+        """One live readout. Reworked in .15: the value is the thing you read
+        from across the room, so it got bigger (16 -> 22) and the card got
+        real breathing room; the caption and unit went quieter. The coloured
+        rule on top is the only thing tying it to its curve on the chart, so
+        it stayed - just thicker."""
         card = tk.Frame(parent, bg=C['panel'])
-        card.pack(side='left', fill='x', expand=True, padx=(0, 4))
-        tk.Frame(card, bg=color, height=3).pack(fill='x')
+        card.pack(side='left', fill='both', expand=True, padx=(0, SC(5)))
+        tk.Frame(card, bg=color, height=SC(4)).pack(fill='x')
         inner = tk.Frame(card, bg=C['panel'])
-        inner.pack(fill='both', expand=True, padx=7, pady=5)
+        inner.pack(fill='both', expand=True, padx=SC(11), pady=(SC(7), SC(8)))
         tk.Label(inner, text=title, bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(7)), anchor='w').pack(anchor='w')
+                 font=(FONT, fsz(8)), anchor='w').pack(anchor='w')
         vrow = tk.Frame(inner, bg=C['panel'])
-        vrow.pack(anchor='w', pady=(1, 0))
+        vrow.pack(anchor='w', pady=(SC(3), 0))
         val = tk.Label(vrow, text="--", bg=C['panel'], fg=color,
-                       font=(FONT, fsz(16), 'bold'))
+                       font=(FONT, fsz(22), 'bold'))
         val.pack(side='left')
         unit_lbl = tk.Label(vrow, text=" " + unit, bg=C['panel'], fg=C['dim2'],
-                            font=(FONT, fsz(7)))
-        unit_lbl.pack(side='left', pady=(4, 0))
+                            font=(FONT, fsz(8)))
+        unit_lbl.pack(side='left', pady=(SC(8), 0))
         return {'val': val, 'unit': unit, 'unit_lbl': unit_lbl, 'extra': None, 'row': vrow}
 
     def _build_chart(self, parent):
@@ -1441,12 +1807,13 @@ class PeltierControl:
         tk.Label(hd, text="LIVE CHART", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(side='left')
 
-        # Statystyki dotarcia do setpointu (prawa strona naglowka)
+        # Setpoint approach statistics (right side of the header)
         self.reach_lbl = tk.Label(hd, text="", bg=C['panel'], fg=C['green'],
                                   font=(FONT, fsz(9), 'bold'))
         self.reach_lbl.pack(side='right')
 
         self.fig = Figure(figsize=(9, 6), facecolor=C['panel'], dpi=110)
+        medallion_watermark(self.fig, size=0.30, cx=0.52, cy=0.55)
         gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.2,
                                    left=0.07, right=0.97, top=0.97, bottom=0.08)
         self.ax1 = self.fig.add_subplot(gs[0])
@@ -1457,11 +1824,11 @@ class PeltierControl:
         self.cv = FigureCanvasTkAgg(self.fig, master=wrap)
         self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
 
-        # Pasek narzedzi wykresu: pauza, okno czasu, zoom matplotlib
+        # Chart toolbar: pause, time window, matplotlib zoom
         toolbar_row = tk.Frame(wrap, bg=C['panel'])
         toolbar_row.pack(fill='x', padx=8, pady=(0, 8))
 
-        # Przycisk PAUSE - zatrzymuje przewijanie zeby przyblizyc
+        # PAUSE button - stops scrolling so you can zoom in
         self.btn_pause = tk.Button(toolbar_row, text="⏸ PAUSE", command=self.toggle_pause,
                                    bg=C['bg2'], fg=C['yellow'], font=(FONT, fsz(9), 'bold'),
                                    relief='flat', cursor='hand2', bd=0, padx=12, pady=6,
@@ -1469,7 +1836,7 @@ class PeltierControl:
                                    activebackground=C['panel3'])
         self.btn_pause.pack(side='left', padx=(0, 6))
 
-        # Wybor okna czasu (ile ostatnich sekund pokazac)
+        # Time window selection (how many last seconds to show)
         tk.Label(toolbar_row, text="WINDOW:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(8))).pack(side='left', padx=(8, 4))
         for label, secs in [("ALL", 0), ("5m", 300), ("2m", 120), ("1m", 60)]:
@@ -1480,11 +1847,23 @@ class PeltierControl:
                          activebackground=C['panel3'])
             b.pack(side='left', padx=2)
 
-        # Matplotlib toolbar (zoom, pan, save) - kompaktowy
+        # Matplotlib toolbar (zoom, pan, save) - compact
         tb_frame = tk.Frame(toolbar_row, bg=C['panel'])
         tb_frame.pack(side='right')
         try:
             self.mpl_toolbar = NavigationToolbar2Tk(self.cv, tb_frame, pack_toolbar=False)
+            # The toolbar's own floppy-disk button bypasses everything we do
+            # here and would write the dark screen theme straight into the
+            # file. Wrap it so it goes through the print palette too.
+            _orig_save = self.mpl_toolbar.save_figure
+            def _save_light(*a, **kw):
+                args = getattr(self, '_live_args', None)
+                with print_theme(self.fig):
+                    if args: self._redraw_live(*args)
+                    r = _orig_save(*a, **kw)
+                if args: self._redraw_live(*args)   # wroc do motywu ekranowego
+                return r
+            self.mpl_toolbar.save_figure = _save_light
             self.mpl_toolbar.config(bg=C['panel'])
             self.mpl_toolbar.update()
             self.mpl_toolbar.pack(side='right')
@@ -1492,7 +1871,7 @@ class PeltierControl:
             print(f"toolbar err: {e}")
 
     def toggle_pause(self):
-        """Pauza/wznow przewijanie wykresu (do przyblizania)"""
+        """Pause/resume chart scrolling (for zooming in)"""
         self.chart_paused = not self.chart_paused
         if not hasattr(self, 'btn_pause'):
             return
@@ -1504,17 +1883,17 @@ class PeltierControl:
                                  highlightbackground=C['yellow'])
 
     def set_chart_window(self, secs):
-        """Ustaw okno czasowe wykresu (0=wszystko)"""
+        """Set the chart time window (0=all)"""
         self.chart_window = secs
 
     def _build_panel(self, parent):
-        """Prawy panel sterowania - waski pasek z przewijaniem"""
+        """Right control panel - narrow scrollable strip"""
         panel = tk.Frame(parent, bg=C['bg2'], width=SC(312))
         panel.pack(side='right', fill='y')
         panel.pack_propagate(False)
         tk.Frame(panel, bg=C['red'], width=6).pack(side='left', fill='y')
 
-        # Przewijalny obszar - Canvas + Scrollbar (panel moze byc dluzszy niz ekran)
+        # Scrollable area - Canvas + Scrollbar (the panel can be taller than the screen)
         scroll_wrap = tk.Frame(panel, bg=C['bg2'])
         scroll_wrap.pack(side='left', fill='both', expand=True)
         pcanvas = tk.Canvas(scroll_wrap, bg=C['bg2'], highlightthickness=0,
@@ -1533,7 +1912,7 @@ class PeltierControl:
         def _on_canvas_config(e):
             pcanvas.itemconfig(inner_id, width=e.width)
         pcanvas.bind('<Configure>', _on_canvas_config)
-        # Przewijanie kolkiem myszy
+        # Mouse wheel scrolling
         def _on_wheel(e):
             pcanvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
         pcanvas.bind('<Enter>', lambda e: pcanvas.bind_all('<MouseWheel>', _on_wheel))
@@ -1542,11 +1921,16 @@ class PeltierControl:
         inner = tk.Frame(inner, bg=C['bg2'])
         inner.pack(fill='both', expand=True, padx=16, pady=14)
 
-        tk.Label(inner, text="CONTROL", bg=C['bg2'], fg=C['text'],
+        # The panel used to open with a bare "CONTROL" heading that just
+        # repeated the tab name, and its three groups were separated by
+        # anonymous hairlines. Named sections say what each group is FOR.
+        tk.Label(inner, text="RUN SETUP", bg=C['bg2'], fg=C['text'],
                  font=(FONT, fsz(13), 'bold')).pack(anchor='w')
-        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(8, 12))
+        tk.Label(inner, text="applied on START", bg=C['bg2'], fg=C['dim2'],
+                 font=(FONT, fsz(8))).pack(anchor='w', pady=(1, 0))
+        section(inner, "SETPOINT & RAMPS", C['orange'], C['bg2'], pady=(12, 8))
 
-        # Suwaki nastaw
+        # Setting sliders
         self.sl_sp = SliderField(inner, "TARGET", -15, 100, 25.0,
                                  C['orange'], "°C", 1,
                                  on_change=lambda v: self.send(f"SP:{v:.1f}"))
@@ -1560,13 +1944,13 @@ class PeltierControl:
                                    C['red'], "°C", 0,
                                    on_change=lambda v: self.send(f"TMAX:{v:.0f}"))
 
-        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
+        section(inner, "HEATSINK FANS", C['blue'], C['bg2'])
 
-        # WENTYLATORY - przycisk on/off + suwak predkosci
+        # FANS - on/off button + speed slider
         fan_hd = tk.Frame(inner, bg=C['bg2'])
         fan_hd.pack(fill='x', pady=(0, 4))
-        tk.Label(fan_hd, text="FANS", bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+        tk.Label(fan_hd, text="STATE", bg=C['bg2'], fg=C['dim'],
+                 font=(FONT, fsz(9), 'bold')).pack(side='left')
         self.fan_on = False
         self.btn_fan = tk.Button(fan_hd, text="○ OFF", command=self.toggle_fan,
                                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9), 'bold'),
@@ -1578,17 +1962,17 @@ class PeltierControl:
                                   C['blue'], "%", 0,
                                   on_change=lambda v: self.set_fan_speed(v))
 
-        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(2, 12))
+        section(inner, "STORED SETUPS", C['purple'], C['bg2'])
 
-        # AUTO badge - kierunek wyznaczany automatycznie
+        # AUTO badge - direction determined automatically
         auto = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
                         highlightbackground=C['green'])
         auto.pack(fill='x', pady=(0, 10))
         tk.Label(auto, text="● AUTO: direction by setpoint", bg=C['bg2'],
                  fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
 
-        # Profile wieloetapowe
-        # Profile + Presety
+        # Multi-step profiles
+        # Profiles + Presets
         bf_pp = tk.Frame(inner, bg=C['bg2'])
         bf_pp.pack(fill='x', pady=(0, 8))
         mk_btn_outline(bf_pp, "PROFILES", self.open_profiles, C['purple']).pack(
@@ -1596,7 +1980,7 @@ class PeltierControl:
         mk_btn_outline(bf_pp, "PRESETS", self.open_presets, C['green']).pack(
             side='left', fill='x', expand=True, padx=(3, 0))
 
-        # Status kalibracji - klikalny (gdy kalibracja trwa, pokazuje postep)
+        # Calibration status - clickable (shows progress while calibration runs)
         self.cal_status = tk.Label(inner, text="", bg=C['bg2'], fg=C['purple'],
                                    font=(FONT, fsz(8)), anchor='w', cursor='hand2')
         self.cal_status.pack(fill='x', pady=(0, 4))
@@ -1604,7 +1988,7 @@ class PeltierControl:
 
         tk.Label(inner, text="▶ START uses panel values",
                  bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
-        tk.Label(inner, text="PID tuning & calibration → ADVANCED tab",
+        tk.Label(inner, text="PID tuning & calibration → TUNING tab",
                  bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
                  justify='left', wraplength=SC(312) - SC(44)
                  ).pack(anchor='w', fill='x', pady=(2, 0))
@@ -1612,11 +1996,11 @@ class PeltierControl:
         self._set_panel_enabled(False)
 
     def build_advanced(self, parent):
-        """Zakladka ADVANCED - PID, kalibracja, polaryzacja, Flash, reset"""
+        """ADVANCED tab - PID, calibration, polarity, Flash, reset"""
         wrap = tk.Frame(parent, bg=C['bg'])
         wrap.pack(fill='both', expand=True, padx=20, pady=16)
 
-        # Przewijalny obszar (duzo opcji)
+        # Scrollable area (many options)
         acanvas = tk.Canvas(wrap, bg=C['bg'], highlightthickness=0)
         asb = tk.Scrollbar(wrap, orient='vertical', command=acanvas.yview)
         acanvas.configure(yscrollcommand=asb.set)
@@ -1630,12 +2014,12 @@ class PeltierControl:
                      lambda ev: acanvas.yview_scroll(int(-ev.delta/120), 'units')))
         acanvas.bind('<Leave>', lambda e: acanvas.unbind_all('<MouseWheel>'))
 
-        # Ograniczenie szerokosci dla czytelnosci
+        # Width limit for readability
         inner = tk.Frame(col, bg=C['bg'])
         inner.pack(fill='x', padx=4, pady=4)
         inner.configure(width=560)
 
-        tk.Label(inner, text="ADVANCED — PID & CALIBRATION", bg=C['bg'], fg=C['text'],
+        tk.Label(inner, text="TUNING — PID & CALIBRATION", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(14), 'bold')).pack(anchor='w')
         tk.Label(inner, text="Tuning, calibration and device memory",
                  bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
@@ -1654,8 +2038,8 @@ class PeltierControl:
                                  on_change=lambda v: self.send(f"KI:{v:.2f}"))
         self.sl_kd = SliderField(sec1, "Kd", 0, 80, 0.8, C['cyan'], "", 2,
                                  on_change=lambda v: self.send(f"KD:{v:.2f}"))
-        # Feed-forward (grzanie): HOLD = moc na utrzymanie, RAMP = moc na dynamike rampy.
-        # Stroj na zywo: za mocno na starcie -> zmniejsz RAMP; nie dochodzi -> zwieksz.
+        # Feed-forward (heating): HOLD = power to hold, RAMP = power for ramp dynamics.
+        # Tune live: too strong at the start -> lower RAMP; not reaching -> raise it.
         self.sl_kffh = SliderField(sec1, "FF HOLD (KFFH)", 0, 8, 2.5, C['yellow'], "PWM/°C", 2,
                                    on_change=lambda v: self.send(f"KFFH:{v:.2f}"))
         self.sl_kffr = SliderField(sec1, "FF RAMP (KFFR)", 0, 4, 1.0, C['yellow'], "PWM/(°C/min)", 2,
@@ -1719,41 +2103,42 @@ class PeltierControl:
         mk_btn_outline(sec7, "↺ RESET ALL SETTINGS", self.do_reset, C['red']).pack(fill='x')
 
     def _adv_section(self, parent, title, color):
-        """Pomocnicza - ramka sekcji w zakladce ADVANCED"""
-        tk.Frame(parent, bg=color, height=2).pack(fill='x', pady=(12, 0))
-        tk.Label(parent, text=title, bg=C['bg'], fg=color,
-                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(4, 6))
+        """Section frame in the TUNING tab. Since .15 it draws the SAME header
+        as section() everywhere else - the tab used to have its own heading
+        style (a full-width coloured bar), which made the app look like two
+        different programs depending on which tab you were on."""
+        section(parent, title, color, C['bg'], pady=(16, 8))
         box = tk.Frame(parent, bg=C['bg2'])
         box.pack(fill='x')
         inner = tk.Frame(box, bg=C['bg2'])
-        inner.pack(fill='x', padx=12, pady=10)
+        inner.pack(fill='x', padx=SC(12), pady=SC(10))
         return inner
 
     def _set_panel_enabled(self, en):
-        # Suwaki zawsze aktywne (mozna ustawic wartosci przed polaczeniem)
-        # START/STOP tez aktywne - sprawdzaja polaczenie w momencie klikniecia
-        # (dezaktywujemy tylko gdy chcemy wyraznie zablokowac)
+        # Sliders always enabled (values can be set before connecting)
+        # START/STOP enabled too - they check the connection at click time
+        # (we disable only when we explicitly want to block them)
         for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off', 'sl_fan']:
             if hasattr(self, sl):
                 getattr(self, sl).set_enabled(True)
-        # Przyciski zawsze klikalnie - reaguja komunikatem jesli brak polaczenia
+        # Buttons always clickable - they respond with a message if not connected
         for b in ['btn_run', 'btn_st', 'btn_autocal', 'btn_estop', 'btn_freeze', 'btn_fan']:
             if hasattr(self, b):
                 getattr(self, b).config(state='normal')
 
 
     # ────────────────────────────────────────────────────
-    #  AKCJE PRZYCISKOW
+    #  BUTTON ACTIONS
     # ────────────────────────────────────────────────────
     def toggle_run(self):
-        """Przelacznik START/STOP w jednym przycisku"""
+        """START/STOP toggle in a single button"""
         if self.is_running:
             self.do_stop()
         else:
             self.do_start()
 
     def _update_run_button(self, running):
-        """Aktualizuj wyglad przycisku: zielony START / czerwony STOP"""
+        """Update button appearance: green START / red STOP"""
         self.is_running = running
         if not hasattr(self, 'btn_run'):
             return
@@ -1765,16 +2150,17 @@ class PeltierControl:
                                activebackground=_lighten(C['green'], 0.15))
 
     def do_start(self):
-        """START - wyslij wszystkie nastawy z panelu, potem uruchom"""
+        """START - send all panel settings, then run"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
-        # RESET statystyk dojscia - kazdy START liczy nowa srednia od zera.
-        # Dzieki temu mozna robic pomiary jeden po drugim bez starych danych.
+        # RESET the approach stats - every START counts a fresh average from zero.
+        # This makes it possible to run measurements back to back without stale data.
         self.reach_start_t = None
         self.reach_start_temp = None
         self.reach_target = self.sl_sp.get()
         self.reach_done = False
+        self.reach_in_tol_t = None
         self.reach_time = None
         self.reach_avg_rate = None
         self.reach_dir = None
@@ -1782,7 +2168,7 @@ class PeltierControl:
         self._last_reach_summary = None
         if hasattr(self, 'reach_lbl'):
             self.reach_lbl.config(text="→ starting...", fg=C['dim'])
-        # Wyslij komplet nastaw z panelu
+        # Send the full set of panel settings
         self.send(f"SP:{self.sl_sp.get():.1f}")
         self.send(f"RU:{self.sl_ru.get():.1f}")
         self.send(f"RD:{self.sl_rd.get():.1f}")
@@ -1796,26 +2182,26 @@ class PeltierControl:
         self._update_run_button(True)
 
     def do_stop(self):
-        # Reczny STOP przerywa tez automatyczna SERIE pomiarow, jesli akurat
-        # leci - inaczej apka za chwile sama by ja "wskrzesila" kolejnym
-        # krokiem, co bylo by mylace przy recznej interwencji.
+        # A manual STOP also aborts the automatic measurement SERIES, if one
+        # happens to be running - otherwise the app would soon "resurrect" it
+        # with the next step, which would be confusing during manual intervention.
         if self.series_running:
-            self._series_abort("reczny STOP")
+            self._series_abort("manual STOP")
         self.send("STOP")
-        self.send("AUTOCALSTOP")  # przerwij tez kalibracje jesli trwa
+        self.send("AUTOCALSTOP")  # also abort calibration if it is running
         if hasattr(self, 'cal_status'):
             self.cal_status.config(text="")
         self._update_run_button(False)
 
     def do_estop(self):
-        """Awaryjne zatrzymanie - natychmiast wylacza PWM"""
+        """Emergency stop - disables PWM immediately"""
         self.send("ESTOP")
         self.send("AUTOCALSTOP")
         if hasattr(self, 'cal_status'):
             self.cal_status.config(text="")
 
     def toggle_fan(self):
-        """Wlacz/wylacz wentylatory"""
+        """Turn the fans on/off"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
@@ -1830,10 +2216,10 @@ class PeltierControl:
             self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
 
     def set_fan_speed(self, v):
-        """Ustaw predkosc wentylatorow (suwak)"""
+        """Set fan speed (slider)"""
         spd = int(v)
         self.send(f"FAN:{spd}")
-        # Suwak na 0 = wylacz, >0 = wlacz
+        # Slider at 0 = off, >0 = on
         if hasattr(self, 'btn_fan'):
             if spd > 0:
                 self.fan_on = True
@@ -1843,7 +2229,7 @@ class PeltierControl:
                 self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
 
     def do_freeze(self):
-        """Zamroz gal do stanu stalego (wymiana probki)"""
+        """Freeze the gal to solid state (sample swap)"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
@@ -1858,7 +2244,7 @@ class PeltierControl:
                 self.reach_lbl.config(text="❄ Freezing gal...", fg=C['cyan'])
 
     def do_reset(self):
-        """Reset nastaw do domyslnych"""
+        """Reset settings to defaults"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
@@ -1868,7 +2254,7 @@ class PeltierControl:
             self.send("RESET")
 
     def do_repol(self):
-        """Wymus ponowne wykrycie polaryzacji Peltiera"""
+        """Force re-detection of the Peltier polarity"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
@@ -1880,7 +2266,7 @@ class PeltierControl:
             self.send("REPOL")
 
     def _update_pol_indicator(self):
-        """Aktualizuj wskaznik polaryzacji w panelu"""
+        """Update the polarity indicator in the panel"""
         if not hasattr(self, 'pol_indicator'):
             return
         if self.dev_pol_set:
@@ -1900,18 +2286,18 @@ class PeltierControl:
             self.send("SELFTUNE")
 
     def do_autocal(self):
-        """Otworz okno wyboru zakresu auto-kalibracji"""
+        """Open the auto-calibration range selection window"""
         if not self.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
         CalRangeDialog(self.root, self)
 
     def start_autocal(self, temp_min, temp_max, ramps):
-        """Uruchom auto-kalibracje z wybranym zakresem i listą ramp"""
-        # Wyslij zakres temp
+        """Run auto-calibration with the selected range and ramp list"""
+        # Send the temp range
         self.send(f"CALRANGE:{temp_min:.0f},{temp_max:.0f}")
         time.sleep(0.1)
-        # Wyslij liste ramp (KLUCZOWE - to definiuje przez co przejdzie kalibracja)
+        # Send the ramp list (CRUCIAL - this defines what the calibration will cover)
         ramps_str = ",".join(f"{r:.0f}" for r in ramps)
         self.send(f"SETCALRAMPS:{ramps_str}")
         time.sleep(0.1)
@@ -1924,13 +2310,13 @@ class PeltierControl:
         self.root.after(600, self.open_cal_window)
 
     def open_cal_window(self):
-        """Otworz okno postepu kalibracji"""
+        """Open the calibration progress window"""
         if not self.cal_plan and not self.cal_running:
             messagebox.showinfo("Calibration",
                 "Calibration is not running.\n"
                 "Click AUTO-CAL to start.")
             return
-        # Jesli okno juz otwarte - tylko podnies
+        # If the window is already open - just raise it
         if hasattr(self, 'cal_win') and self.cal_win and tk._default_root:
             try:
                 self.cal_win.win.lift()
@@ -1939,40 +2325,40 @@ class PeltierControl:
         self.cal_win = CalibrationWindow(self.root, self)
 
     def _refresh_cal_view(self):
-        """Odswiez okno kalibracji jesli otwarte + status w panelu"""
-        # Status w panelu glownym
+        """Refresh the calibration window if open + the panel status"""
+        # Status in the main panel
         if hasattr(self, 'cal_status'):
             if self.cal_running and self.cal_total > 0:
                 eta = self._cal_eta()
                 eta_s = f" · ~{int(eta//60)}min" if eta else ""
                 self.cal_status.config(
-                    text=f"Kalibracja {self.cal_current}/{self.cal_total}{eta_s} (klik=szczegoly)")
+                    text=f"Calibration {self.cal_current}/{self.cal_total}{eta_s} (click=details)")
             elif self.cal_current >= self.cal_total and self.cal_total > 0:
                 self.cal_status.config(text="✓ Calibration done")
-        # Okno szczegolow
+        # Details window
         if hasattr(self, 'cal_win') and self.cal_win:
             try: self.cal_win.refresh()
             except: pass
-        # TARGET/HEAT RATE/COOL RATE: firmware IGNORUJE komendy SP/RU/RD gdy
-        # trwa kalibracja (sys==CAL - patrz procCmd) - zeby przypadkowe
-        # przesuniecie suwaka nie zaburzalo trwajacego pomiaru relay. Wczesniej
-        # suwaki byly "zawsze aktywne" (patrz _set_panel_enabled), wiec user
-        # mogl je przesunac bez ostrzezenia i nic sie nie dzialo - myslal ze
-        # zmienil cel, a firmware po cichu to olewalo. Zablokuj je wizualnie
-        # na czas kalibracji, zeby bylo jasne ze sa martwe.
+        # TARGET/HEAT RATE/COOL RATE: the firmware IGNORES SP/RU/RD commands while
+        # calibration is running (sys==CAL - see procCmd) - so an accidental
+        # slider move cannot disturb the relay measurement in progress. Previously
+        # the sliders were "always enabled" (see _set_panel_enabled), so the user
+        # could move them with no warning and nothing happened - they thought
+        # the target had changed while the firmware quietly ignored it. Disable them
+        # visually for the duration of calibration so it is clear they are dead.
         for sl in ('sl_sp', 'sl_ru', 'sl_rd'):
             if hasattr(self, sl):
                 getattr(self, sl).set_enabled(not self.cal_running)
 
     def open_profiles(self):
-        """Okno edycji profili wieloetapowych"""
+        """Multi-step profile editor window"""
         ProfileWindow(self.root, self)
 
     # ────────────────────────────────────────────────────
-    #  PRESETY - zapisywalne zestawy nastaw
+    #  PRESETS - saveable sets of settings
     # ────────────────────────────────────────────────────
     def _gather_settings(self):
-        """Zbierz wszystkie aktualne nastawy z suwakow"""
+        """Collect all current settings from the sliders"""
         s = {}
         for key, attr in [('sp','sl_sp'),('ru','sl_ru'),('rd','sl_rd'),
                           ('tmax','sl_tmax'),('kp','sl_kp'),('ki','sl_ki'),
@@ -1983,7 +2369,7 @@ class PeltierControl:
         return s
 
     def _load_presets(self):
-        """Wczytaj presety z pliku JSON"""
+        """Load presets from the JSON file"""
         if not self.presets_file.exists():
             return {}
         try:
@@ -1993,7 +2379,7 @@ class PeltierControl:
             return {}
 
     def _save_presets(self, presets):
-        """Zapisz presety do pliku JSON"""
+        """Save presets to the JSON file"""
         try:
             with open(self.presets_file, 'w', encoding='utf-8') as f:
                 json.dump(presets, f, indent=2)
@@ -2003,11 +2389,11 @@ class PeltierControl:
             return False
 
     def open_presets(self):
-        """Otworz okno zarzadzania presetami"""
+        """Open the preset management window"""
         PresetWindow(self.root, self)
 
     def apply_preset(self, settings):
-        """Zastosuj preset - ustaw suwaki i wyslij do urzadzenia"""
+        """Apply a preset - set the sliders and send to the device"""
         mapping = [('sp','sl_sp','SP',1),('ru','sl_ru','RU',1),('rd','sl_rd','RD',1),
                    ('tmax','sl_tmax','TMAX',0),('kp','sl_kp','KP',1),('ki','sl_ki','KI',2),
                    ('kd','sl_kd','KD',2),('off','sl_off','OFFSET',1),('fan','sl_fan','FAN',0)]
@@ -2020,7 +2406,7 @@ class PeltierControl:
                         self.send(f"{cmd}:{val:.{dec}f}")
                 except Exception as e:
                     print(f"apply preset {key}: {e}")
-        # Aktualizuj stan wentylatora wg fan
+        # Update the fan state according to fan
         if 'fan' in settings and hasattr(self, 'btn_fan'):
             fv = settings['fan']
             self.fan_on = (fv > 0)
@@ -2030,7 +2416,7 @@ class PeltierControl:
                 self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
 
     # ────────────────────────────────────────────────────
-    #  ZAKLADKA POLACZENIE
+    #  CONNECTION TAB
     # ────────────────────────────────────────────────────
     def build_conn(self, parent):
         wrap = tk.Frame(parent, bg=C['bg'])
@@ -2102,7 +2488,7 @@ class PeltierControl:
             self.connect(port)
 
     # ────────────────────────────────────────────────────
-    #  ZAKLADKA ARCHIWUM
+    #  ARCHIVE TAB
     # ────────────────────────────────────────────────────
     def build_arch(self, parent):
         wrap = tk.Frame(parent, bg=C['bg'])
@@ -2112,27 +2498,27 @@ class PeltierControl:
         hd.pack(fill='x', pady=(0, 6))
         tk.Label(hd, text="CYCLE ARCHIVE", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
-        tk.Label(hd, text="  zaznacz cykle po lewej, wybierz krzywe i os X ponizej",
+        tk.Label(hd, text="  tick cycles on the left, pick curves and X axis below",
                  bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8))).pack(side='left', padx=(8, 0))
         mk_btn(hd, "REFRESH", self.refresh_arch, C['cyan']).pack(side='right')
 
-        # ── FOLDER NA DANE POMIAROWE ────────────────────────────────────
-        # Widoczny tutaj, bo to jest miejsce, w ktorym uzytkownik oglada
-        # zapisane pomiary - naturalne miejsce, zeby zobaczyc i zmienic,
-        # gdzie one w ogole ladują.
+        # ── MEASUREMENT DATA FOLDER ─────────────────────────────────────
+        # Shown here, because this is the place where the user browses the
+        # saved measurements - the natural place to see and change where
+        # they actually land.
         dd = tk.Frame(wrap, bg=C['bg2'])
         dd.pack(fill='x', pady=(0, 10))
         tk.Frame(dd, bg=C['green'], width=SC(4)).pack(side='left', fill='y')
-        tk.Label(dd, text="DANE:", bg=C['bg2'], fg=C['dim'],
+        tk.Label(dd, text="DATA:", bg=C['bg2'], fg=C['dim'],
                  font=(FONT, fsz(9), 'bold')).pack(side='left', padx=(10, 6), pady=6)
         self.data_dir_lbl = tk.Label(dd, text="", bg=C['bg2'], fg=C['text'],
                                      font=(FONT, fsz(9)), anchor='w')
         self.data_dir_lbl.pack(side='left', fill='x', expand=True, pady=6)
-        mk_btn_outline(dd, "📂 OTWORZ", self.open_log_folder, C['dim']).pack(
+        mk_btn_outline(dd, "📂 OPEN", self.open_log_folder, C['dim']).pack(
             side='right', padx=(4, 8), pady=4)
-        mk_btn_outline(dd, "＋ NOWY", self.create_data_dir, C['green']).pack(
+        mk_btn_outline(dd, "＋ NEW", self.create_data_dir, C['green']).pack(
             side='right', padx=4, pady=4)
-        mk_btn_outline(dd, "ZMIEN…", self.choose_data_dir, C['cyan']).pack(
+        mk_btn_outline(dd, "CHANGE…", self.choose_data_dir, C['cyan']).pack(
             side='right', padx=4, pady=4)
         self._update_data_dir_label()
         self._bind_tooltip(self.data_dir_lbl, str(self.log_dir))
@@ -2140,7 +2526,7 @@ class PeltierControl:
         body = tk.Frame(wrap, bg=C['bg'])
         body.pack(fill='both', expand=True)
 
-        # Lista cykli z checkboxami (do porownywania)
+        # Cycle list with checkboxes (for comparison)
         lf = tk.Frame(body, bg=C['panel'], width=SC(340))
         lf.pack(side='left', fill='y', padx=(0, 12))
         lf.pack_propagate(False)
@@ -2151,7 +2537,7 @@ class PeltierControl:
                  font=(FONT, fsz(10), 'bold')).pack(side='left')
         mk_btn_outline(lhd, "CLEAR", self._arch_clear_sel, C['dim']).pack(side='right')
 
-        # Przewijalna lista checkboxow
+        # Scrollable list of checkboxes
         list_wrap = tk.Frame(lf, bg=C['bg2'])
         list_wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         asb = tk.Scrollbar(list_wrap)
@@ -2164,8 +2550,8 @@ class PeltierControl:
         self._arch_win = self.arch_canvas.create_window((0, 0), window=self.arch_items, anchor='nw')
         self.arch_items.bind('<Configure>',
             lambda e: self.arch_canvas.config(scrollregion=self.arch_canvas.bbox('all')))
-        # KLUCZOWE: okno wewnetrzne musi miec szerokosc canvasu, inaczej
-        # wiersze nie rozciagaja sie i przycisk ✕ (side='right') wypada poza widok
+        # KEY POINT: the inner window must have the canvas width, otherwise
+        # the rows do not stretch and the ✕ button (side='right') falls out of view
         self.arch_canvas.bind('<Configure>',
             lambda e: self.arch_canvas.itemconfig(self._arch_win, width=e.width))
         self.arch_canvas.bind('<Enter>', lambda e: self.arch_canvas.bind_all(
@@ -2174,23 +2560,24 @@ class PeltierControl:
 
         self.arch_vars = {}   # {path: BooleanVar}
 
-        # Wykres
+        # Chart
         cf = tk.Frame(body, bg=C['panel'])
         cf.pack(side='left', fill='both', expand=True)
         tk.Frame(cf, bg=C['border2'], height=3).pack(fill='x')
-        # KOLEJNOSC PAKOWANIA JEST ISTOTNA. Figura ma WLASNY zadany rozmiar
-        # (figsize x dpi = ok. 880x500 px). Gdy canvas spakuje sie pierwszy z
-        # expand=True, pack przydziela mu ten zadany rozmiar, a wiersze
-        # spakowane PO nim dostaja to, co zostanie - czyli przy nizszym oknie
-        # dokladnie 1 piksel. Objaw: paski "OS X" i "KRZYWE" istnialy, ale
-        # mialy wymiar 1x1 i byly niewidoczne (wykryte testem geometrii przy
-        # 1600x900 i 1366x768). Dlatego wszystkie wiersze sterujace pakujemy
-        # NAJPIERW, od dolu (side='bottom'), a canvas dostaje reszte.
+        # THE PACKING ORDER MATTERS. The figure has its OWN requested size
+        # (figsize x dpi = approx. 880x500 px). When the canvas is packed first
+        # with expand=True, pack gives it that requested size, and the rows
+        # packed AFTER it get whatever is left - which on a shorter window is
+        # exactly 1 pixel. Symptom: the "X AXIS" and "CURVES" bars existed but
+        # were 1x1 in size and invisible (found by a geometry test at
+        # 1600x900 and 1366x768). That is why all control rows are packed
+        # FIRST, from the bottom (side='bottom'), and the canvas gets the rest.
         self.fig_a = Figure(figsize=(8, 4.5), facecolor=C['panel'], dpi=110)
+        medallion_watermark(self.fig_a, size=0.34, cx=0.52, cy=0.55)
         self.ax_a = self.fig_a.add_subplot(111)
         self.ax_a.set_facecolor(C['panel2'])
 
-        # Panel nastaw przebiegu - najnizszy wiersz
+        # Run settings panel - the bottom row
         self.arch_settings = tk.Frame(cf, bg=C['bg2'])
         self.arch_settings.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
         self.arch_settings_lbl = tk.Label(self.arch_settings, text="",
@@ -2200,10 +2587,10 @@ class PeltierControl:
 
         crow = tk.Frame(cf, bg=C['panel'])
         crow.pack(side='bottom', fill='x', padx=8, pady=(0, 6))
-        # OS X ma WLASNY wiersz - dzielenie go z przyciskami eksportu
-        # powodowalo, ze przy wiekszych fontach ostatnie opcje ("zegar PC",
-        # "start rampy", "wzgl. temperatury") nie miescily sie w szerokosci
-        # i dostawaly rozmiar 1x1, czyli znikaly.
+        # X AXIS has its OWN row - sharing it with the export buttons made
+        # the last options ("PC clock", "ramp start", "rel. temperature")
+        # not fit into the width at larger fonts, so they got size 1x1,
+        # i.e. they vanished.
         xrow = tk.Frame(cf, bg=C['panel'])
         xrow.pack(side='bottom', fill='x', padx=8, pady=(0, 4))
         atb = tk.Frame(cf, bg=C['panel'])
@@ -2211,15 +2598,15 @@ class PeltierControl:
         tbf = tk.Frame(cf, bg='#3a3f44')
         tbf.pack(side='bottom', fill='x', padx=8, pady=(4, 0))
 
-        # Canvas dostaje CALA pozostala przestrzen
+        # The canvas gets ALL the remaining space
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
         self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
-        # Pierwszy rysunek PRZED toolbarem - inicjalizuje canvas
+        # First draw BEFORE the toolbar - it initializes the canvas
         self.cv_a.draw()
         try:
             self.mpl_toolbar_a = NavigationToolbar2Tk(self.cv_a, tbf, pack_toolbar=False)
             self.mpl_toolbar_a.config(bg='#3a3f44')
-            # Przyciski toolbara czytelne na ciemnym tle
+            # Toolbar buttons readable on the dark background
             for child in self.mpl_toolbar_a.winfo_children():
                 try: child.config(bg='#3a3f44')
                 except: pass
@@ -2228,7 +2615,7 @@ class PeltierControl:
         except Exception as e:
             print(f"arch toolbar err: {e}")
 
-        # Przyciski eksportu - w wierszu 'atb' utworzonym wyzej
+        # Export buttons - in the 'atb' row created above
         mk_btn_outline(atb, "⤓ CSV", self.export_arch_csv, C['green']).pack(
             side='right', padx=(4, 0))
         mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(
@@ -2239,22 +2626,22 @@ class PeltierControl:
             side='right', padx=(4, 0))
         mk_btn_outline(atb, "📁", self.open_log_folder, C['dim']).pack(
             side='right', padx=(4, 0))
-        # ── TRYB OSI X ──────────────────────────────────────────────────
-        # arch_align zostaje dla zgodnosci ze starym kodem (uzywa go m.in.
-        # eksport), ale sterowany jest juz trybem ponizej.
+        # ── X AXIS MODE ─────────────────────────────────────────────────
+        # arch_align stays for compatibility with the old code (the export
+        # uses it, among others), but it is now driven by the mode below.
         self.arch_align = tk.BooleanVar(value=True)
         self.arch_xmode = tk.StringVar(value='t0')
-        tk.Label(xrow, text="OS X:", bg=C['panel'], fg=C['dim'],
+        tk.Label(xrow, text="X AXIS:", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
-        for val, txt in (('t0', 'od startu'), ('abs', 'czas pliku'),
-                         ('pc', 'zegar PC'), ('ramp', 'start rampy'),
-                         ('temp', 'wzgl. temperatury')):
+        for val, txt in (('t0', 'from start'), ('abs', 'file time'),
+                         ('pc', 'PC clock'), ('ramp', 'ramp start'),
+                         ('temp', 'rel. temperature')):
             tk.Radiobutton(xrow, text=txt, value=val, variable=self.arch_xmode,
                            command=self._on_xmode_change, bg=C['panel'], fg=C['dim'],
                            selectcolor=C['bg2'], activebackground=C['panel'],
                            activeforeground=C['text'], font=(FONT, fsz(8)),
                            bd=0, highlightthickness=0).pack(side='left')
-        # Temperatura odniesienia dla trybu "wzgl. temperatury"
+        # Reference temperature for the "rel. temperature" mode
         self.arch_treflbl = tk.Label(xrow, text="T=", bg=C['panel'], fg=C['dim'],
                                      font=(FONT, fsz(8)))
         self.arch_treflbl.pack(side='left', padx=(8, 2))
@@ -2266,13 +2653,13 @@ class PeltierControl:
         self.arch_tref.bind('<Return>', lambda e: self._redraw_arch())
         self.arch_tref.bind('<FocusOut>', lambda e: self._redraw_arch())
 
-        # ── KTORE KRZYWE RYSOWAC ────────────────────────────────────────
-        tk.Label(crow, text="KRZYWE:", bg=C['panel'], fg=C['dim'],
+        # ── WHICH CURVES TO DRAW ────────────────────────────────────────
+        tk.Label(crow, text="CURVES:", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
         self.arch_show = {}
-        for key, txt, dflt in (('temp', 'temperatura', True),
+        for key, txt, dflt in (('temp', 'temperature', True),
                                ('sa', 'setpoint', True),
-                               ('st', 'cel', True),
+                               ('st', 'target', True),
                                ('t2', 'temp 2', False),
                                ('pwm', 'PWM', False)):
             v = tk.BooleanVar(value=dflt)
@@ -2282,37 +2669,37 @@ class PeltierControl:
                            activebackground=C['panel'], activeforeground=C['text'],
                            font=(FONT, fsz(8)), bd=0, highlightthickness=0
                            ).pack(side='left', padx=(0, 4))
-        mk_btn_outline(crow, "ZAZNACZ WSZYSTKIE", self._arch_select_all, C['dim']
+        mk_btn_outline(crow, "SELECT ALL", self._arch_select_all, C['dim']
                        ).pack(side='right')
-        # Porownanie przebiegow WZGLEDEM SIEBIE: zamiast temperatur rysujemy
-        # ROZNICE kazdego przebiegu wzgledem pierwszego zaznaczonego
-        # (interpolowana na wspolna os czasu). Roznice widac duzo lepiej niz
-        # przy nakladaniu dwoch prawie identycznych krzywych.
+        # Comparing runs AGAINST EACH OTHER: instead of temperatures we draw
+        # the DIFFERENCE of every run relative to the first one ticked
+        # (interpolated onto a common time axis). Differences are far easier
+        # to see than two nearly identical curves overlaid on each other.
         self.arch_delta = tk.BooleanVar(value=False)
-        tk.Checkbutton(xrow, text="roznica wzgl. 1.", variable=self.arch_delta,
+        tk.Checkbutton(xrow, text="delta vs 1st", variable=self.arch_delta,
                        command=self._redraw_arch, bg=C['panel'], fg=C['yellow'],
                        selectcolor=C['bg2'], activebackground=C['panel'],
                        activeforeground=C['text'], font=(FONT, fsz(8)),
                        bd=0, highlightthickness=0).pack(side='right', padx=(0, 10))
 
-        # (panel nastaw przebiegu utworzony wyzej, jako najnizszy wiersz)
+        # (run settings panel created above, as the bottom row)
 
         self.refresh_arch()
-        # Narysuj pusty wykres od razu - inicjalizuje canvas i toolbar
+        # Draw an empty chart right away - it initializes the canvas and toolbar
         self._redraw_arch()
 
     def build_series(self, parent):
-        """Zakladka SERIA - lista testow (SP/RATE/hold) wykonywanych automatycznie
-        jeden po drugim, z auto-archiwizacja kazdego (bez pytania o nazwe) -
-        pliki ladują w PeltierLogi gotowe do analizy."""
+        """SERIES tab - a list of tests (SP/RATE/hold) executed automatically
+        one after another, each auto-archived (without asking for a name) -
+        the files land in PeltierLogi ready for analysis."""
         wrap = tk.Frame(parent, bg=C['bg'])
         wrap.pack(fill='both', expand=True, padx=16, pady=16)
 
-        tk.Label(wrap, text="SERIA POMIAROW", bg=C['bg'], fg=C['text'],
+        tk.Label(wrap, text="MEASUREMENT SERIES", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(anchor='w')
         tk.Label(wrap,
-                 text="Dodaj testy (SP/RATE/czas trzymania) - apka zrobi je po kolei, "
-                      "wraca do bazy miedzy testami i sama archiwizuje kazdy wynik.",
+                 text="Add tests (SP/RATE/hold time) - the app runs them one by one, "
+                      "returns to base between tests and archives every result itself.",
                  bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
                  wraplength=SC(760)
                  ).pack(anchor='w', pady=(2, SC(12)))
@@ -2320,15 +2707,15 @@ class PeltierControl:
         body = tk.Frame(wrap, bg=C['bg'])
         body.pack(fill='both', expand=True)
 
-        # ── Lewa kolumna: dodawanie kroku + ustawienia bazy ──────────
-        # SZEROKOSC: byla wpisana na sztywno jako 280 PIKSELI razem z
-        # pack_propagate(False), wiec kolumna NIGDY nie rosla pod tresc.
-        # Pomiar realnymi metrykami fontu pokazal, ze przy FS=1.0 najszerszy
-        # napis ma 342 px (a z marginesami trzeba 378) - czyli tekst byl
-        # przycinany JUZ BEZ skalowania DPI, a przy FS=1.5 nie miescily sie
-        # nawet same etykiety pol ("TRZYMANIE PO DOJSCIU (s)" = 288 px).
-        # Teraz: szerokosc skalowana przez SC(), z zapasem, a dlugie opisy
-        # maja wraplength (zawijaja sie zamiast rozpychac/wystawac).
+        # ── Left column: adding a step + base settings ───────────────
+        # WIDTH: it was hard-coded as 280 PIXELS together with
+        # pack_propagate(False), so the column NEVER grew to fit the content.
+        # A measurement with real font metrics showed that at FS=1.0 the widest
+        # caption is 342 px (and with margins 378 is needed) - so the text was
+        # clipped ALREADY WITHOUT DPI scaling, and at FS=1.5 not even the field
+        # labels themselves fit ("HOLD AFTER REACHED (s)" = 288 px).
+        # Now: the width is scaled by SC(), with headroom, and long descriptions
+        # have wraplength (they wrap instead of stretching/overflowing).
         SER_W = SC(320)
         SER_PAD = SC(14)
         self._ser_wrap = SER_W - 2 * SER_PAD - SC(6)
@@ -2336,9 +2723,9 @@ class PeltierControl:
         left.pack(side='left', fill='y', padx=(0, SC(12)))
         left.pack_propagate(False)
         tk.Frame(left, bg=C['cyan'], height=SC(3)).pack(fill='x')
-        # Tresc kolumny PRZEWIJALNA: przy wiekszych fontach (FS=1.5) jest
-        # wyzsza niz okno i dolne pozycje (SZYBKIE WYPELNIENIE, przycisk
-        # quickfill) byly fizycznie nieosiagalne - ucinal je dol ekranu.
+        # The column content is SCROLLABLE: at larger fonts (FS=1.5) it is
+        # taller than the window and the lowest items (QUICK FILL, the
+        # quickfill button) were physically out of reach - cut off by the screen.
         lin = make_scrollable(left, C['panel'], padx=SER_PAD, pady=SC(12))
 
         def _field(label, default):
@@ -2352,17 +2739,17 @@ class PeltierControl:
 
         self.series_e_sp = _field("SP (°C)", "50.0")
         self.series_e_rate = _field("HEAT RATE (°C/min)", "30.0")
-        self.series_e_hold = _field("TRZYMANIE PO DOJSCIU (s)", "60")
+        self.series_e_hold = _field("HOLD AFTER REACHED (s)", "60")
 
-        mk_btn(lin, "+ DODAJ TEST", self._on_series_add, C['cyan']
+        mk_btn(lin, "+ ADD TEST", self._on_series_add, C['cyan']
                ).pack(fill='x', pady=(12, 4))
-        mk_btn_outline(lin, "USUN ZAZNACZONY", self._on_series_remove, C['dim']
+        mk_btn_outline(lin, "DELETE SELECTED", self._on_series_remove, C['dim']
                        ).pack(fill='x', pady=(0, 4))
-        mk_btn_outline(lin, "WYCZYSC LISTE", self._on_series_clear, C['dim']
+        mk_btn_outline(lin, "CLEAR LIST", self._on_series_clear, C['dim']
                        ).pack(fill='x')
 
         tk.Frame(lin, bg=C['border2'], height=1).pack(fill='x', pady=12)
-        tk.Label(lin, text="BAZA MIEDZY TESTAMI (°C)", bg=C['panel'], fg=C['dim'],
+        tk.Label(lin, text="BASE BETWEEN TESTS (°C)", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 2))
         self.series_e_base = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
                                        font=(FONT, fsz(11), 'bold'), relief='flat',
@@ -2372,58 +2759,58 @@ class PeltierControl:
         self.series_e_base.bind('<Return>', self._on_series_base_change)
         self.series_e_base.pack(fill='x', ipady=4)
 
-        tk.Label(lin, text="TEMPO POWROTU (°C/min)", bg=C['panel'], fg=C['dim'],
+        tk.Label(lin, text="RETURN RATE (°C/min)", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(10, 2))
         self.series_e_return_rate = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
                                               font=(FONT, fsz(11), 'bold'), relief='flat',
                                               insertbackground=C['text'])
-        # ZMIANA po analizie logu 20260827 145616 (uskok/"garb" na starcie
-        # kazdego powrotu): domyslne 25.0 bylo WOLNIEJSZE niz naturalne
-        # (pasywne, przy wentylatorach 100%) chlodzenie obiektu zaraz po
-        # goracym hold - w danych widac realny spadek temp od razu po
-        # starcie liczacy sie w dziesiatkach C/min, znacznie szybszy niz
-        # komenderowane 25. Skutek: rampa (spA) natychmiast zostawala W
-        # TYLE ZA REALNYM spadkiem (temp<spA), PID odczytywal to jako
-        # "za zimno za wczesnie" i dogrzewal, zeby WYHAMOWAC chlodzenie do
-        # komenderowanego tempa - stad widoczny odbity "garb" (temp chwilowo
-        # ROSNIE) tuz po starcie kazdego powrotu. Firmware juz ma dokladnie
-        # ten sam wzorzec ("pelna predkosc cofniecia") dla innych powrotow
-        # do bazy (patrz rU=rD=RAMP_MAX w .ino) - tu robimy to samo: bardzo
-        # duza wartosc, ktora firmware i tak bezpiecznie przytnie do swojego
-        # RAMP_MAX (constrain(fv,RAMP_MIN,RAMP_MAX) na komendzie RD) - wiec
-        # rampa NIGDY nie jest wolniejsza od naturalnego chlodzenia i nie ma
-        # czego "wyhamowywac" dogrzewaniem. Nadal edytowalne recznie w polu
-        # (np. jesli ktos chce CELOWO wolniejszy, kontrolowany powrot).
+        # CHANGED after analysing log 20260827 145616 (step/"hump" at the start
+        # of every return): the default 25.0 was SLOWER than the natural
+        # (passive, with the fans at 100%) cooling of the object right after
+        # a hot hold - the data shows a real temp drop right after the
+        # start on the order of tens of C/min, much faster than the
+        # commanded 25. Result: the ramp (spA) immediately fell BEHIND
+        # THE REAL drop (temp<spA), the PID read that as
+        # "too cold too early" and added heat in order to BRAKE the cooling to
+        # the commanded rate - hence the visible rebound "hump" (temp briefly
+        # RISES) right after the start of every return. The firmware already has
+        # exactly the same pattern ("full retreat speed") for other returns
+        # to base (see rU=rD=RAMP_MAX in the .ino) - here we do the same: a very
+        # large value, which the firmware safely clamps anyway to its own
+        # RAMP_MAX (constrain(fv,RAMP_MIN,RAMP_MAX) on the RD command) - so the
+        # ramp is NEVER slower than the natural cooling and there is nothing
+        # to "brake" with extra heating. Still editable by hand in the field
+        # (e.g. if someone DELIBERATELY wants a slower, controlled return).
         self.series_e_return_rate.insert(0, "80.0")
         self.series_e_return_rate.pack(fill='x', ipady=4)
         tk.Label(lin,
-                 text="Niezalezne od COOL RATE na CONTROL. Domyslnie max - "
-                      "wolniejszy powrot daje 'garb' na starcie.",
+                 text="Independent of COOL RATE on CONTROL. Max by default - "
+                      "a slower return gives a 'hump' at the start.",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
                  wraplength=self._ser_wrap
                  ).pack(anchor='w', fill='x', pady=(3, 0))
 
-        # Zjazd jako PELNOPRAWNY TEST, a nie tylko dojazd do pozycji startowej.
-        # PO CO: caly model mocy (FF_GAIN/FF_TEMP_GAIN w firmware) jest
-        # skalibrowany z danych GRZANIA - dla chlodzenia nie mamy zadnej
-        # rzetelnej kalibracji, bo dotychczasowe zjazdy byly robione stalym,
-        # szybkim tempem powrotu (i wczesniej w ogole nie archiwizowane).
-        # Zaznaczenie tego pola sprawia, ze zjazd po kazdym tescie leci w
-        # TYM SAMYM tempie co test - czyli seria R10..R70 daje komplet
-        # 7 przebiegow grzania I 7 przebiegow chlodzenia w roznych tempach,
-        # dokladnie to, czego potrzeba do skalibrowania galezi chlodzenia
-        # ta sama metoda co grzania.
-        # TRYB: "seria testow" (po kazdym tescie powrot do bazy - do
-        # porownywania pojedynczych ramp) albo "program" (kroki lecą jeden po
-        # drugim od miejsca, w ktorym skonczyl sie poprzedni - do zadawania
-        # przebiegow typu: dojedz do 50, potrzymaj, zejdz do 30, potrzymaj).
-        # Kazdy krok i tak zapisuje sie jako OSOBNY, normalny pomiar w
-        # archiwum, wiec porownuje sie go dokladnie tak samo jak reczny.
+        # The descent as a FULL-FLEDGED TEST, not just a trip back to the start.
+        # WHY: the whole power model (FF_GAIN/FF_TEMP_GAIN in the firmware) is
+        # calibrated from HEATING data - for cooling we have no
+        # reliable calibration, because so far the descents were run at a fixed,
+        # fast return rate (and earlier were not archived at all).
+        # Ticking this box makes the descent after every test run at
+        # THE SAME rate as the test - so an R10..R70 series gives a full set of
+        # 7 heating runs AND 7 cooling runs at different rates,
+        # exactly what is needed to calibrate the cooling branch
+        # with the same method as the heating one.
+        # MODE: "test series" (return to base after every test - for
+        # comparing single ramps) or "program" (the steps run one after
+        # another from the point where the previous one ended - for defining
+        # profiles such as: go to 50, hold, drop to 30, hold).
+        # Every step is saved as a SEPARATE, normal measurement in the
+        # archive anyway, so it is compared exactly like a manual one.
         self.series_mode = tk.StringVar(value='seria')
-        tk.Label(lin, text="TRYB", bg=C['panel'], fg=C['dim'],
+        tk.Label(lin, text="MODE", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(SC(10), 2))
-        for val, txt in (('seria', 'seria testow (powrot do bazy)'),
-                         ('program', 'program (krok po kroku)')):
+        for val, txt in (('seria', 'test series (return to base)'),
+                         ('program', 'program (step by step)')):
             tk.Radiobutton(lin, text=txt, value=val, variable=self.series_mode,
                            bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                            activebackground=C['panel'], activeforeground=C['text'],
@@ -2432,44 +2819,44 @@ class PeltierControl:
                            justify='left').pack(anchor='w', fill='x')
         pf = tk.Frame(lin, bg=C['panel'])
         pf.pack(fill='x', pady=(SC(6), 0))
-        mk_btn_outline(pf, "ZAPISZ PROGRAM", self._series_save_prog, C['dim']).pack(
+        mk_btn_outline(pf, "SAVE PROGRAM", self._series_save_prog, C['dim']).pack(
             side='left', fill='x', expand=True, padx=(0, 2))
-        mk_btn_outline(pf, "WCZYTAJ", self._series_load_prog, C['dim']).pack(
+        mk_btn_outline(pf, "LOAD", self._series_load_prog, C['dim']).pack(
             side='left', fill='x', expand=True, padx=(2, 0))
 
         self.series_cool_as_test = tk.BooleanVar(value=False)
-        tk.Checkbutton(lin, text="zjazd tez jako TEST",
+        tk.Checkbutton(lin, text="descent also as TEST",
                        variable=self.series_cool_as_test,
                        bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                        activebackground=C['panel'], activeforeground=C['text'],
                        font=(FONT, fsz(9)), bd=0, highlightthickness=0,
                        anchor='w').pack(anchor='w', fill='x', pady=(SC(10), 0))
         tk.Label(lin,
-                 text="Zbiera dane do kalibracji chlodzenia. Inaczej zjazd "
-                      "leci max tempem (tylko powrot).",
+                 text="Collects data for cooling calibration. Otherwise the descent "
+                      "runs at max rate (return only).",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
                  wraplength=self._ser_wrap
                  ).pack(anchor='w', fill='x', pady=(3, 0))
 
-        tk.Label(lin, text="SZYBKIE WYPELNIENIE", bg=C['panel'], fg=C['dim'],
+        tk.Label(lin, text="QUICK FILL", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(16, 2))
-        # Krotszy napis - pelny ("SP z pola x rampy 10/20/30/40/50/60/70")
-        # nie miescil sie w kolumnie przy wiekszych fontach, a przycisk nie
-        # zawija tekstu, wiec konce byly ucinane.
-        mk_btn_outline(lin, "SP × rampy 10…70",
+        # Shorter caption - the full one ("SP from field x ramps 10/20/30/40/50/60/70")
+        # did not fit in the column at larger fonts, and a button does not
+        # wrap text, so the ends were cut off.
+        mk_btn_outline(lin, "SP × ramps 10…70",
                        self._on_series_quickfill, C['purple']).pack(fill='x')
-        tk.Label(lin, text="doda 7 testow: 10/20/30/40/50/60/70 °C/min",
+        tk.Label(lin, text="adds 7 tests: 10/20/30/40/50/60/70 °C/min",
                  bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
                  wraplength=self._ser_wrap).pack(anchor='w', fill='x', pady=(3, 0))
 
-        # ── Prawa kolumna: lista + status + start/stop ──────────
+        # ── Right column: list + status + start/stop ────────────
         right = tk.Frame(body, bg=C['panel'])
         right.pack(side='left', fill='both', expand=True)
         tk.Frame(right, bg=C['border2'], height=3).pack(fill='x')
 
         rhd = tk.Frame(right, bg=C['panel'])
         rhd.pack(fill='x', padx=14, pady=(10, 4))
-        tk.Label(rhd, text="LISTA TESTOW", bg=C['panel'], fg=C['dim'],
+        tk.Label(rhd, text="TEST LIST", bg=C['panel'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(side='left')
 
         self.series_listbox = tk.Listbox(right, bg=C['bg2'], fg=C['text'],
@@ -2480,14 +2867,14 @@ class PeltierControl:
 
         stf = tk.Frame(right, bg=C['panel'])
         stf.pack(fill='x', padx=14, pady=(0, 10))
-        self.series_status_lbl = tk.Label(stf, text="Seria nieaktywna",
+        self.series_status_lbl = tk.Label(stf, text="Series inactive",
                                            bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
                                            anchor='w', justify='left')
         self.series_status_lbl.pack(fill='x', ipady=8, padx=2)
 
         btnf = tk.Frame(right, bg=C['panel'])
         btnf.pack(fill='x', padx=14, pady=(0, 14))
-        self.btn_series_run = mk_btn(btnf, "▶ START SERII", self._on_series_toggle, C['green'])
+        self.btn_series_run = mk_btn(btnf, "▶ START SERIES", self._on_series_toggle, C['green'])
         self.btn_series_run.pack(fill='x')
 
         self._series_refresh_list()
@@ -2498,7 +2885,7 @@ class PeltierControl:
             rate = float(self.series_e_rate.get().replace(',', '.'))
             hold = float(self.series_e_hold.get().replace(',', '.'))
         except ValueError:
-            messagebox.showwarning("Bledna wartosc", "SP/RATE/hold musza byc liczbami.")
+            messagebox.showwarning("Invalid value", "SP/RATE/hold must be numbers.")
             return
         self.series_add_step(sp, rate, hold)
 
@@ -2522,21 +2909,21 @@ class PeltierControl:
         try:
             sp = float(self.series_e_sp.get().replace(',', '.'))
         except ValueError:
-            messagebox.showwarning("Bledna wartosc", "Wpisz najpierw SP.")
+            messagebox.showwarning("Invalid value", "Enter SP first.")
             return
         for rate in (10, 20, 30, 40, 50, 60, 70):
             self.series_add_step(sp, rate, 60)
 
     def _on_series_toggle(self):
         if self.series_running:
-            self._series_abort("reczny STOP SERII")
+            self._series_abort("manual STOP SERIES")
             self.send("STOP")
             self._update_run_button(False)
         else:
             self.series_start()
 
     def _cycle_display_name(self, path):
-        """Czytelna nazwa cyklu: usuwa prefiks c_/cykl_ i zamienia _ na spacje"""
+        """Readable cycle name: strips the c_/cykl_ prefix and turns _ into spaces"""
         from pathlib import Path as _P
         s = _P(path).stem
         if s.startswith('cykl_'): s = s[5:]
@@ -2544,7 +2931,7 @@ class PeltierControl:
         return s.replace('_', ' ')
 
     def _bind_tooltip(self, widget, text):
-        """Prosty tooltip pokazujacy pelny tekst po najechaniu"""
+        """Simple tooltip showing the full text on hover"""
         tip = {'win': None}
         def show(e):
             if tip['win']: return
@@ -2562,13 +2949,13 @@ class PeltierControl:
         widget.bind('<Leave>', hide)
 
     def refresh_arch(self):
-        # Wyczysc liste checkboxow
+        # Clear the checkbox list
         for w in self.arch_items.winfo_children():
             w.destroy()
         self.arch_vars = {}
         files = sorted([f for f in self.log_dir.glob("*.csv") if (f.name.startswith("cykl_") or f.name.startswith("c_")) and not f.name.startswith("_tmp")],
                        key=lambda f: f.stat().st_mtime, reverse=True)
-        # Paleta kolorow dla porownania
+        # Color palette for the comparison
         self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
                             C['cyan'], C['purple'], C['yellow'], '#ff8fab']
         if not files:
@@ -2577,7 +2964,7 @@ class PeltierControl:
                      anchor='w', padx=12, pady=12)
             return
 
-        # Grupowanie po dacie (dzien modyfikacji pliku)
+        # Grouping by date (file modification day)
         from datetime import datetime as _dt
         import time as _time
         groups = {}
@@ -2588,14 +2975,14 @@ class PeltierControl:
         today = _dt.now().strftime("%Y-%m-%d")
         i = 0
         for day, day_files in groups.items():
-            # Naglowek grupy (data)
+            # Group header (date)
             day_label = "Today" if day == today else day
             hdr = tk.Frame(self.arch_items, bg=C['panel'])
             hdr.pack(fill='x', pady=(6, 1))
             tk.Label(hdr, text=f"▸ {day_label}  ({len(day_files)})", bg=C['panel'],
                      fg=C['cyan'], font=(FONT, fsz(8), 'bold'), anchor='w').pack(
                      side='left', padx=8, pady=3)
-            # Pliki w grupie
+            # Files in the group
             for f in day_files:
                 row = tk.Frame(self.arch_items, bg=C['bg2'])
                 row.pack(fill='x', pady=1)
@@ -2603,9 +2990,9 @@ class PeltierControl:
                 self.arch_vars[str(f)] = var
                 col = self._arch_colors[i % len(self._arch_colors)]
                 i += 1
-                # KOLEJNOSC PACK: kosz NAJPIERW (side=right) = zawsze widoczny,
-                # potem kropka (left), na koncu checkbox wypelnia srodek.
-                # Dzieki temu dluga nazwa nie zaslania kosza.
+                # PACK ORDER: the bin FIRST (side=right) = always visible,
+                # then the dot (left), and finally the checkbox fills the middle.
+                # This way a long name does not cover the bin.
                 delb = tk.Button(row, text="🗑", command=lambda p=f: self._delete_cycle(p),
                                 bg=C['bg2'], fg=C['red'], font=(FONT, fsz(11), 'bold'),
                                 relief='flat', cursor='hand2', bd=0, padx=10, pady=2,
@@ -2614,7 +3001,7 @@ class PeltierControl:
                 dot = tk.Frame(row, bg=col, width=10, height=10)
                 dot.pack(side='left', padx=(8, 4))
                 dot.pack_propagate(False)
-                # Nazwa skrocona jesli za dluga (zeby nie rozpychala wiersza)
+                # Name shortened if too long (so it does not stretch the row)
                 full_name = self._cycle_display_name(f)
                 disp_name = full_name if len(full_name) <= 22 else full_name[:20] + "…"
                 cb = tk.Checkbutton(row, text=disp_name,
@@ -2623,13 +3010,13 @@ class PeltierControl:
                                    activebackground=C['bg2'], activeforeground=col,
                                    font=(FONT, fsz(9)), bd=0, highlightthickness=0,
                                    anchor='w')
-                # Pelna nazwa w tooltipie (po najechaniu)
+                # Full name in the tooltip (on hover)
                 if len(full_name) > 22:
                     self._bind_tooltip(cb, full_name)
                 cb.pack(side='left', fill='x', expand=True)
 
     def _delete_cycle(self, path):
-        """Usun plik cyklu z archiwum (z potwierdzeniem)"""
+        """Delete a cycle file from the archive (with confirmation)"""
         from pathlib import Path as _P
         name = self._cycle_display_name(_P(path))
         if messagebox.askyesno("Delete cycle",
@@ -2642,33 +3029,33 @@ class PeltierControl:
                 messagebox.showerror("Delete error", str(e))
 
     def _cycle_settings(self, path):
-        """Odczytaj nastawy przebiegu z CSV: target SP, rampy, PID. Zwraca dict lub None"""
+        """Read the run settings from the CSV: target SP, ramps, PID. Returns a dict or None"""
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                rows = list(csv.DictReader(f))
+                rows = [_csv_row(r) for r in csv.DictReader(f)]
         except Exception:
             return None
-        # Znajdz pierwszy poprawny wiersz danych
+        # Find the first valid data row
         valid = [r for r in rows if r.get('czas_s', '').replace('.','').replace('-','').isdigit()]
         if not valid:
             return None
         s = {}
-        # Target setpoint - najczestsza wartosc setpoint_cel (cel koncowy)
+        # Target setpoint - the most frequent setpoint_cel value (final target)
         try:
             sps = [float(r['setpoint_cel']) for r in valid if r.get('setpoint_cel')]
             s['target'] = max(set(sps), key=sps.count) if sps else None
         except: s['target'] = None
-        # PID - z pierwszego wiersza (stale przez przebieg lub z kalibracji)
+        # PID - from the first row (constant over the run or from calibration)
         try:
             s['kp'] = float(valid[0].get('Kp', 0))
             s['ki'] = float(valid[0].get('Ki', 0))
             s['kd'] = float(valid[0].get('Kd', 0))
         except: s['kp'] = s['ki'] = s['kd'] = None
-        # Oszacuj rampe z nachylenia setpoint_aktywny na poczatku
+        # Estimate the ramp from the setpoint_aktywny slope at the beginning
         try:
             t0 = float(valid[0]['czas_s'])
             sa0 = float(valid[0]['setpoint_aktywny'])
-            # znajdz punkt ~10s pozniej
+            # find a point ~10s later
             ramp = None
             for r in valid:
                 tt = float(r['czas_s'])
@@ -2683,16 +3070,16 @@ class PeltierControl:
         return s
 
     def _arch_clear_sel(self):
-        """Odznacz wszystkie cykle"""
+        """Deselect all cycles"""
         for v in self.arch_vars.values():
             v.set(False)
         self._redraw_arch()
 
     def _load_cycle_data(self, path):
-        """Wczytaj dane cyklu z CSV (odporne na komentarze). Zwraca (t,temp,spt,pwm) lub None"""
+        """Load cycle data from the CSV (comment-tolerant). Returns (t,temp,spt,pwm) or None"""
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                data = list(csv.DictReader(f))
+                data = [_csv_row(r) for r in csv.DictReader(f)]
         except Exception:
             return None
         t, temp, spt, pwm = [], [], [], []
@@ -2710,7 +3097,7 @@ class PeltierControl:
             except (ValueError, TypeError):
                 continue
             t.append(tt); temp.append(tm); spt.append(sp)
-            # setpoint aktywny (rampa) - osobno do wykresu
+            # active setpoint (ramp) - separately for the chart
             try:
                 sa_list.append(float(r.get('setpoint_aktywny', 'nan')))
             except:
@@ -2719,26 +3106,26 @@ class PeltierControl:
                 pwm.append(float(r.get('PWM_%', r.get('PWM', 0))))
             except:
                 pwm.append(0)
-            # temp2 - druga termopara (opcjonalna kolumna)
+            # temp2 - the second thermocouple (optional column)
             try:
                 t2v = r.get('temperatura2_C', '')
                 temp2.append(float(t2v) if t2v else None)
             except:
                 temp2.append(None)
-            # czas PC (kolumna dodana pozniej - stare pliki jej nie maja)
+            # PC time (column added later - old files do not have it)
             pc_raw.append(r.get('czas_pc', '') or '')
         if not t:
             return None
-        # Dolacz temp2 i setpoint aktywny jako atrybuty (kompatybilnie - zwracamy 4)
+        # Attach temp2 and the active setpoint as attributes (compatibly - we return 4)
         self._last_temp2 = temp2
         self._last_sa = sa_list
         self._last_pc = self._pc_seconds(pc_raw, t, path)
         return t, temp, spt, pwm
 
     def _pc_seconds(self, pc_raw, t, path):
-        """Zamien kolumne czas_pc na sekundy epoki. Dla starych plikow (bez
-        tej kolumny) odtwarza os czasu z daty modyfikacji pliku: mtime to
-        moment ZAMKNIECIA, wiec start = mtime - dlugosc przebiegu."""
+        """Convert the czas_pc column into epoch seconds. For old files (without
+        that column) it rebuilds the time axis from the file modification date:
+        mtime is the moment of CLOSING, so start = mtime - run length."""
         out = []
         ok = False
         for sraw in pc_raw:
@@ -2755,13 +3142,13 @@ class PeltierControl:
                         v = None
             out.append(v)
         if ok:
-            # uzupelnij ewentualne dziury liniowo wzgledem czas_s
+            # fill any gaps linearly relative to czas_s
             base = next((i for i, v in enumerate(out) if v is not None), None)
             if base is not None:
                 t0 = out[base] - t[base]
                 out = [v if v is not None else t0 + t[i] for i, v in enumerate(out)]
             return out
-        # fallback: z mtime pliku
+        # fallback: from the file mtime
         try:
             end = Path(path).stat().st_mtime
             t0 = end - (t[-1] - t[0])
@@ -2770,7 +3157,7 @@ class PeltierControl:
             return [None] * len(t)
 
     def _compute_stats(self, data):
-        """Oblicz pelne statystyki przebiegu. data=(t,temp,spt,pwm). Zwraca dict."""
+        """Compute the full run statistics. data=(t,temp,spt,pwm). Returns a dict."""
         import statistics
         t, temp, spt, pwm = data
         st = {}
@@ -2779,29 +3166,29 @@ class PeltierControl:
         st['duration'] = t[-1] - t[0] if len(t) > 1 else 0
         st['target'] = spt[-1] if spt else 0
 
-        # Srednie tempo narastania (start -> max)
+        # Average rise rate (start -> max)
         idx_max = temp.index(st['tmax'])
         rise_time = t[idx_max] - t[0] if idx_max > 0 else 0
         st['avg_rise'] = (st['tmax'] - temp[0]) / (rise_time/60.0) if rise_time > 5 else 0
 
-        # Overshoot - ile temp przekroczyla target (w fazie ustalonej)
+        # Overshoot - how far temp exceeded the target (in the settled phase)
         target = st['target']
         st['overshoot'] = max(0, st['tmax'] - target) if target else 0
 
-        # Czas ustalania - kiedy temp weszla i zostala w +/-1C od target
+        # Settling time - when temp entered and stayed within +/-1C of the target
         st['settle_time'] = None
         if target:
             band = 1.0
             for i, tm in enumerate(temp):
                 if abs(tm - target) <= band:
-                    # sprawdz czy zostala w pasie do konca (lub przez 80% reszty)
+                    # check whether it stayed in the band to the end (or for 80% of the rest)
                     rest = temp[i:]
                     in_band = sum(1 for x in rest if abs(x-target) <= band)
                     if in_band >= len(rest)*0.8:
                         st['settle_time'] = t[i] - t[0]
                         break
 
-        # Blad ustalony - srednie odchylenie w ostatnich 20% probek
+        # Steady-state error - mean deviation over the last 20% of samples
         n = len(temp)
         tail = temp[int(n*0.8):] if n > 5 else temp
         if target and tail:
@@ -2809,12 +3196,12 @@ class PeltierControl:
         else:
             st['steady_error'] = 0
 
-        # Max odchylenie od setpointu (rampy) - jak dobrze nadazal
+        # Max deviation from the setpoint (ramp) - how well it tracked
         devs = [abs(temp[i] - spt[i]) for i in range(len(temp))]
         st['max_dev'] = max(devs) if devs else 0
 
-        # Odchylenie standardowe szumu - w fazie ustalonej (ostatnie 20%)
-        # To miara jakosci pomiaru (szum termopary)
+        # Standard deviation of the noise - in the settled phase (last 20%)
+        # This is a measure of measurement quality (thermocouple noise)
         if len(tail) > 2:
             st['noise_std'] = statistics.stdev(tail)
         else:
@@ -2823,12 +3210,12 @@ class PeltierControl:
         return st
 
     def _on_xmode_change(self):
-        """Radiobutton osi X -> zsynchronizuj stary arch_align i przerysuj."""
+        """X axis radiobutton -> sync the old arch_align and redraw."""
         self.arch_align.set(self.arch_xmode.get() != 'abs')
         self._redraw_arch()
 
     def _arch_select_all(self):
-        """Zaznacz wszystkie cykle (a gdy juz wszystkie - odznacz)."""
+        """Select all cycles (and when all are already selected - deselect)."""
         if not self.arch_vars:
             return
         target = not all(v.get() for v in self.arch_vars.values())
@@ -2837,14 +3224,14 @@ class PeltierControl:
         self._redraw_arch()
 
     def _arch_t_offset(self, t, temp, mode, tref):
-        """Przesuniecie osi X dla jednego przebiegu, wg wybranego trybu."""
+        """X axis offset for a single run, according to the selected mode."""
         if mode == 'abs':
             return 0.0
         if mode == 'temp':
-            # Znajdz PIERWSZE przejscie przez tref (z interpolacja liniowa
-            # miedzy probkami) i przyjmij ten moment za zero. Dzieki temu
-            # przebiegi o roznych temperaturach startowych naklada sie
-            # dokladnie w tym samym punkcie termicznym, a nie czasowym.
+            # Find the FIRST crossing of tref (with linear interpolation
+            # between samples) and take that moment as zero. This way
+            # runs with different starting temperatures overlay
+            # at exactly the same thermal point, not the same time point.
             for i in range(1, len(temp)):
                 a, b = temp[i-1], temp[i]
                 if (a - tref) * (b - tref) <= 0 and a != b:
@@ -2852,29 +3239,28 @@ class PeltierControl:
                     return t[i-1] + f * (t[i] - t[i-1])
                 if a == tref:
                     return t[i-1]
-            return t[0]      # nie osiagnieto tref - wyrownaj od startu
+            return t[0]      # tref not reached - align from the start
         if mode == 'ramp':
-            # Zero = moment, w ktorym rampa REALNIE rusza. Wykrywamy po
-            # setpoincie aktywnym (spA): dopoki stoi, jestesmy przed startem.
-            # To wyrownuje przebiegi o roznej dlugosci "rozbiegu" przed
-            # wlasciwa rampa (np. gdy jeden zaczal z zimnego urzadzenia).
+            # Zero = the moment the ramp REALLY starts. We detect it from
+            # the active setpoint (spA): while it stands still, we are pre-start.
+            # This aligns runs with a different "run-up" length before
+            # the actual ramp (e.g. when one started from a cold device).
             sa = self._last_sa or []
             for i in range(1, min(len(sa), len(t))):
                 if sa[i] is not None and sa[0] is not None and abs(sa[i]-sa[0]) > 0.05:
                     return t[i]
-            # brak spA (stary plik) - fallback: pierwsza wyrazna zmiana temp
+            # no spA (old file) - fallback: the first clear temp change
             for i in range(1, len(temp)):
                 if abs(temp[i]-temp[0]) > 0.3:
                     return t[i]
             return t[0]
         return t[0]          # 't0'
-
     def _redraw_arch(self):
-        """Narysuj wszystkie zaznaczone cykle (porownanie)"""
+        """Draw all selected runs (comparison)"""
         selected = [(p, v) for p, v in self.arch_vars.items() if v.get()]
         self.ax_a.clear()
-        # Druga os (PWM) tworzona na zadanie - kasujemy stara przy kazdym
-        # przerysowaniu, inaczej narastalyby kolejne osie.
+        # The second axis (PWM) is created on demand - we delete the old one on
+        # every redraw, otherwise more and more axes would pile up.
         if getattr(self, '_ax_pwm', None) is not None:
             try: self._ax_pwm.remove()
             except Exception: pass
@@ -2888,7 +3274,7 @@ class PeltierControl:
             tref = float(self.arch_tref.get().replace(',', '.'))
         except Exception:
             tref = 40.0
-        # Pole T= ma sens tylko w trybie "wzgl. temperatury"
+        # The T= field only makes sense in "rel. to temperature" mode
         if hasattr(self, 'arch_tref'):
             st_ = 'normal' if mode == 'temp' else 'disabled'
             try:
@@ -2898,7 +3284,7 @@ class PeltierControl:
                 pass
 
         if not selected:
-            self.ax_a.text(0.5, 0.5, "Zaznacz jeden lub wiecej cykli po lewej",
+            self.ax_a.text(0.5, 0.5, "Select one or more runs on the left",
                           ha='center', va='center', color=C['dim2'],
                           fontsize=11, transform=self.ax_a.transAxes)
             self.cv_a.draw()
@@ -2911,7 +3297,7 @@ class PeltierControl:
 
         multi = len(selected) > 1
 
-        # ── Zbierz dane wszystkich zaznaczonych, policz przesuniecia ──────
+        # ── Collect the data of everything selected, compute the offsets ──
         series = []
         for path, _ in selected:
             d = self._load_cycle_data(path)
@@ -2923,15 +3309,15 @@ class PeltierControl:
                                pc=list(self._last_pc or [])))
         if not series:
             self.cv_a.draw(); return
-        # Kolejnosc = taka jak na liscie po lewej. Wazne dla trybu "roznica
-        # wzgl. 1." - odniesieniem ma byc przebieg, ktory uzytkownik widzi
-        # jako pierwszy, a nie przypadkowa kolejnosc slownika zaznaczen.
+        # Order = the same as in the list on the left. Important for the
+        # "difference rel. to 1st" mode - the reference must be the trace the
+        # user sees first, not an arbitrary ordering of the selection dict.
         series.sort(key=lambda z: file_order.get(z['path'], 10**6))
 
         if mode == 'pc':
-            # Wspolna os = zegar PC. Zero bierzemy z NAJWCZESNIEJSZEGO
-            # przebiegu, zeby liczby na osi byly male, a etykiety i tak
-            # pokazuja prawdziwa godzine (formatter nizej).
+            # Common axis = PC clock. We take zero from the EARLIEST
+            # run, so that the numbers on the axis stay small, while the
+            # labels still show the real time of day (formatter below).
             starts = [s['pc'][0] for s in series if s['pc'] and s['pc'][0] is not None]
             self._pc_zero = min(starts) if starts else 0.0
             for s in series:
@@ -2940,7 +3326,7 @@ class PeltierControl:
             for s in series:
                 s['off'] = self._arch_t_offset(s['t'], s['temp'], mode, tref)
 
-        # Jednostka osi: sekundy czy minuty
+        # Axis unit: seconds or minutes
         spans = []
         for s in series:
             if mode == 'pc' and s['pc'] and s['pc'][0] is not None:
@@ -2951,7 +3337,7 @@ class PeltierControl:
         use_min = max_t > 180
         tdiv = 60.0 if use_min else 1.0
 
-        # ── PORoWNANIE WZGLEDEM SIEBIE ──────────────────────────────────
+        # ── COMPARISON AGAINST EACH OTHER ───────────────────────────────
         delta_mode = bool(getattr(self, 'arch_delta', None) and self.arch_delta.get()
                           and len(series) > 1)
         ref = series[0] if delta_mode else None
@@ -2963,11 +3349,11 @@ class PeltierControl:
                 ref_x = [((v if v is not None else 0) - self._pc_zero) / tdiv for v in ref['pc']]
             else:
                 ref_x = [(x - ref['off']) / tdiv for x in ref['t']]
-            # W trybie roznicy setpointy tylko zaciemniaja obraz
+            # In difference mode the setpoints only clutter the picture
             show = dict(show); show['sa'] = False; show['st'] = False
 
         def _interp(xs, ys, x):
-            """Liniowa interpolacja ys(xs) w punkcie x (poza zakresem - brzeg)."""
+            """Linear interpolation of ys(xs) at point x (outside the range - edge value)."""
             if not xs: return 0.0
             if x <= xs[0]: return ys[0]
             if x >= xs[-1]: return ys[-1]
@@ -2995,14 +3381,14 @@ class PeltierControl:
             base = f"{name} · " if multi else ""
             if show.get('st'):
                 self.ax_a.plot(tx, s['spt'], color=C['orange'], lw=1.2, ls='--',
-                              label=(base + 'cel') if not multi else None, alpha=0.5)
+                              label=(base + 'target') if not multi else None, alpha=0.5)
             if show.get('sa') and s['sa'] and any(v is not None for v in s['sa']):
                 xs = [tx[i] for i in range(min(len(s['sa']), len(tx))) if s['sa'][i] is not None]
                 ys = [v for v in s['sa'][:len(tx)] if v is not None]
                 if ys:
                     self.ax_a.plot(xs, ys, color=(C['cyan'] if not multi else col),
                                   lw=1.1, ls=':', alpha=0.75,
-                                  label=(base + 'setpoint (rampa)') if not multi else None)
+                                  label=(base + 'setpoint (ramp)') if not multi else None)
             if show.get('temp'):
                 if delta_mode and ref is not None:
                     if s is ref:
@@ -3014,13 +3400,13 @@ class PeltierControl:
                                   label=f"{name} − {ref_name}")
                 else:
                     self.ax_a.plot(tx, s['temp'], color=col, lw=(2 if not multi else 1.8),
-                                  label=(name if multi else 'temperatura'))
+                                  label=(name if multi else 'temperature'))
             if show.get('t2') and s['t2'] and any(v is not None for v in s['t2']):
                 xs = [tx[i] for i in range(min(len(s['t2']), len(tx))) if s['t2'][i] is not None]
                 ys = [v for v in s['t2'][:len(tx)] if v is not None]
                 if ys:
                     self.ax_a.plot(xs, ys, color=C['purple'], lw=1.5, alpha=0.8,
-                                  label=(base + 'termopara 2'))
+                                  label=(base + 'thermocouple 2'))
             if show.get('pwm'):
                 if ax2 is None:
                     ax2 = self.ax_a.twinx(); self._ax_pwm = ax2
@@ -3028,12 +3414,12 @@ class PeltierControl:
                     ax2.tick_params(colors=C['dim'], labelsize=8)
                 ax2.plot(tx, s['pwm'], color=col, lw=0.9, ls='-.', alpha=0.5)
 
-        # Linia odniesienia w trybie "wzgl. temperatury"
+        # Reference line in "rel. to temperature" mode
         if mode == 'temp':
             self.ax_a.axhline(tref, color=C['dim2'], lw=0.8, ls='--', alpha=0.6)
             self.ax_a.axvline(0, color=C['dim2'], lw=0.8, ls='--', alpha=0.6)
 
-        # Etykiety osi X jako godzina zegarowa w trybie PC
+        # X axis labels as wall-clock time in PC mode
         if mode == 'pc':
             import matplotlib.ticker as _mt
             z = getattr(self, '_pc_zero', 0.0)
@@ -3042,20 +3428,20 @@ class PeltierControl:
                 except Exception: return ""
             self.ax_a.xaxis.set_major_formatter(_mt.FuncFormatter(_fmt))
 
-        # Opis osi czasu - jednostka + informacja o punkcie odniesienia
+        # Time axis caption - unit + information about the reference point
         unit_txt = 'min' if use_min else 's'
         if mode == 'pc':
-            xlabel = 'zegar PC [godz:min:s]'
+            xlabel = 'PC clock [h:min:s]'
         else:
-            xlabel = f'czas [{unit_txt}]'
-            xlabel += {'t0':   '  ·  0 = start przebiegu',
-                       'abs':  '  ·  czas wlasny pliku',
-                       'ramp': '  ·  0 = start rampy',
-                       'temp': f'  ·  0 = przejscie przez {tref:.1f}°C',
+            xlabel = f'time [{unit_txt}]'
+            xlabel += {'t0':   '  ·  0 = start of the run',
+                       'abs':  '  ·  file own time',
+                       'ramp': '  ·  0 = start of the ramp',
+                       'temp': f'  ·  0 = crossing {tref:.1f}°C',
                        }.get(mode, '')
         self.ax_a.set_xlabel(xlabel, color=C['dim'], fontsize=9)
         self.ax_a.set_ylabel(
-            (f'roznica temperatury vs {ref_name} [°C]' if delta_mode else 'temperature [°C]'),
+            (f'temperature difference vs {ref_name} [°C]' if delta_mode else 'temperature [°C]'),
             color=C['dim'], fontsize=9)
         self.ax_a.tick_params(colors=C['dim'], labelsize=8)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
@@ -3064,7 +3450,7 @@ class PeltierControl:
         for sp in self.ax_a.spines.values():
             sp.set_color(C['border'])
 
-        # Tytul: statystyki (jeden cykl) lub liczba porownywanych
+        # Title: statistics (single run) or the number being compared
         if not multi:
             d = self._load_cycle_data(selected[0][0])
             if d:
@@ -3084,7 +3470,7 @@ class PeltierControl:
         self.fig_a.tight_layout()
         self.cv_a.draw()
 
-        # Panel nastaw przebiegu (tylko przy jednym zaznaczonym cyklu)
+        # Run settings panel (only when a single run is selected)
         if hasattr(self, 'arch_settings_lbl'):
             if not multi:
                 cs = self._cycle_settings(selected[0][0])
@@ -3101,7 +3487,7 @@ class PeltierControl:
                 self.arch_settings_lbl.config(text=f"({len(selected)} cycles selected — settings shown for single selection)")
 
     def _selected_arch_path(self):
-        """Pierwszy zaznaczony cykl (do eksportu)"""
+        """First selected run (for export)"""
         for p, v in self.arch_vars.items():
             if v.get():
                 from pathlib import Path as _P
@@ -3109,31 +3495,31 @@ class PeltierControl:
         return None
 
     def export_arch_csv(self):
-        """Pobierz CSV zaznaczonych pomiarow.
+        """Download the CSV of the selected measurements.
 
-        Jeden zaznaczony -> zwykle "zapisz jako". Wiecej niz jeden -> pytamy
-        o folder i kopiujemy tam wszystkie pod oryginalnymi nazwami (bez tego
-        trzeba bylo eksportowac po jednym).
+        One selected -> an ordinary "save as". More than one -> we ask
+        for a folder and copy them all there under their original names (without
+        this you had to export them one at a time).
         """
         from pathlib import Path as _P
         sel = [_P(p) for p, v in self.arch_vars.items() if v.get()]
         if not sel:
-            messagebox.showinfo("Brak zaznaczenia", "Zaznacz pomiar na liscie po lewej.")
+            messagebox.showinfo("No selection", "Select a measurement in the list on the left.")
             return
         from tkinter import filedialog
         import shutil
         try:
             if len(sel) == 1:
                 dest = filedialog.asksaveasfilename(
-                    title="Pobierz CSV pomiaru", defaultextension=".csv",
+                    title="Download measurement CSV", defaultextension=".csv",
                     initialfile=sel[0].name,
                     filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
                 if not dest:
                     return
                 shutil.copy(sel[0], dest)
-                messagebox.showinfo("Pobrano", f"Zapisano:\n{dest}")
+                messagebox.showinfo("Downloaded", f"Saved:\n{dest}")
             else:
-                folder = filedialog.askdirectory(title=f"Gdzie zapisac {len(sel)} plikow CSV?")
+                folder = filedialog.askdirectory(title=f"Where to save {len(sel)} CSV files?")
                 if not folder:
                     return
                 done, failed = 0, []
@@ -3142,15 +3528,15 @@ class PeltierControl:
                         shutil.copy(f, _P(folder) / f.name); done += 1
                     except Exception as e:
                         failed.append(f"{f.name}: {e}")
-                msg = f"Zapisano {done} z {len(sel)} plikow w:\n{folder}"
+                msg = f"Saved {done} of {len(sel)} files in:\n{folder}"
                 if failed:
-                    msg += "\n\nNie udalo sie:\n" + "\n".join(failed[:5])
-                messagebox.showinfo("Pobrano", msg)
+                    msg += "\n\nFailed:\n" + "\n".join(failed[:5])
+                messagebox.showinfo("Downloaded", msg)
         except Exception as e:
-            messagebox.showerror("Blad eksportu", str(e))
+            messagebox.showerror("Export error", str(e))
 
     def save_arch_chart(self):
-        """Zapisz aktualny wykres (z porownaniem) jako obraz"""
+        """Save the current chart (with the comparison) as an image"""
         if not any(v.get() for v in self.arch_vars.values()):
             messagebox.showinfo("No selection", "Tick at least one cycle first.")
             return
@@ -3161,17 +3547,24 @@ class PeltierControl:
                 initialfile="comparison.png",
                 filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
             if dest:
-                self.fig_a.savefig(dest, dpi=150, facecolor=C['panel'],
-                                   bbox_inches='tight')
+                # ALWAYS export on white - see print_theme(). The chart is
+                # rebuilt once in the print palette, saved, then rebuilt again
+                # in the screen palette, so what you see on screen is
+                # untouched and what lands in the file is printable.
+                with print_theme(self.fig_a):
+                    self._redraw_arch()
+                    self.fig_a.savefig(dest, dpi=200, facecolor='white',
+                                       edgecolor='none', bbox_inches='tight')
+                self._redraw_arch()
                 messagebox.showinfo("Saved", f"Chart saved to:\n{dest}")
         except Exception as e:
             messagebox.showerror("Save error", str(e))
 
     # ════════════════════════════════════════════════════════
-    #  FOLDER NA DANE POMIAROWE (wybierany przez uzytkownika)
+    #  FOLDER FOR MEASUREMENT DATA (chosen by the user)
     # ════════════════════════════════════════════════════════
     def _load_data_dir(self):
-        """Odczytaj zapamietany folder danych; gdy brak/niedostepny - domyslny."""
+        """Read the remembered data folder; if missing/unavailable - the default."""
         default = self.cfg_dir
         try:
             if self.settings_file.exists():
@@ -3180,23 +3573,23 @@ class PeltierControl:
                 p = d.get('data_dir')
                 if p:
                     q = Path(p)
-                    # Nie tworzymy go tu na sile - jesli uzytkownik odlaczyl
-                    # dysk albo skasowal folder, cicho wracamy do domyslnego,
-                    # zamiast wywalac aplikacje przy starcie.
+                    # We do not force-create it here - if the user unplugged the
+                    # drive or deleted the folder, we quietly fall back to the
+                    # default instead of crashing the application at startup.
                     if q.is_dir():
                         return q
                     try:
                         q.mkdir(parents=True, exist_ok=True)
                         return q
                     except Exception:
-                        print(f"Folder danych '{q}' niedostepny - uzywam {default}")
+                        print(f"Data folder '{q}' unavailable - using {default}")
         except Exception as e:
             print(f"ustawienia.json: {e}")
         default.mkdir(exist_ok=True)
         return default
 
     def _save_data_dir(self):
-        """Zapamietaj wybrany folder danych (scalajac z reszta ustawien)."""
+        """Remember the chosen data folder (merging it with the other settings)."""
         d = {}
         try:
             if self.settings_file.exists():
@@ -3209,20 +3602,20 @@ class PeltierControl:
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(d, f, indent=2)
         except Exception as e:
-            messagebox.showwarning("Ustawienia", f"Nie zapisano wyboru folderu:\n{e}")
+            messagebox.showwarning("Settings", f"Folder choice not saved:\n{e}")
 
     def _set_data_dir(self, newdir):
-        """Przelacz folder danych na `newdir` (Path) i odswiez archiwum."""
+        """Switch the data folder to `newdir` (Path) and refresh the archive."""
         newdir = Path(newdir)
         if newdir == self.log_dir:
             return
-        # Nie przelaczamy w trakcie zapisu cyklu - plik tymczasowy jest juz
-        # otwarty w starym folderze i archiwizacja trafilaby w prozne.
+        # We do not switch while a run is being saved - the temporary file is
+        # already open in the old folder and archiving would go nowhere.
         if self.cyc_on:
             messagebox.showwarning(
-                "Trwa pomiar",
-                "Nie zmieniam folderu w trakcie zapisu cyklu.\n"
-                "Zatrzymaj pomiar (STOP) i sprobuj ponownie.")
+                "Measurement in progress",
+                "I will not change the folder while a run is being saved.\n"
+                "Stop the measurement (STOP) and try again.")
             return
         try:
             newdir.mkdir(parents=True, exist_ok=True)
@@ -3230,7 +3623,7 @@ class PeltierControl:
             probe.write_text("ok", encoding='utf-8')
             probe.unlink()
         except Exception as e:
-            messagebox.showerror("Folder danych", f"Nie moge pisac w:\n{newdir}\n\n{e}")
+            messagebox.showerror("Data folder", f"I cannot write to:\n{newdir}\n\n{e}")
             return
         self.log_dir = newdir
         self._save_data_dir()
@@ -3240,24 +3633,24 @@ class PeltierControl:
             self._redraw_arch()
         except Exception:
             pass
-        self._series_status(f"Dane zapisuje teraz w: {self.log_dir}")
+        self._series_status(f"Data is now saved in: {self.log_dir}")
 
     def choose_data_dir(self):
-        """Wskaz ISTNIEJACY folder na dane pomiarowe."""
+        """Point to an EXISTING folder for measurement data."""
         from tkinter import filedialog
-        p = filedialog.askdirectory(title="Wybierz folder na dane pomiarowe",
+        p = filedialog.askdirectory(title="Select a folder for measurement data",
                                     initialdir=str(self.log_dir))
         if p:
             self._set_data_dir(p)
 
     def create_data_dir(self):
-        """Utworz NOWY folder na dane (pytamy o rodzica i nazwe)."""
+        """Create a NEW data folder (we ask for the parent and the name)."""
         from tkinter import filedialog, simpledialog
-        parent = filedialog.askdirectory(title="Gdzie utworzyc nowy folder na dane?",
+        parent = filedialog.askdirectory(title="Where to create the new data folder?",
                                          initialdir=str(self.log_dir))
         if not parent:
             return
-        name = simpledialog.askstring("Nowy folder", "Nazwa folderu:",
+        name = simpledialog.askstring("New folder", "Folder name:",
                                       initialvalue=datetime.now().strftime("Pomiary_%Y-%m-%d"),
                                       parent=self.root)
         if not name:
@@ -3265,20 +3658,20 @@ class PeltierControl:
         import re as _re
         safe = _re.sub(r'[<>:"/\\|?*]', '_', name).strip().strip('.')
         if not safe:
-            messagebox.showwarning("Nowy folder", "Pusta nazwa.")
+            messagebox.showwarning("New folder", "Empty name.")
             return
         self._set_data_dir(Path(parent) / safe)
 
     def _update_data_dir_label(self):
         if hasattr(self, 'data_dir_lbl'):
             p = str(self.log_dir)
-            # Skracamy srodek dlugiej sciezki - koniec (nazwa folderu) jest
-            # najwazniejszy, a pelna sciezka i tak jest w podpowiedzi.
+            # We shorten the middle of a long path - the end (the folder name)
+            # matters most, and the full path is in the tooltip anyway.
             show = p if len(p) <= 52 else p[:20] + " … " + p[-29:]
             self.data_dir_lbl.config(text=show)
 
     def open_log_folder(self):
-        """Otworz folder z logami"""
+        """Open the folder with the logs"""
         try:
             import subprocess
             p = str(self.log_dir)
@@ -3292,11 +3685,11 @@ class PeltierControl:
             messagebox.showinfo("Folder", f"Logs are in:\n{self.log_dir}")
 
     def load_arch(self, evt=None):
-        """Zachowane dla kompatybilnosci - przekierowuje do redraw"""
+        """Kept for compatibility - redirects to redraw"""
         self._redraw_arch()
 
     def show_arch_stats(self):
-        """Pokaz okno ze statystykami zaznaczonego cyklu"""
+        """Show a window with the statistics of the selected run"""
         path = self._selected_arch_path()
         if not path:
             messagebox.showinfo("No selection", "Tick a cycle in the list first.")
@@ -3336,7 +3729,7 @@ class PeltierControl:
             ("Steady-state error", f"{st['steady_error']:.3f} °C", C['text']),
             ("Max deviation from ramp", f"{st['max_dev']:.2f} °C", C['text']),
             ("─", "", None),
-            ("Noise σ (measurement quality)", f"±{st['noise_std']:.3f} °C", 
+            ("Noise σ (measurement quality)", f"±{st['noise_std']:.3f} °C",
              C['green'] if st['noise_std']<0.2 else C['yellow'] if st['noise_std']<0.5 else C['red']),
         ]
         for label, val, col in rows:
@@ -3350,7 +3743,7 @@ class PeltierControl:
             tk.Label(r, text=val, bg=C['bg2'], fg=col or C['text'],
                      font=(FONT, fsz(10), 'bold'), anchor='e').pack(side='right', padx=10)
 
-        # Interpretacja szumu
+        # Noise interpretation
         noise = st['noise_std']
         interp = ("Excellent - low noise" if noise < 0.2 else
                   "Moderate noise" if noise < 0.5 else
@@ -3360,7 +3753,7 @@ class PeltierControl:
                  justify='left').pack(anchor='w', pady=(12, 0))
 
     def export_arch_pdf(self):
-        """Generuj raport PDF: wykres + statystyki + nastawy + data"""
+        """Generate a PDF report: chart + statistics + settings + date"""
         path = self._selected_arch_path()
         if not path:
             messagebox.showinfo("No selection", "Tick a cycle in the list first.")
@@ -3385,7 +3778,7 @@ class PeltierControl:
             messagebox.showerror("PDF error", f"Could not create report:\n{e}")
 
     def _build_pdf_report(self, path, data, dest):
-        """Zbuduj raport PDF za pomoca matplotlib (bez dodatkowych bibliotek)"""
+        """Build the PDF report using matplotlib (no extra libraries)"""
         from matplotlib.backends.backend_pdf import PdfPages
         from matplotlib.figure import Figure
         from pathlib import Path as _P
@@ -3393,22 +3786,22 @@ class PeltierControl:
 
         t, temp, spt, pwm = data
         st = self._compute_stats(data)
-        # Os czasu od zera
+        # Time axis starting from zero
         t0 = t[0]
         tx = [x - t0 for x in t]
 
         with PdfPages(dest) as pdf:
-            fig = Figure(figsize=(8.27, 11.69))  # A4 pionowo
+            fig = Figure(figsize=(8.27, 11.69))  # A4 portrait
             fig.patch.set_facecolor('white')
 
-            # Naglowek
-            fig.text(0.5, 0.96, "Peltier Control - Cycle Report", ha='center',
+            # Header
+            fig.text(0.5, 0.96, "IGNI - Run Report", ha='center',
                      fontsize=16, fontweight='bold')
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             fig.text(0.5, 0.935, f"{self._cycle_display_name(_P(path))}  ·  generated {ts}",
                      ha='center', fontsize=9, color='gray')
 
-            # Wykres temperatury (gorna polowa)
+            # Temperature chart (upper half)
             ax1 = fig.add_axes([0.1, 0.55, 0.82, 0.32])
             ax1.plot(tx, spt, color='#e8833a', lw=1.2, ls='--', label='target', alpha=0.7)
             ax1.plot(tx, temp, color='#2b7fd4', lw=1.8, label='temperature')
@@ -3418,14 +3811,14 @@ class PeltierControl:
             ax1.grid(True, alpha=0.3)
             ax1.set_title('Temperature profile', fontsize=11, loc='left')
 
-            # Wykres PWM (pod spodem)
+            # PWM chart (underneath)
             ax2 = fig.add_axes([0.1, 0.40, 0.82, 0.10])
             ax2.fill_between(tx, pwm, color='#3ea662', alpha=0.5)
             ax2.set_xlabel('time [s]', fontsize=8)
             ax2.set_ylabel('PWM [%]', fontsize=8)
             ax2.grid(True, alpha=0.3)
 
-            # Tabela statystyk (dol)
+            # Statistics table (bottom)
             def settle_str():
                 return f"{st['settle_time']:.0f} s" if st['settle_time'] is not None else "not reached"
             stats_lines = [
@@ -3453,11 +3846,11 @@ class PeltierControl:
 
 
     # ────────────────────────────────────────────────────
-    #  TICK + WYKRES
+    #  TICK + CHART
     # ────────────────────────────────────────────────────
     def tick(self):
         try:
-            # SELF-TUNE/kalibracja zmienily PID - zaktualizuj suwaki (tabele)
+            # SELF-TUNE/calibration changed the PID - update the sliders (tables)
             stp = getattr(self, '_st_pid_update', None)
             if stp is not None:
                 self._st_pid_update = None
@@ -3476,42 +3869,44 @@ class PeltierControl:
                 self.pwm.append(pwm); self.kp.append(kp)
                 self.ki.append(ki); self.kd.append(kd)
                 self.states.append(state)
-                # Ogranicz dlugosc buforow
+                # Limit the buffer length
                 if len(self.t) > self.maxlen:
                     for a in [self.t, self.temp, self.spt, self.spa,
                               self.pwm, self.kp, self.ki, self.kd, self.states]:
                         del a[0]
-                # Start cyklu
+                # Run start
                 if state == 'AUTO' and prev != 'AUTO' and not self.cyc_on:
                     self._cyc_start(temp)
-                    # Rozpocznij sledzenie dotarcia do setpointu
+                    # Start tracking the approach to the setpoint
                     self.reach_start_t = now2
                     self.reach_start_temp = temp
                     self.reach_target = st
                     self.reach_done = False
+                    self.reach_in_tol_t = None
                     self.reach_time = None
                     self.reach_avg_rate = None
                     self.last_setpoint_target = st
                     self._ramp_reset(now2, temp, st)
                 elif self.cyc_on and state == 'MAN' and prev in ('AUTO', 'COOLDOWN', 'FREEZE', 'FREEZE_READY'):
-                    # Koniec cyklu - przejscie z pracy do MAN (STOP).
-                    # Bez cooldown teraz idzie prosto AUTO->MAN.
+                    # End of the run - transition from operation to MAN (STOP).
+                    # Without cooldown it now goes straight AUTO->MAN.
                     self.cyc_stop("done")
 
-                # Wykrywanie zmiany docelowego setpointu podczas pracy (nowe dotarcie)
+                # Detect a change of the target setpoint while running (new approach)
                 if state == 'AUTO' and self.last_setpoint_target is not None:
                     if abs(st - self.last_setpoint_target) > 0.5:
-                        # Setpoint zmieniony - zacznij liczyc od nowa
+                        # Setpoint changed - start counting from scratch
                         self.reach_start_t = now2
                         self.reach_start_temp = temp
                         self.reach_target = st
                         self.reach_done = False
+                        self.reach_in_tol_t = None
                         self.last_setpoint_target = st
                         self._ramp_reset(now2, temp, st)
 
-                # Koniec FAZY RAMPY = generator rampy (spA) dojechal do celu.
-                # Liczymy to ZANIM sprawdzimy dotarcie temperatury, zeby obie
-                # miary byly niezalezne (patrz komentarz przy self.ramp_t0).
+                # End of the RAMP PHASE = the ramp generator (spA) reached the target.
+                # We compute this BEFORE checking the temperature approach, so that
+                # both measures stay independent (see the comment at self.ramp_t0).
                 if (state == 'AUTO' and not self.ramp_done
                         and self.ramp_t0 is not None and abs(sa - st) <= 0.05):
                     self.ramp_done = True
@@ -3520,20 +3915,27 @@ class PeltierControl:
                         self.ramp_rate = (temp - self.ramp_temp0) / (self.ramp_secs / 60.0)
                     self.ramp_lag = st - temp
 
-                # Sprawdz czy osiagnieto setpoint (w granicach 0.5C, stabilnie)
+                # Check whether the setpoint was reached: |error| <= REACH_TOL_C
+                # held continuously for REACH_STABLE_S (see the comment
+                # at those constants at the top of the file).
                 if (state == 'AUTO' and not self.reach_done
                         and self.reach_target is not None
                         and self.reach_start_t is not None):
-                    if abs(temp - self.reach_target) <= 0.5:
+                    if abs(temp - self.reach_target) > REACH_TOL_C:
+                        self.reach_in_tol_t = None   # we fell out - count from scratch
+                    elif self.reach_in_tol_t is None:
+                        self.reach_in_tol_t = now2
+                    if (self.reach_in_tol_t is not None
+                            and now2 - self.reach_in_tol_t >= REACH_STABLE_S):
                         self.reach_done = True
                         self.reach_time = now2 - self.reach_start_t
                         delta = self.reach_target - self.reach_start_temp
                         dT = abs(delta)
                         if self.reach_time > 0:
                             self.reach_avg_rate = dT / (self.reach_time / 60.0)
-                        # Kierunek przejscia: grzanie czy chlodzenie
+                        # Direction of the transition: heating or cooling
                         self.reach_dir = "HEAT" if delta > 0 else "COOL"
-                        # Zapamietaj statystyki dotarcia dla tego cyklu
+                        # Remember the approach statistics for this run
                         self._last_reach_summary = {
                             'target': self.reach_target,
                             'time_s': self.reach_time,
@@ -3556,15 +3958,15 @@ class PeltierControl:
         self.root.after(250, self.tick)
 
     def _ramp_reset(self, t0, temp0, target):
-        """Zacznij liczyc NOWA faze rampy (patrz komentarz przy self.ramp_t0)."""
+        """Start counting a NEW ramp phase (see the comment at self.ramp_t0)."""
         self.ramp_t0 = t0
         self.ramp_temp0 = temp0
         self.ramp_done = False
         self.ramp_secs = None
         self.ramp_rate = None
         self.ramp_lag = None
-        # Tempo ZADANE bierzemy z tego suwaka, ktory odpowiada kierunkowi
-        # przejscia - w gore HEAT RATE, w dol COOL RATE.
+        # We take the COMMANDED rate from whichever slider matches the direction
+        # of the transition - upwards HEAT RATE, downwards COOL RATE.
         try:
             if target is not None and temp0 is not None and target < temp0:
                 self.ramp_cmd_rate = self.sl_rd.get()
@@ -3572,33 +3974,32 @@ class PeltierControl:
                 self.ramp_cmd_rate = self.sl_ru.get()
         except Exception:
             self.ramp_cmd_rate = None
-
     def update_cards(self):
         if not self.t: return
         temp = self.temp[-1]; spt = self.spt[-1]; pwm = self.pwm[-1]
         self.cards['temp']['val'].config(text=f"{temp:.2f}")
-        # Karta drugiej termopary
+        # Second thermocouple card
         t2 = getattr(self, '_latest_temp2', None)
         if 'temp2' in self.cards:
             self.cards['temp2']['val'].config(text=f"{t2:.2f}" if t2 is not None else "--")
         self.cards['sp']['val'].config(text=f"{spt:.1f}")
-        # AVG RATE - tempo SAMEJ RAMPY (nie licząc ogona dojazdu).
-        # Wczesniej liczylo sie az do wejscia w +/-0.5C od celu, wiec ogon
-        # dojazdu zanizal wynik nawet 2.5x (patrz komentarz przy self.ramp_t0)
-        # i karta pokazywala 12.2 przy zadanych 30. Teraz: w trakcie rampy
-        # tempo liczone od jej startu, a po jej zakonczeniu ZAMROZONE na
-        # wartosci osiagnietej w rampie - dzieki temu widac wprost, czy
-        # rampa nadaza za zadanym RATE.
+        # AVG RATE - the rate of the RAMP ITSELF (not counting the approach tail).
+        # Previously it was counted until entering +/-0.5C of the target, so the
+        # approach tail dragged the result down by as much as 2.5x (see the
+        # comment at self.ramp_t0) and the card showed 12.2 for a commanded 30.
+        # Now: during the ramp the rate is counted from its start, and once it
+        # finishes it is FROZEN at the value reached in the ramp - that way you
+        # can see directly whether the ramp keeps up with the commanded RATE.
         avg_rate = 0.0
         if self.ramp_done and self.ramp_rate is not None:
             avg_rate = self.ramp_rate
         elif (self.ramp_t0 is not None and self.ramp_temp0 is not None
                 and self.t and self.cur_state == 'AUTO'):
             elapsed = self.t[-1] - self.ramp_t0
-            if elapsed > 2:  # min 2s zeby uniknac dzielenia przez male liczby
+            if elapsed > 2:  # min 2s to avoid dividing by small numbers
                 avg_rate = (temp - self.ramp_temp0) / (elapsed / 60.0)
         self.cards['rate']['val'].config(text=f"{avg_rate:+.1f}")
-        # Kolor karty = jak blisko ZADANEGO tempa (zielony >=95%, zolty >=85%)
+        # Card color = how close to the COMMANDED rate (green >=95%, yellow >=85%)
         try:
             cmd = self.ramp_cmd_rate
             if cmd and abs(cmd) > 0.1 and abs(avg_rate) > 0.1:
@@ -3606,22 +4007,22 @@ class PeltierControl:
                 rcol = (C['green'] if frac >= 0.95 else
                         (C['yellow'] if frac >= 0.85 else C['red']))
                 self.cards['rate']['unit_lbl'].config(
-                    text=f"°C/min  {frac*100:.0f}% zad.", fg=rcol)
+                    text=f"°C/min  {frac*100:.0f}% of cmd", fg=rcol)
             else:
                 self.cards['rate']['unit_lbl'].config(text="°C/min", fg=C['dim2'])
         except Exception:
             pass
-        # PWM + kierunek (HEAT/COOL/HOLD widoczny w jednostce)
+        # PWM + direction (HEAT/COOL/HOLD shown in the unit)
         diff = spt - temp
         arrow = "% ▲HEAT" if diff > 0.3 else ("% ▼COOL" if diff < -0.3 else "% ●HOLD")
         self.cards['pwm']['val'].config(text=f"{pwm:.0f}")
-        # Kolor kierunku
+        # Direction color
         acol = C['red'] if diff > 0.3 else (C['cyan'] if diff < -0.3 else C['dim2'])
         self.cards['pwm']['unit_lbl'].config(text=" " + arrow, fg=acol)
 
-        # Statystyki dotarcia / status FREEZE
+        # Approach statistics / FREEZE status
         if hasattr(self, 'reach_lbl'):
-            # FREEZE - priorytet (najwazniejszy komunikat dla usera)
+            # FREEZE - priority (the most important message for the user)
             if self.cur_state == 'FREEZE_READY':
                 self.reach_lbl.config(text="❄ GAL SOLID — ready to swap sample", fg=C['cyan'])
             elif self.cur_state == 'FREEZE':
@@ -3631,20 +4032,20 @@ class PeltierControl:
                 tstr = f"{m}m {s}s" if m > 0 else f"{s}s"
                 d = getattr(self, 'reach_dir', '')
                 dcol = C['red'] if d == 'HEAT' else C['cyan']
-                # ROZBICIE na dwie osobne liczby zamiast jednej mylacej
-                # sredniej (patrz komentarz przy self.ramp_t0): ile jechala
-                # sama RAMPA i z jakim tempem vs zadane, a osobno ile trwal
-                # DOJAZD (ogon) po zakonczeniu rampy. To sa dwa rozne
-                # problemy i naprawia sie je czym innym.
+                # SPLIT into two separate numbers instead of one misleading
+                # average (see the comment at self.ramp_t0): how long the RAMP
+                # itself ran and at what rate vs commanded, and separately how
+                # long the APPROACH (tail) took after the ramp finished. These
+                # are two different problems and they are fixed differently.
                 if self.ramp_rate is not None and self.ramp_secs is not None:
                     cmd = self.ramp_cmd_rate
-                    pct = (f" ({abs(self.ramp_rate)/abs(cmd)*100:.0f}% z {abs(cmd):.0f})"
+                    pct = (f" ({abs(self.ramp_rate)/abs(cmd)*100:.0f}% of {abs(cmd):.0f})"
                            if cmd and abs(cmd) > 0.1 else "")
                     tail = max(0.0, self.reach_time - self.ramp_secs)
-                    lag = f" · zostalo {self.ramp_lag:+.2f}°C" if self.ramp_lag is not None else ""
+                    lag = f" · remaining {self.ramp_lag:+.2f}°C" if self.ramp_lag is not None else ""
                     self.reach_lbl.config(
-                        text=(f"✓ {d} · rampa {abs(self.ramp_rate):.1f}°C/min{pct}"
-                              f" w {self.ramp_secs:.0f}s{lag} · dojazd +{tail:.0f}s"),
+                        text=(f"✓ {d} · ramp {abs(self.ramp_rate):.1f}°C/min{pct}"
+                              f" in {self.ramp_secs:.0f}s{lag} · approach +{tail:.0f}s"),
                         fg=dcol)
                 else:
                     rate_str = f"{self.reach_avg_rate:.2f}" if self.reach_avg_rate else "?"
@@ -3652,7 +4053,7 @@ class PeltierControl:
                         text=f"✓ {d} REACHED in {tstr} · avg {rate_str}°C/min", fg=dcol)
             elif (self.cur_state == 'AUTO' and self.reach_start_t is not None
                   and not self.reach_done):
-                # W trakcie dochodzenia - pokaz uplyniety czas
+                # While approaching - show the elapsed time
                 if self.t:
                     elapsed = self.t[-1] - self.reach_start_t
                     m = int(elapsed // 60); s = int(elapsed % 60)
@@ -3662,16 +4063,16 @@ class PeltierControl:
             else:
                 self.reach_lbl.config(text="")
         if not self.t: return
-        # Pauza - nie odswiezaj (pozwala przyblizyc/obejrzec zatrzymany wykres)
+        # Paused - do not refresh (lets you zoom in on / inspect the frozen chart)
         if self.chart_paused:
             return
         t = self.t; temp = self.temp; spt = self.spt; spa = self.spa; pwm = self.pwm
 
-        # Okno czasowe - pokaz tylko ostatnie N sekund jesli ustawione
+        # Time window - show only the last N seconds if set
         if self.chart_window > 0 and len(t) > 1:
             t_now = t[-1]
             cutoff = t_now - self.chart_window
-            # Znajdz indeks od ktorego pokazac
+            # Find the index to start showing from
             i0 = 0
             for i in range(len(t) - 1, -1, -1):
                 if t[i] < cutoff:
@@ -3680,13 +4081,23 @@ class PeltierControl:
             t = t[i0:]; temp = temp[i0:]; spt = spt[i0:]
             spa = spa[i0:]; pwm = pwm[i0:]
 
+        self._live_args = (t, temp, spt, spa, pwm)
+        self._redraw_live(t, temp, spt, spa, pwm)
+
+    def _redraw_live(self, t, temp, spt, spa, pwm):
+        """The live chart drawing, split out of update_cards() in .15.
+
+        It used to be inline, which meant the only way to re-render the chart
+        was to run the whole card-update routine - including its Tk widget
+        writes. Exporting on a white background needs exactly this part and
+        nothing else (see print_theme), so it now stands on its own."""
         self.ax1.clear()
         self.ax1.set_facecolor(C['panel2'])
-        # target final (przerywana pomaranczowa)
+        # target final (dashed orange)
         self.ax1.plot(t, spt, color=C['orange'], lw=1.3, ls='--', label='target', alpha=0.7)
-        # actual setpoint - rampa (kropkowana cyan) - pokazuje jak setpoint pelznie
+        # actual setpoint - ramp (dotted cyan) - shows how the setpoint creeps
         self.ax1.plot(t, spa, color=C['cyan'], lw=1.5, ls=':', label='setpoint (ramp)')
-        # temperatura rzeczywista (gruba niebieska)
+        # actual temperature (thick blue)
         self.ax1.plot(t, temp, color=C['blue'], lw=2.2, label='temp')
         self.ax1.set_ylabel('°C', color=C['dim'], fontsize=9)
         self.ax1.tick_params(colors=C['dim'], labelsize=8, length=0)
@@ -3711,27 +4122,87 @@ class PeltierControl:
         self.cv.draw_idle()
 
     # ────────────────────────────────────────────────────
-    #  CSV CYKLU
+    #  RUN CSV
     # ────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────
+    #  SLEEP INHIBIT FOR THE DURATION OF A MEASUREMENT
+    # ────────────────────────────────────────────────────
+    # IMPORTANT DISTINCTION: SCREEN BLANKING breaks nothing - the process keeps
+    # running, the serial port keeps reading, the CSV keeps being appended (every
+    # row is flushed immediately, see cyc_log). What does break things is
+    # SUSPENDING THE WHOLE SYSTEM (S3/hibernation): USB is then re-enumerated
+    # from scratch, the COM port can disappear, and the SERIES state machine
+    # (which runs HERE, in the app, not in the firmware) stops switching legs -
+    # the board stays at the last commanded setpoint in AUTO and holds it,
+    # but the series is stalled and there is a hole in the log.
+    #
+    # That is why, for the duration of a measurement, we ask the system NOT TO
+    # SLEEP. This is an ordinary per-process API - it does NOT change any system
+    # settings, does not require administrator rights and stops working the
+    # moment the lock is released or the program is closed. The screen may blank
+    # normally - we deliberately do NOT keep it lit.
+    def _wake_lock(self, on):
+        try:
+            if sys.platform.startswith('win'):
+                import ctypes
+                ES_CONTINUOUS      = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                # ES_CONTINUOUS alone = release the lock (back to normal).
+                flags = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) if on else ES_CONTINUOUS
+                ok = ctypes.windll.kernel32.SetThreadExecutionState(flags)
+                if on and not ok:
+                    print("WARNING: failed to block system sleep")
+                    return
+            elif sys.platform == 'darwin':
+                import subprocess
+                if on:
+                    if getattr(self, '_wl_proc', None) is None:
+                        self._wl_proc = subprocess.Popen(
+                            ['caffeinate', '-s', '-w', str(os.getpid())])
+                else:
+                    p = getattr(self, '_wl_proc', None)
+                    if p is not None:
+                        try: p.terminate()
+                        except Exception: pass
+                        self._wl_proc = None
+            else:
+                import subprocess
+                if on:
+                    if getattr(self, '_wl_proc', None) is None:
+                        self._wl_proc = subprocess.Popen(
+                            ['systemd-inhibit', '--what=sleep:idle',
+                             '--who=PeltierControl', '--why=measurement in progress',
+                             'sleep', 'infinity'])
+                else:
+                    p = getattr(self, '_wl_proc', None)
+                    if p is not None:
+                        try: p.terminate()
+                        except Exception: pass
+                        self._wl_proc = None
+            print("WAKE LOCK: %s" % ("enabled (the system will not sleep during the measurement)"
+                                     if on else "released"))
+        except Exception as e:
+            # No caffeinate/systemd-inhibit, or an exotic system - the
+            # measurement should happen anyway, so we only inform.
+            print("WAKE LOCK unavailable (%s) - make sure the laptop does not fall asleep" % e)
+
     def _cyc_start(self, temp0):
         self.cyc_on = True
+        self._wake_lock(True)
         self.cyc_t0 = time.time()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Plik tymczasowy - nazwe nada uzytkownik po STOP
+        # Temporary file - the user names it after STOP
         self.cyc_ts = ts
         self.cyc_fn = self.log_dir / f"_tmp_cykl_{ts}.csv"
         self.cyc_file = open(self.cyc_fn, 'w', newline='', encoding='utf-8')
         self.cyc_wr = csv.writer(self.cyc_file)
-        # czas_pc = zegar KOMPUTERA (YYYY-MM-DD HH:MM:SS.mmm). czas_s jest
-        # liczony od startu cyklu, wiec sam z siebie nie pozwala zestawic
-        # przebiegu z niczym poza nim samym - czas PC pozwala zlozyc kilka
-        # cykli na jednej osi rzeczywistej i skorelowac je z zdarzeniami
-        # spoza aplikacji. Kolumna dopisana NA KONCU, zeby stare pliki i
-        # dotychczasowe parsery (czytajace po indeksach) dalej dzialaly.
-        self.cyc_wr.writerow(['czas_s', 'temperatura_C', 'setpoint_aktywny',
-                              'setpoint_cel', 'PWM', 'PWM_%', 'Kp', 'Ki', 'Kd', 'stan',
-                              'temperatura2_C', 'ff', 'p_term', 'i_term', 'd_term',
-                              'pid_raw', 'react_scale', 'czas_pc'])
+        # czas_pc = the COMPUTER clock (YYYY-MM-DD HH:MM:SS.mmm). czas_s is
+        # counted from the start of the run, so on its own it does not let you
+        # line the trace up with anything but itself - the PC time makes it
+        # possible to put several runs on one real time axis and correlate them
+        # with events outside the application. The column is appended AT THE END
+        # so that old files and existing parsers (reading by index) keep working.
+        self.cyc_wr.writerow(CSV_COLS)
         self.cyc_rows = 0
         print(f"CYC START T={temp0:.1f}")
 
@@ -3741,10 +4212,11 @@ class PeltierControl:
                 t2str = f"{temp2:.2f}" if temp2 is not None else ""
                 if dbg:
                     dbgvals = [f"{dbg['ff']:.2f}", f"{dbg['p']:.2f}", f"{dbg['i']:.2f}",
-                               f"{dbg['dd']:.2f}", f"{dbg['raw']:.2f}", f"{dbg['react']:.2f}"]
+                               f"{dbg['dd']:.2f}", f"{dbg['raw']:.2f}", f"{dbg['react']:.2f}",
+                               ("" if dbg.get('amb') is None else f"{dbg['amb']:.2f}")]
                 else:
-                    dbgvals = ["", "", "", "", "", ""]
-                _n = datetime.now()   # JEDNO pobranie - dwa dalyby niespojne ms
+                    dbgvals = ["", "", "", "", "", "", ""]
+                _n = datetime.now()   # ONE call - two would give inconsistent ms
                 pcnow = _n.strftime("%Y-%m-%d %H:%M:%S.") + f"{_n.microsecond//1000:03d}"
                 self.cyc_wr.writerow([f"{t:.2f}", f"{temp:.2f}", f"{sa:.2f}",
                                      f"{st:.2f}", pwm, f"{pwm*100/255:.1f}",
@@ -3761,11 +4233,17 @@ class PeltierControl:
         had_data = self.cyc_on and getattr(self, 'cyc_rows', 0) > 0
         tmp_path = self.cyc_fn
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
-        print(f"CYC STOP: {reason} ({getattr(self,'cyc_rows',0)} próbek)")
+        # We release the sleep lock ONLY when we are not in the middle of a
+        # series - between series legs cyc_stop/_cyc_start fire one right after
+        # the other (see _series_roll_cycle) and it would be a shame to let the
+        # system sleep in that gap.
+        if not getattr(self, 'series_running', False):
+            self._wake_lock(False)
+        print(f"CYC STOP: {reason} ({getattr(self,'cyc_rows',0)} samples)")
         if getattr(self, 'series_skip_archive', False):
-            # Noga "powrot do bazy" w SERII - to nie test, tylko dojazd do
-            # pozycji startowej, wiec nie ma co archiwizowac (patrz komentarz
-            # w _series_launch_cool). Kasujemy plik tymczasowy od razu.
+            # The "return to base" leg in a SERIES - not a test, just an approach
+            # to the starting position, so there is nothing to archive (see the
+            # comment in _series_launch_cool). We delete the temp file right away.
             self.series_skip_archive = False
             if tmp_path and tmp_path.exists():
                 try: tmp_path.unlink()
@@ -3775,31 +4253,31 @@ class PeltierControl:
             hint = self.series_name_hint
             self.series_name_hint = None
             if hint:
-                # SERIA: zapisz od razu pod czytelna nazwa, BEZ modalnego
-                # okna (ktore by zablokowalo dalsze automatyczne kroki -
-                # nikt nie stoi przy komputerze zeby je zamknac).
+                # SERIES: save it right away under a readable name, WITHOUT a
+                # modal window (which would block the following automatic steps -
+                # nobody is standing at the computer to close it).
                 self.root.after(0, lambda: self.save_cycle_as(tmp_path, hint))
             else:
-                # Zapytaj o nazwe i zapisz do archiwum (w watku GUI)
+                # Ask for a name and save to the archive (in the GUI thread)
                 self.root.after(0, lambda: self._ask_save_name(tmp_path))
         elif tmp_path and tmp_path.exists():
-            # Brak danych - usun plik tymczasowy
+            # No data - delete the temporary file
             try: tmp_path.unlink()
             except: pass
 
     def _ask_save_name(self, tmp_path):
-        """Okno z pytaniem o nazwe cyklu do archiwum"""
+        """Window asking for the run name for the archive"""
         SaveCycleDialog(self.root, self, tmp_path)
 
     # ════════════════════════════════════════════════════════
-    #  SERIA POMIAROW - automatyczny ciag testow SP/RATE bez
-    #  reki na klawiaturze miedzy kolejnymi testami. Kazdy test to:
-    #    1) grzanie do SP z dana rampa (HEAT RATE) - do "dojechania"
-    #       (uzywa tej samej logiki reach_done co karty na CONTROL)
-    #    2) trzymanie na SP przez hold_s sekund (widac tam fale/lag)
-    #    3) STOP -> archiwizacja pod czytelna nazwa (bez pytania)
-    #    4) powrot do temperatury bazowej (COOL RATE z panelu) przed
-    #       kolejnym testem, zeby kazdy start byl z tego samego punktu
+    #  MEASUREMENT SERIES - an automatic sequence of SP/RATE tests with no
+    #  hand on the keyboard between consecutive tests. Each test is:
+    #    1) heating to SP with the given ramp (HEAT RATE) - until "reached"
+    #       (uses the same reach_done logic as the cards on CONTROL)
+    #    2) holding at SP for hold_s seconds (oscillation/lag is visible there)
+    #    3) STOP -> archiving under a readable name (without asking)
+    #    4) return to the base temperature (COOL RATE from the panel) before
+    #       the next test, so that every start is from the same point
     # ════════════════════════════════════════════════════════
     def series_add_step(self, sp, rate, hold_s):
         self.series_steps.append({'sp': float(sp), 'rate': float(rate), 'hold_s': float(hold_s)})
@@ -3822,21 +4300,21 @@ class PeltierControl:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
         if not self.series_steps:
-            messagebox.showwarning("Pusta seria", "Dodaj przynajmniej jeden test do listy.")
+            messagebox.showwarning("Empty series", "Add at least one test to the list.")
             return
         if self.series_running:
             return
         self.series_running = True
         self.series_idx = 0
-        # Zapamietaj COOL RATE z panelu CONTROL - powrot miedzy testami
-        # uzywa WLASNEGO, szybkiego tempa (patrz _series_launch_cool),
-        # niezaleznie od tego co user ma ustawione do prawdziwych testow.
-        # Przywracamy oryginal po zakonczeniu/przerwaniu serii.
+        # Remember the COOL RATE from the CONTROL panel - the return between
+        # tests uses ITS OWN fast rate (see _series_launch_cool), regardless of
+        # what the user has set for the real tests.
+        # We restore the original after the series finishes/is aborted.
         self._series_saved_rd = self.sl_rd.get()
-        self._series_status(f"Start serii: {len(self.series_steps)} testow")
+        self._series_status(f"Series start: {len(self.series_steps)} tests")
         self._series_launch_heat(self.series_idx)
         if hasattr(self, 'btn_series_run'):
-            self.btn_series_run.config(text="■ STOP SERII", bg=C['red'])
+            self.btn_series_run.config(text="■ STOP SERIES", bg=C['red'])
 
     def _series_restore_rd(self):
         saved = getattr(self, '_series_saved_rd', None)
@@ -3852,33 +4330,39 @@ class PeltierControl:
         self.series_phase = None
         self.series_name_hint = None
         self.series_skip_archive = False
+        if not self.cyc_on:
+            self._wake_lock(False)
         self._series_restore_rd()
-        self._series_status(f"Seria przerwana ({reason})" if reason else "Seria przerwana")
+        self._series_status(f"Series aborted ({reason})" if reason else "Series aborted")
         if hasattr(self, 'btn_series_run'):
-            self.btn_series_run.config(text="▶ START SERII", bg=C['green'])
+            self.btn_series_run.config(text="▶ START SERIES", bg=C['green'])
 
     def _series_finish(self):
         self.series_running = False
         self.series_leg = None
         self.series_phase = None
+        # Series finished - if no single run is in progress any more, we can
+        # give the system back the right to sleep (see _wake_lock).
+        if not self.cyc_on:
+            self._wake_lock(False)
         self._series_restore_rd()
-        self._series_status(f"Seria zakonczona - {len(self.series_steps)} testow, pliki w PeltierLogi")
+        self._series_status(f"Series finished - {len(self.series_steps)} tests, files in PeltierLogi")
         if hasattr(self, 'btn_series_run'):
-            self.btn_series_run.config(text="▶ START SERII", bg=C['green'])
+            self.btn_series_run.config(text="▶ START SERIES", bg=C['green'])
 
     def _series_status(self, text):
-        print(f"SERIA: {text}")
+        print(f"SERIES: {text}")
         if hasattr(self, 'series_status_lbl'):
             self.series_status_lbl.config(text=text)
 
     def _series_save_prog(self):
-        """Zapisz liste krokow do pliku JSON (program przebiegu)."""
+        """Save the step list to a JSON file (run program)."""
         if not self.series_steps:
-            messagebox.showinfo("Pusty program", "Najpierw dodaj kroki.")
+            messagebox.showinfo("Empty program", "Add steps first.")
             return
         from tkinter import filedialog
         dest = filedialog.asksaveasfilename(
-            title="Zapisz program", defaultextension=".json",
+            title="Save program", defaultextension=".json",
             initialdir=str(self.log_dir),
             initialfile=datetime.now().strftime("program_%Y-%m-%d.json"),
             filetypes=[("Program (JSON)", "*.json"), ("All files", "*.*")])
@@ -3889,15 +4373,15 @@ class PeltierControl:
                 json.dump({'tryb': self.series_mode.get(),
                            'baza': self.series_base_sp,
                            'kroki': self.series_steps}, f, indent=2)
-            self._series_status(f"Program zapisany: {dest}")
+            self._series_status(f"Program saved: {dest}")
         except Exception as e:
-            messagebox.showerror("Zapis programu", str(e))
+            messagebox.showerror("Save program", str(e))
 
     def _series_load_prog(self):
-        """Wczytaj liste krokow z pliku JSON."""
+        """Load the step list from a JSON file."""
         from tkinter import filedialog
         src = filedialog.askopenfilename(
-            title="Wczytaj program", initialdir=str(self.log_dir),
+            title="Load program", initialdir=str(self.log_dir),
             filetypes=[("Program (JSON)", "*.json"), ("All files", "*.*")])
         if not src:
             return
@@ -3910,7 +4394,7 @@ class PeltierControl:
                 clean.append(dict(sp=float(st['sp']), rate=float(st['rate']),
                                   hold_s=float(st.get('hold_s', 60))))
             if not clean:
-                messagebox.showwarning("Program", "Plik nie zawiera krokow.")
+                messagebox.showwarning("Program", "The file contains no steps.")
                 return
             self.series_steps = clean
             if d.get('tryb') in ('seria', 'program'):
@@ -3921,69 +4405,70 @@ class PeltierControl:
                     self.series_e_base.delete(0, 'end')
                     self.series_e_base.insert(0, f"{self.series_base_sp:.1f}")
             self._series_refresh_list()
-            self._series_status(f"Wczytano program: {len(clean)} krokow")
+            self._series_status(f"Program loaded: {len(clean)} steps")
         except Exception as e:
-            messagebox.showerror("Wczytanie programu", str(e))
+            messagebox.showerror("Load program", str(e))
 
     def _series_roll_cycle(self, hint):
-        """Zamknij BIEZACY plik cyklu pod nazwa `hint` i od razu otworz nowy -
-        BEZ zatrzymywania regulatora.
+        """Close the CURRENT run file under the name `hint` and immediately open
+        a new one - WITHOUT stopping the controller.
 
-        Wczesniej kazda noga serii byla zamykana przez STOP, bo tylko przejscie
-        AUTO->MAN zamykalo plik cyklu. To wymuszalo przerwe w regulacji -
-        patrz komentarz przy _series_switch_leg.
+        Previously every series leg was closed with STOP, because only an
+        AUTO->MAN transition closed the run file. That forced a break in control -
+        see the comment at _series_switch_leg.
         """
         self.series_name_hint = hint
-        self.cyc_stop("koniec nogi serii")
+        self.cyc_stop("end of series leg")
         temp0 = self.temp[-1] if self.temp else 0.0
         self._cyc_start(temp0)
 
     def _series_switch_leg(self, sp, ru=None, rd=None):
-        """Przelacz serie na nowy cel BEZ STOP/START - regulator zostaje w AUTO.
+        """Switch the series to a new target WITHOUT STOP/START - the controller stays in AUTO.
 
-        DLACZEGO (zgloszenie: "rampa chlodzenia zaczyna sie pozniej niz koniec
-        rampy grzania, a linia SP jest duzo nizej"):
-        Poprzednio miedzy nogami szlo STOP -> 600 ms -> START. Firmware na
-        STOP przechodzi w MAN i ZERUJE moc, a na START wykonuje spA=lT, czyli
-        ustawia setpoint aktywny na BIEZACY pomiar. Pomiar w tym czasie zdazyl
-        juz opasc, bo grzalka/powierzchnia Peltiera ma mala bezwladnosc i po
-        odcieciu ~60 jednostek PWM stygnie blyskawicznie.
-        Zmierzone na prawdziwych logach (5 przejsc, koniec grzania -> start
-        zjazdu): przerwa 1.4-1.7 s, a w tym czasie temperatura spadala o
-        5.6-7.0 C (50.1-50.6 -> 43.1-44.6). Dlatego rampa zjazdu startowala
-        od ~44-47 C zamiast od 50 C - dokladnie to "linia SP duzo nizej" i
-        widoczna dziura miedzy koncem grzania a poczatkiem chlodzenia.
+        WHY (report: "the cooling ramp starts later than the end of the heating
+        ramp, and the SP line is much lower"):
+        Previously, between legs it went STOP -> 600 ms -> START. On STOP the
+        firmware goes to MAN and ZEROES the power, and on START it does spA=lT,
+        i.e. it sets the active setpoint to the CURRENT reading. In that time the
+        reading had already dropped, because the heater/Peltier surface has low
+        inertia and after cutting ~60 PWM units it cools down instantly.
+        Measured on real logs (5 transitions, end of heating -> start of the
+        descent): a gap of 1.4-1.7 s, during which the temperature fell by
+        5.6-7.0 C (50.1-50.6 -> 43.1-44.6). That is why the descent ramp started
+        from ~44-47 C instead of from 50 C - exactly the "SP line much lower" and
+        the visible hole between the end of heating and the start of cooling.
 
-        Firmware obsluguje SP/RU/RD w trakcie AUTO (zmieniaja tylko cel i
-        tempa), a START robi cokolwiek TYLKO gdy sys==MAN. Wystarczy wiec nie
-        wychodzic z AUTO: spA plynnie przechodzi z 50 w dol, bez zerowania
-        mocy, bez przerwy i bez skoku setpointu.
+        The firmware handles SP/RU/RD during AUTO (they only change the target and
+        the rates), and START does anything ONLY when sys==MAN. So it is enough not
+        to leave AUTO: spA transitions smoothly from 50 downwards, without zeroing
+        the power, without a break and without a setpoint jump.
         """
         if ru is not None:
             self.send(f"RU:{ru:.1f}")
         if rd is not None:
             self.send(f"RD:{rd:.1f}")
         self.send(f"SP:{sp:.1f}")
-        # Statystyki dojscia licza sie od nowa dla kazdej nogi. UWAGA: do_start
-        # ZERUJE reach_start_t, bo tam zaraz nastapi przejscie MAN->AUTO, ktore
-        # je ustawia. Tu takiego przejscia NIE BEDZIE (zostajemy w AUTO), wiec
-        # trzeba ustawic je SAMEMU - inaczej warunek wykrywania dojazdu w tick()
-        # (wymaga reach_start_t is not None) nigdy by nie zadzialal i noga
-        # wisialaby az do timeoutu.
+        # The approach statistics are counted from scratch for every leg. NOTE:
+        # do_start ZEROES reach_start_t, because a MAN->AUTO transition follows
+        # right there, which sets it. Here there will be NO such transition (we
+        # stay in AUTO), so it has to be set MANUALLY - otherwise the approach
+        # detection condition in tick() (which requires reach_start_t is not None)
+        # would never fire and the leg would hang until the timeout.
         now = self.t[-1] if self.t else time.time()
         cur = self.temp[-1] if self.temp else None
         self.reach_start_t = now
         self.reach_start_temp = cur
         self.reach_target = sp
         self.reach_done = False
+        self.reach_in_tol_t = None
         self.reach_time = None
         self.reach_avg_rate = None
         self.reach_dir = None
-        # None CELOWO: automatyczne wykrywanie zmiany setpointu w tick()
-        # porownuje telemetryczne 'st' z ta wartoscia, a przez chwile po
-        # wyslaniu SP telemetria niesie jeszcze STARY setpoint - wpisanie tu
-        # nowego celu wyzwoliloby falszywe "setpoint zmieniony" i zresetowalo
-        # dopiero co ustawione liczniki. Seria i tak sama steruje setpointem.
+        # None DELIBERATELY: the automatic setpoint-change detection in tick()
+        # compares the telemetry 'st' against this value, and for a moment after
+        # sending SP the telemetry still carries the OLD setpoint - writing the
+        # new target here would trigger a false "setpoint changed" and reset the
+        # counters we have just set. The series steers the setpoint itself anyway.
         self.last_setpoint_target = None
         self._last_reach_summary = None
         self._ramp_reset(now, cur, sp)
@@ -3991,10 +4476,10 @@ class PeltierControl:
 
     def _series_launch_heat(self, idx):
         if not self.connected:
-            # Automatyczna seria dziala BEZ nadzoru - nie zostawiamy modalnego
-            # okna "not connected" zawieszonego w powietrzu, tylko po prostu
-            # przerywamy z czytelnym statusem.
-            self._series_abort("utracono polaczenie z urzadzeniem")
+            # The automatic series runs UNATTENDED - we do not leave a modal
+            # "not connected" window hanging in mid-air, we simply abort with a
+            # readable status.
+            self._series_abort("lost connection to the device")
             return
         step = self.series_steps[idx]
         self.sl_sp.set(step['sp'])
@@ -4005,19 +4490,19 @@ class PeltierControl:
         self.series_phase_t0 = time.time()
         self._series_status(
             f"Test {idx+1}/{len(self.series_steps)}: SP={step['sp']:.1f}°C "
-            f"RATE={step['rate']:.1f}°C/min - grzanie...")
+            f"RATE={step['rate']:.1f}°C/min - heating...")
 
     def _series_launch_cool(self):
         if not self.connected:
-            self._series_abort("utracono polaczenie z urzadzeniem")
+            self._series_abort("lost connection to the device")
             return
         try:
             return_rate = float(self.series_e_return_rate.get().replace(',', '.'))
         except (ValueError, AttributeError):
-            return_rate = 80.0  # bezpieczny fallback = domyslny "max" (patrz build_series)
-        # Tryb "zjazd tez jako TEST" - zjezdzamy w tempie tego samego kroku
-        # serii co grzanie, zeby zebrac dane do kalibracji chlodzenia
-        # (patrz komentarz przy self.series_cool_as_test w build_series).
+            return_rate = 80.0  # safe fallback = the default "max" (see build_series)
+        # The "descent also as a TEST" mode - we descend at the rate of the same
+        # series step as the heating, in order to collect data for cooling
+        # calibration (see the comment at self.series_cool_as_test in build_series).
         cool_is_test = False
         try:
             cool_is_test = bool(self.series_cool_as_test.get())
@@ -4025,37 +4510,37 @@ class PeltierControl:
             pass
         if cool_is_test and self.series_idx < len(self.series_steps):
             return_rate = self.series_steps[self.series_idx]['rate']
-        # Wlasne SZYBKIE tempo powrotu, NIEZALEZNE od COOL RATE na CONTROL -
-        # powrot miedzy testami to tylko "dojazd do pozycji startowej", nie
-        # sam test, wiec nie ma powodu robic go w tempie eksperymentu.
+        # Its own FAST return rate, INDEPENDENT of the COOL RATE on CONTROL -
+        # the return between tests is only an "approach to the starting position",
+        # not the test itself, so there is no reason to do it at the experiment rate.
         self.sl_rd.set(return_rate)
         self.sl_sp.set(self.series_base_sp)
-        # PLYNNE przejscie grzanie -> chlodzenie: BEZ STOP/START (patrz
-        # _series_switch_leg). Zjazd zaczyna sie dokladnie tam, gdzie
-        # skonczylo sie grzanie.
+        # SMOOTH heating -> cooling transition: WITHOUT STOP/START (see
+        # _series_switch_leg). The descent starts exactly where the heating
+        # finished.
         self._series_switch_leg(self.series_base_sp, rd=return_rate)
         self.series_leg = 'cool'
         self.series_phase = 'ramping'
         self.series_phase_t0 = time.time()
-        # WCZESNIEJ: powrot byl uznany za "nie dane do analizy" i pomijany
-        # (series_skip_archive=True), zeby nie zaśmiecac PeltierLogi. Po
-        # uwadze uzytkownika o niedobrym wygladzie CHLODZENIA ("wolalbym aby
-        # schodzilo rowno z setpointem aktualnym") - a ten wlasnie leg jest
-        # jedyna nasza rampa w dol - TERAZ archiwizujemy go tak samo jak
-        # grzanie, zeby miec realne dane do analizy zamiast zgadywac.
+        # PREVIOUSLY: the return was treated as "not data for analysis" and
+        # skipped (series_skip_archive=True), so as not to clutter PeltierLogi.
+        # After the user's remark about the poor look of COOLING ("I would prefer
+        # it to descend evenly with the active setpoint") - and this leg is
+        # precisely our only downward ramp - we NOW archive it just like the
+        # heating, so that we have real data to analyse instead of guessing.
         self.series_skip_archive = False
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Prefiks TEST vs POWROT w nazwie pliku, zeby dalo sie jednym
-        # spojrzeniem (i jednym filtrem przy analizie) odroznic zjazd
-        # zrobiony jako pelnoprawny test od zwyklego dojazdu do bazy.
+        # A TEST vs RETURN prefix in the file name, so that at a single glance
+        # (and with a single filter during analysis) one can tell a descent done
+        # as a full-blown test from an ordinary approach to the base.
         kind = "cooltest" if cool_is_test else "cool"
         self.series_name_hint = (
             f"seria_{kind}_toSP{self.series_base_sp:.0f}_R{return_rate:.0f}_{ts}")
-        lbl = "ZJAZD-TEST" if cool_is_test else "Powrot"
-        self._series_status(f"{lbl} do {self.series_base_sp:.1f}°C (tempo {return_rate:.0f}°C/min)...")
+        lbl = "DESCENT-TEST" if cool_is_test else "Return"
+        self._series_status(f"{lbl} to {self.series_base_sp:.1f}°C (rate {return_rate:.0f}°C/min)...")
 
     def _series_tick(self):
-        """Wywolywane z glownego tick() (co ok. 250ms) gdy seria aktywna."""
+        """Called from the main tick() (about every 250ms) when a series is active."""
         if not self.series_running or self.series_idx >= len(self.series_steps):
             return
         now = time.time()
@@ -4067,9 +4552,9 @@ class PeltierControl:
                 self.series_phase_t0 = now
                 self._series_status(
                     f"Test {self.series_idx+1}/{len(self.series_steps)}: "
-                    f"dojechano do SP={step['sp']:.1f} - trzymanie {step['hold_s']:.0f}s")
+                    f"reached SP={step['sp']:.1f} - hold {step['hold_s']:.0f}s")
             elif now - self.series_phase_t0 > SERIES_HEAT_TIMEOUT_S:
-                self._series_status(f"Test {self.series_idx+1}: TIMEOUT dojazdu - koncze ten test")
+                self._series_status(f"Test {self.series_idx+1}: approach TIMEOUT - ending this test")
                 self._series_end_heat_leg(tag="TIMEOUT")
 
         elif self.series_leg == 'heat' and self.series_phase == 'holding':
@@ -4077,31 +4562,53 @@ class PeltierControl:
             remaining = max(0, step['hold_s'] - elapsed)
             self._series_status(
                 f"Test {self.series_idx+1}/{len(self.series_steps)}: "
-                f"trzymanie SP={step['sp']:.1f} - jeszcze {remaining:.0f}s")
+                f"holding SP={step['sp']:.1f} - {remaining:.0f}s left")
             if elapsed >= step['hold_s']:
                 self._series_end_heat_leg(tag="OK")
 
         elif self.series_leg == 'cool' and self.series_phase == 'ramping':
-            if self.reach_done or (now - self.series_phase_t0 > SERIES_COOL_TIMEOUT_S):
+            # Up to .13 the descent ended EXACTLY here - at the moment of
+            # reaching, without a single hold sample (see the comment at
+            # REACH_TOL_C). Now it gets a hold phase just like the heating, so
+            # that the tail is visible in the log: whether the temperature
+            # actually settles on the target and whether it crosses it.
+            if self.reach_done:
+                self.series_phase = 'holding'
+                self.series_phase_t0 = now
+                self._series_status(
+                    f"Descent {self.series_idx+1}/{len(self.series_steps)}: "
+                    f"reached {self.series_base_sp:.1f} - hold "
+                    f"{step['hold_s']:.0f}s")
+            elif now - self.series_phase_t0 > SERIES_COOL_TIMEOUT_S:
+                self._series_status(f"Descent {self.series_idx+1}: approach TIMEOUT - ending")
+                self._series_end_cool_leg()
+
+        elif self.series_leg == 'cool' and self.series_phase == 'holding':
+            elapsed = now - self.series_phase_t0
+            remaining = max(0, step['hold_s'] - elapsed)
+            self._series_status(
+                f"Descent {self.series_idx+1}/{len(self.series_steps)}: "
+                f"holding {self.series_base_sp:.1f} - {remaining:.0f}s left")
+            if elapsed >= step['hold_s']:
                 self._series_end_cool_leg()
 
     def _series_end_heat_leg(self, tag="OK"):
-        # BLAD ktory to powodowal (znaleziony po zgloszeniu "10/40/70 zamiast
-        # calej listy"): tick() leci co 250ms, ale nastepny krok byl
-        # planowany z opoznieniem 600ms (root.after) - a warunek, ktory tu
-        # wprowadza (reach_done / uplyniety hold_s), zostawal PRAWDZIWY przez
-        # cale te 600ms. Efekt: tick() wywolywal ta funkcje 2-3 razy zanim
-        # faza faktycznie sie zmienila, kazde wywolanie planowalo WLASNY
-        # _series_advance - serie_idx skakal o 2-3 zamiast o 1 (dlatego z
-        # listy 10/20/30/40/50/60/70 realnie leciały tylko 10, 40, 70 -
-        # skok o 3 kazdorazowo). Naprawa: ustawiamy sentinel 'ending' OD
-        # RAZU (synchronicznie), zeby warunek w tick() przestal pasowac
-        # natychmiast, a nie dopiero po 600ms.
+        # THE BUG that caused this (found after the report "10/40/70 instead of
+        # the whole list"): tick() runs every 250ms, but the next step was
+        # scheduled with a 600ms delay (root.after) - and the condition that
+        # leads here (reach_done / hold_s elapsed) stayed TRUE for that whole
+        # 600ms. Effect: tick() called this function 2-3 times before the phase
+        # actually changed, and each call scheduled its OWN _series_advance -
+        # series_idx jumped by 2-3 instead of by 1 (which is why out of the list
+        # 10/20/30/40/50/60/70 only 10, 40, 70 actually ran - a jump of 3 every
+        # time). Fix: we set the 'ending' sentinel IMMEDIATELY (synchronously),
+        # so that the condition in tick() stops matching at once rather than
+        # only after 600ms.
         self.series_phase = 'ending'
         step = self.series_steps[self.series_idx]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # W trybie PROGRAM nazwa niesie numer kroku - inaczej kolejne kroki o
-        # tym samym SP bylyby nie do odroznienia w archiwum.
+        # In PROGRAM mode the name carries the step number - otherwise consecutive
+        # steps with the same SP would be indistinguishable in the archive.
         try: _prog = (self.series_mode.get() == 'program')
         except AttributeError: _prog = False
         if _prog:
@@ -4114,9 +4621,9 @@ class PeltierControl:
         except AttributeError: pass
         nxt = self.series_idx + 1
         if prog:
-            # PROGRAM: zadnego powrotu do bazy - nastepny krok startuje
-            # dokladnie tam, gdzie skonczyl sie poprzedni (plynnie, bez
-            # STOP/START - patrz _series_switch_leg).
+            # PROGRAM: no return to base - the next step starts exactly where
+            # the previous one finished (smoothly, without STOP/START - see
+            # _series_switch_leg).
             if nxt < len(self.series_steps) and self.connected:
                 self._series_roll_cycle(hint)
                 self.series_idx = nxt
@@ -4129,12 +4636,12 @@ class PeltierControl:
                 self._series_switch_leg(nstep['sp'],
                                         rd=(nstep['rate'] if down else None),
                                         ru=(None if down else nstep['rate']))
-                self.series_leg = 'heat'      # 'heat' = noga zadana krokiem
+                self.series_leg = 'heat'      # 'heat' = the leg commanded by the step
                 self.series_phase = 'ramping'
                 self.series_phase_t0 = time.time()
                 self._series_status(
-                    f"Krok {nxt+1}/{len(self.series_steps)}: "
-                    f"{'zjazd' if down else 'dojazd'} do {nstep['sp']:.1f}°C "
+                    f"Step {nxt+1}/{len(self.series_steps)}: "
+                    f"{'descent' if down else 'approach'} to {nstep['sp']:.1f}°C "
                     f"@ {nstep['rate']:.0f}°C/min")
             else:
                 self.series_name_hint = hint
@@ -4142,33 +4649,33 @@ class PeltierControl:
                 self._update_run_button(False)
                 self.root.after(600, self._series_advance)
         elif abs(self.series_base_sp - step['sp']) > 0.5:
-            # PLYNNIE: zamykamy plik grzania i od razu otwieramy plik zjazdu,
-            # NIE wychodzac z AUTO - dzieki temu poczatek zjazdu = koniec
-            # grzania (patrz _series_switch_leg).
+            # SMOOTHLY: we close the heating file and immediately open the
+            # descent file, WITHOUT leaving AUTO - thanks to that the start of
+            # the descent = the end of the heating (see _series_switch_leg).
             self._series_roll_cycle(hint)
             self.series_leg = 'cool'
             self._series_launch_cool()
         else:
-            # Cel = baza, wiec nie ma nogi zjazdu - tu konczymy naprawde.
+            # Target = base, so there is no descent leg - here we really finish.
             self.series_name_hint = hint
             self.send("STOP")
             self._update_run_button(False)
             self.root.after(600, self._series_advance)
 
     def _series_end_cool_leg(self):
-        # Ten sam sentinel-guard co w _series_end_heat_leg - patrz komentarz
-        # tam. Tu byl WLASCIWY zrodlowy bug (reach_done zostawal True przez
-        # cale 600ms bez tego), bo kazdy test w tej serii mial base_sp!=SP,
-        # wiec ZAWSZE przechodzil przez noge 'cool'.
+        # The same sentinel guard as in _series_end_heat_leg - see the comment
+        # there. This was the ACTUAL source of the bug (reach_done stayed True
+        # for the whole 600ms without it), because every test in this series had
+        # base_sp!=SP, so it ALWAYS went through the 'cool' leg.
         self.series_phase = 'ending'
-        # series_name_hint juz ustawiony w _series_launch_cool - plik zjazdu
-        # archiwizuje sie pod nazwa "seria_cool_/cooltest_..." (chlodzenie
-        # tez jest danymi - patrz komentarz przy _series_launch_cool).
+        # series_name_hint is already set in _series_launch_cool - the descent
+        # file is archived under the name "seria_cool_/cooltest_..." (cooling is
+        # data too - see the comment at _series_launch_cool).
         nxt = self.series_idx + 1
         if nxt < len(self.series_steps) and self.connected:
-            # Jest kolejny test - przechodzimy PLYNNIE, bez STOP/START, wiec
-            # nastepna rampa grzania startuje dokladnie tam, gdzie skonczyl
-            # sie zjazd (patrz _series_switch_leg).
+            # There is another test - we transition SMOOTHLY, without STOP/START,
+            # so the next heating ramp starts exactly where the descent finished
+            # (see _series_switch_leg).
             self._series_roll_cycle(self.series_name_hint)
             self.series_idx = nxt
             step = self.series_steps[nxt]
@@ -4180,9 +4687,9 @@ class PeltierControl:
             self.series_phase_t0 = time.time()
             self._series_status(
                 f"Test {nxt+1}/{len(self.series_steps)}: SP={step['sp']:.1f}°C "
-                f"RATE={step['rate']:.1f}°C/min - grzanie...")
+                f"RATE={step['rate']:.1f}°C/min - heating...")
         else:
-            # Ostatni krok (albo utrata polaczenia) - tu naprawde zatrzymujemy.
+            # Last step (or a lost connection) - here we really do stop.
             self.send("STOP")
             self._update_run_button(False)
             self.root.after(600, self._series_advance)
@@ -4199,37 +4706,37 @@ class PeltierControl:
             self._series_launch_heat(self.series_idx)
 
     def save_cycle_as(self, tmp_path, name):
-        """Zapisz cykl pod nazwa = opis uzytkownika (timestamp tylko przy duplikacie)"""
+        """Save the run under a name = the user's description (timestamp only on a duplicate)"""
         import re as _re
-        # Zachowaj czytelny opis: pozwol na spacje, myslniki, podkreslenia
+        # Keep a readable description: allow spaces, hyphens, underscores
         clean = name.strip()
         safe = _re.sub(r'[^\w\-\s]', '', clean).strip()
         safe = _re.sub(r'\s+', '_', safe) or "cykl"
-        # Plik: prefix c_ (do wyszukiwania w archiwum) + opis
+        # File: prefix c_ (for searching the archive) + description
         dest = self.log_dir / f"c_{safe}.csv"
-        # Jesli istnieje - dodaj timestamp zeby nie nadpisac
+        # If it exists - add a timestamp so as not to overwrite
         if dest.exists():
             ts = datetime.now().strftime("%m%d_%H%M")
             dest = self.log_dir / f"c_{safe}_{ts}.csv"
         try:
             tmp_path.rename(dest)
-            print(f"Zapisano cykl: {dest.name}")
+            print(f"Run saved: {dest.name}")
         except Exception as e:
-            print(f"Blad zapisu: {e}")
+            print(f"Save error: {e}")
         if hasattr(self, 'refresh_arch'):
             try: self.refresh_arch()
             except: pass
 
     def discard_cycle(self, tmp_path):
-        """Odrzuc cykl - usun plik tymczasowy"""
+        """Discard the run - delete the temporary file"""
         try:
             if tmp_path.exists(): tmp_path.unlink()
-            print("Cykl odrzucony")
+            print("Run discarded")
         except: pass
 
 
 # ════════════════════════════════════════════════════════
-#  DIALOG WYBORU ZAKRESU AUTO-KALIBRACJI
+#  AUTO-CALIBRATION RANGE SELECTION DIALOG
 # ════════════════════════════════════════════════════════
 class CalRangeDialog:
     def __init__(self, parent, app):
@@ -4242,14 +4749,14 @@ class CalRangeDialog:
         self.win.grab_set()
 
         tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
-        # Pasek przyciskow PRZYPIETY NA DOLE OKNA, poza obszarem przewijania -
-        # wczesniej START/CANCEL byly na koncu dlugiej listy w 'inner' i przy
-        # mniejszym oknie (albo wiekszych fontach) wychodzily poza ekran, wiec
-        # nie dalo sie kliknac "START CALIBRATION".
+        # The button bar is PINNED AT THE BOTTOM OF THE WINDOW, outside the
+        # scrolling area - previously START/CANCEL were at the end of a long list
+        # in 'inner' and with a smaller window (or larger fonts) they went off
+        # screen, so "START CALIBRATION" could not be clicked.
         self._btnbar = tk.Frame(self.win, bg=C['bg'])
         self._btnbar.pack(side='bottom', fill='x', padx=24, pady=(0, 16))
-        # Reszta tresci przewijalna - gwarantuje dostep do kazdego pola
-        # niezaleznie od DPI i rozmiaru okna.
+        # The rest of the content scrolls - this guarantees access to every field
+        # regardless of DPI and window size.
         inner = make_scrollable(self.win, C['bg'], padx=24, pady=20)
 
         tk.Label(inner, text="AUTO-CALIBRATION RANGE", bg=C['bg'], fg=C['text'],
@@ -4257,7 +4764,7 @@ class CalRangeDialog:
         tk.Label(inner, text="Select temperature range and ramps to calibrate",
                  bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
 
-        # Zakres temperatur - suwaki
+        # Temperature range - sliders
         tmin0 = getattr(app, 'dev_cal_min', 50.0)
         tmax0 = getattr(app, 'dev_cal_max', 100.0)
 
@@ -4268,20 +4775,20 @@ class CalRangeDialog:
 
         tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(4, 8))
 
-        # Krok temperatury (info - firmware uzywa co 10C)
+        # Temperature step (info - the firmware uses every 10C)
         tk.Label(inner, text="TEMP STEP: 10°C (fixed)", bg=C['bg'], fg=C['dim2'],
                  font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 12))
 
-        # MAX RATE - suwak (do 80)
+        # MAX RATE - slider (up to 80)
         self.sl_maxrate = SliderField(inner, "MAX RATE", 5, 80, 40,
                                       C['yellow'], "°C/min", 0,
                                       on_change=lambda v: self._update_estimate())
 
-        # KROK RATE - wybor 5/10/20/40
+        # RATE STEP - choice of 5/10/20/40
         tk.Label(inner, text="RATE STEP [°C/min]:", bg=C['bg'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(8, 6))
 
-        self.rate_step = 5  # domyslny krok
+        self.rate_step = 5  # default step
         self.step_btns = {}
         step_frame = tk.Frame(inner, bg=C['bg'])
         step_frame.pack(fill='x', pady=(0, 12))
@@ -4294,10 +4801,10 @@ class CalRangeDialog:
             b.pack(side='left', padx=4, fill='x', expand=True)
             self.step_btns[st] = b
 
-        # RECOMMENDED - lista ramp nie da sie wyrazic rownym krokiem (5, potem
-        # co 10 az do 80) - to dokladnie domyslna lista z firmware
-        # (calRamps[]). Osobny przycisk zamiast probowac to wcisnac w
-        # KROK RATE powyzej.
+        # RECOMMENDED - the ramp list cannot be expressed with a uniform step
+        # (5, then every 10 up to 80) - this is exactly the default list from the
+        # firmware (calRamps[]). A separate button instead of trying to squeeze
+        # it into the RATE STEP above.
         self.custom_ramps = None
         self.btn_recommended = tk.Button(
             inner, text="RECOMMENDED (5/10/20/30/40/50/60/70/80 °C/min)",
@@ -4307,18 +4814,18 @@ class CalRangeDialog:
             activebackground=C['panel3'])
         self.btn_recommended.pack(fill='x', pady=(6, 0))
 
-        # Podglad generowanej listy ramp
+        # Preview of the generated ramp list
         self.ramps_preview = tk.Label(inner, text="", bg=C['bg'], fg=C['cyan'],
                                      font=(FONT, fsz(10)))
         self.ramps_preview.pack(anchor='w', pady=(0, 8))
 
-        # Szacowany czas
+        # Estimated time
         self.est_lbl = tk.Label(inner, text="", bg=C['bg'], fg=C['yellow'],
                                font=(FONT, fsz(10), 'bold'))
         self.est_lbl.pack(anchor='w', pady=(0, 12))
-        self._use_recommended_ramps()  # domyslnie wybrana (zamiast _set_step(10)) - woala tez _update_estimate()
+        self._use_recommended_ramps()  # selected by default (instead of _set_step(10)) - it also called _update_estimate()
 
-        # Przyciski - w przypietym pasku na dole okna (patrz self._btnbar)
+        # Buttons - in the bar pinned at the bottom of the window (see self._btnbar)
         bf = self._btnbar
         mk_btn(bf, "▶ START CALIBRATION", self.start, C['purple'], fg='#fff').pack(
             side='left', fill='x', expand=True, padx=(0, 4))
@@ -4326,7 +4833,7 @@ class CalRangeDialog:
             side='left', fill='x', expand=True, padx=(4, 0))
 
     def _set_step(self, step):
-        """Ustaw krok rate (rowny krok) i podswietl przycisk - wylacza RECOMMENDED."""
+        """Set the rate step (uniform step) and highlight the button - disables RECOMMENDED."""
         self.custom_ramps = None
         self.rate_step = step
         for s, b in self.step_btns.items():
@@ -4339,8 +4846,8 @@ class CalRangeDialog:
         self._update_estimate()
 
     def _use_recommended_ramps(self):
-        """Domyslna lista ramp z firmware (5, potem co 10 az do 80) - nie da
-        sie jej wyrazic rownym krokiem, stad osobna sciezka od _set_step."""
+        """The default ramp list from the firmware (5, then every 10 up to 80) -
+        it cannot be expressed with a uniform step, hence a separate path from _set_step."""
         self.custom_ramps = [5, 10, 20, 30, 40, 50, 60, 70, 80]
         for b in self.step_btns.values():
             b.config(bg=C['bg2'], fg=C['dim'])
@@ -4348,8 +4855,8 @@ class CalRangeDialog:
         self._update_estimate()
 
     def _gen_ramps(self):
-        """Generuj liste ramp - albo RECOMMENDED (custom_ramps), albo rowny
-        krok z max+krok. Np. max=20 krok=5 -> [5,10,15,20]"""
+        """Generate the ramp list - either RECOMMENDED (custom_ramps) or a uniform
+        step from max+step. E.g. max=20 step=5 -> [5,10,15,20]"""
         if self.custom_ramps is not None:
             return list(self.custom_ramps)
         try:
@@ -4362,7 +4869,7 @@ class CalRangeDialog:
         while r <= maxr + 0.01 and len(ramps) < 20:
             ramps.append(int(round(r)))
             r += step
-        if not ramps:  # gdy max < krok, uzyj samego max
+        if not ramps:  # when max < step, use max alone
             ramps = [int(round(maxr))]
         return ramps
 
@@ -4372,13 +4879,13 @@ class CalRangeDialog:
             n_temps = max(1, int((tmax - tmin) / 10) + 1)
             ramps = self._gen_ramps()
             n_ramps = len(ramps)
-            # Relay: ok. 2-4 min/temperatura typowo (zalezy jak szybko zlapie
-            # cykle - do 10 min w najgorszym razie). PO relay, test
-            # rampowania per rampa: cofniecie (zwykle <1 min) + 60s test
-            # (jazda+dostrajanie) = ~1.5 min/rampa.
-            total_tests = n_temps * (1 + n_ramps)  # relay + kazda rampa, per temperatura
+            # Relay: about 2-4 min/temperature typically (depends on how quickly
+            # it catches the cycles - up to 10 min in the worst case). AFTER the
+            # relay, a ramping test per ramp: back-off (usually <1 min) + 60s test
+            # (run+tuning) = ~1.5 min/ramp.
+            total_tests = n_temps * (1 + n_ramps)  # relay + each ramp, per temperature
             est_min = n_temps * (3 + n_ramps * 1.5)
-            # Podglad listy ramp
+            # Preview of the ramp list
             if hasattr(self, 'ramps_preview'):
                 self.ramps_preview.config(
                     text=f"Ramps: {', '.join(str(r) for r in ramps)} °C/min")
@@ -4411,13 +4918,12 @@ class CalRangeDialog:
         self.win.destroy()
 
 class CalibrationWindow:
-    # Fazy jednego kroku (kolejnosc = przebieg w firmware): relay najpierw
-    # mierzy bazowy Kp/Ki/Kd dla temperatury, potem rampprep/ramptest leca
-    # w kolko dla kazdej rampy z calRamps (dostrajaja galaz grzania per rampa).
-    PHASES = [('heating', '① Grzanie'), ('stabil', '② Stabilizacja'),
-              ('relay', '③ Relay pomiar'), ('rampprep', '④ Cofanie'),
-              ('ramptest', '⑤ Test rampy')]
-
+    # Phases of one step (order = the sequence in the firmware): relay first
+    # measures the base Kp/Ki/Kd for the temperature, then rampprep/ramptest run
+    # in a loop for every ramp from calRamps (they tune the heating branch per ramp).
+    PHASES = [('heating', '① Heating'), ('stabil', '② Stabilization'),
+              ('relay', '③ Relay measurement'), ('rampprep', '④ Back-off'),
+              ('ramptest', '⑤ Ramp test')]
     def __init__(self, parent, app):
         self.app = app
         self.win = tk.Toplevel(parent)
@@ -4432,35 +4938,35 @@ class CalibrationWindow:
 
         tk.Label(inner, text="CALIBRATION PROGRESS", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(14), 'bold')).pack(anchor='w')
-        tk.Label(inner, text="Relay autotuning — jeden test na temperaturę (wypełnia wszystkie rampy)",
+        tk.Label(inner, text="Relay autotuning — one test per temperature (fills all ramps)",
                  bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 10))
 
-        # Pasek postepu (liczony w temperaturach)
+        # Progress bar (counted in temperatures)
         self.prog_frame = tk.Frame(inner, bg=C['bg2'], height=SC(30))
         self.prog_frame.pack(fill='x', pady=(0, 10))
         self.prog_frame.pack_propagate(False)
         self.prog_bar = tk.Frame(self.prog_frame, bg=C['purple'], height=SC(30))
         self.prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
-        self.prog_text = tk.Label(self.prog_frame, text="0 / 0 temperatur", bg=C['bg2'],
+        self.prog_text = tk.Label(self.prog_frame, text="0 / 0 temperatures", bg=C['bg2'],
                                   fg=C['text'], font=(FONT, fsz(11), 'bold'))
         self.prog_text.place(relx=0.5, rely=0.5, anchor='center')
 
-        # Biezacy krok
+        # Current step
         info = tk.Frame(inner, bg=C['panel'])
         info.pack(fill='x', pady=(0, 10))
         ii = tk.Frame(info, bg=C['panel'])
         ii.pack(fill='x', padx=14, pady=12)
 
         row1 = tk.Frame(ii, bg=C['panel']); row1.pack(fill='x', pady=2)
-        tk.Label(row1, text="TERAZ:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(row1, text="NOW:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
         self.lbl_now = tk.Label(row1, text="—", bg=C['panel'], fg=C['orange'],
                                 font=(FONT, fsz(12), 'bold'), anchor='w')
         self.lbl_now.pack(side='left')
 
-        # Wskaznik fazy: grzanie -> stabilizacja -> relay
+        # Phase indicator: heating -> stabilization -> relay
         phase_row = tk.Frame(ii, bg=C['panel']); phase_row.pack(fill='x', pady=(8, 4))
-        tk.Label(phase_row, text="FAZA:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(phase_row, text="PHASE:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
         self.phase_lbls = {}
         for key, label in self.PHASES:
@@ -4470,30 +4976,30 @@ class CalibrationWindow:
             self.phase_lbls[key] = l
 
         row2 = tk.Frame(ii, bg=C['panel']); row2.pack(fill='x', pady=2)
-        tk.Label(row2, text="NASTĘPNA:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(row2, text="NEXT:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
         self.lbl_next = tk.Label(row2, text="—", bg=C['panel'], fg=C['cyan'],
                                  font=(FONT, fsz(11)), anchor='w')
         self.lbl_next.pack(side='left')
 
         row3 = tk.Frame(ii, bg=C['panel']); row3.pack(fill='x', pady=2)
-        tk.Label(row3, text="POZOSTAŁO:", bg=C['panel'], fg=C['dim2'],
+        tk.Label(row3, text="REMAINING:", bg=C['panel'], fg=C['dim2'],
                  font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
         self.lbl_eta = tk.Label(row3, text="—", bg=C['panel'], fg=C['yellow'],
                                 font=(FONT, fsz(11), 'bold'), anchor='w')
         self.lbl_eta.pack(side='left')
 
-        # Ostrzezenia: punkty gdzie test relay nie zlapal oscylacji i
-        # dostaly wartosci bazowe zamiast realnie zmierzonych (widoczne
-        # tylko tutaj - wczesniej ten fakt trafial WYLACZNIE do surowej
-        # konsoli szeregowej jako "RELAY FAIL - bazowe")
+        # Warnings: points where the relay test did not catch oscillation and
+        # got base values instead of actually measured ones (visible
+        # only here - previously this fact went ONLY to the raw
+        # serial console as "RELAY FAIL - bazowe")
         self.lbl_warn = tk.Label(inner, text="", bg=C['bg'], fg=C['red'],
                                  font=(FONT, fsz(9)), anchor='w', justify='left',
                                  wraplength=580)
         self.lbl_warn.pack(anchor='w', pady=(0, 6))
 
-        # Lista temperatur do kalibracji
-        tk.Label(inner, text="TEMPERATURY", bg=C['bg'], fg=C['dim'],
+        # List of temperatures to calibrate
+        tk.Label(inner, text="TEMPERATURES", bg=C['bg'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(4, 4))
 
         list_wrap = tk.Frame(inner, bg=C['bg2'])
@@ -4516,10 +5022,10 @@ class CalibrationWindow:
         self.refresh()
 
     def _step_label(self, t, r):
-        """Czytelna etykieta kroku. Bezpieczna dla relay, gdzie r jest stringiem
-        (stare formatowanie {r:.0f} wywalalo wyjatek i lista nigdy sie nie budowala)."""
+        """Readable step label. Safe for relay, where r is a string
+        (the old {r:.0f} formatting raised an exception and the list never built)."""
         try:
-            if isinstance(r, str):     # tryb relay: jeden test na temperature
+            if isinstance(r, str):     # relay mode: one test per temperature
                 return f"{t:.0f}°C"
             return f"{t:.0f}°C  @  {r:.0f}°C/min"
         except Exception:
@@ -4531,14 +5037,14 @@ class CalibrationWindow:
         cur = app.cal_current
         phase = getattr(app, 'cal_phase', None)
 
-        # Pasek postepu - liczony tak, zeby NIE skakac na 100% w chwili gdy
-        # ostatni punkt dopiero sie zaczyna (patrz _cal_progress_fraction:
-        # cur/total tego nie odrozniala od "naprawde skonczone").
+        # Progress bar - computed so it does NOT jump to 100% the moment
+        # the last point is only just starting (see _cal_progress_fraction:
+        # cur/total did not distinguish that from "really finished").
         frac = app._cal_progress_fraction()
         self.prog_bar.place_configure(relwidth=min(1.0, frac))
-        self.prog_text.config(text=f"{min(cur, total)} / {total} temperatur")
+        self.prog_text.config(text=f"{min(cur, total)} / {total} temperatures")
 
-        # TERAZ
+        # NOW
         if app.cal_cur_temp is not None:
             tnum = f"   ({cur}/{total})" if cur else ""
             rtxt = ""
@@ -4546,68 +5052,68 @@ class CalibrationWindow:
                 rtxt = f"   @ {app.cal_cur_ramp:.0f}°C/min"
             self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C{tnum}{rtxt}")
         else:
-            self.lbl_now.config(text="— (czekam na urządzenie)")
+            self.lbl_now.config(text="— (waiting for device)")
 
-        # Podswietl aktywna faze
+        # Highlight the active phase
         for key, _ in self.PHASES:
             if key == phase:
                 self.phase_lbls[key].config(bg=C['orange'], fg='#1a1c1f')
             else:
                 self.phase_lbls[key].config(bg=C['bg2'], fg=C['dim2'])
 
-        # NASTEPNA temperatura
+        # NEXT temperature
         if 0 < cur < len(app.cal_plan):
             nt, nr = app.cal_plan[cur]
             self.lbl_next.config(text=self._step_label(nt, nr))
         elif cur >= len(app.cal_plan) and len(app.cal_plan) > 0:
-            self.lbl_next.config(text="(ostatnia)")
+            self.lbl_next.config(text="(last)")
         else:
             self.lbl_next.config(text="—")
 
-        # ETA - "ZAKONCZONO" tylko gdy kalibracja NAPRAWDE sie skonczyla
-        # (cal_running=False), a nie gdy ostatni punkt dopiero sie zaczal.
+        # ETA - "COMPLETED" only when the calibration has REALLY finished
+        # (cal_running=False), not when the last point has only just started.
         if not app.cal_running and cur >= total and total > 0:
-            self.lbl_eta.config(text="ZAKOŃCZONO ✓")
+            self.lbl_eta.config(text="COMPLETED ✓")
         else:
             eta = app._cal_eta()
             if eta is None:
                 self.lbl_eta.config(text="—")
             elif eta < 1:
-                # unikaj mylacego "0 min 0 s" gdy realnie jeszcze pracuje
-                self.lbl_eta.config(text="finalizacja…")
+                # avoid the misleading "0 min 0 s" when it is really still working
+                self.lbl_eta.config(text="finalizing…")
             else:
                 m = int(eta // 60); s = int(eta % 60)
                 self.lbl_eta.config(text=f"~{m} min {s} s")
 
-        # Ostrzezenia o punktach z nieudanym testem relay (wartosci bazowe)
+        # Warnings about points with a failed relay test (base values)
         warns = getattr(app, 'cal_warnings', [])
         lines = []
         if warns:
             def _wtxt(w):
                 t, cycles, amp = w
                 if amp is not None and amp >= 140:
-                    return f"{t:.0f}°C (nawet max. moc pobudzenia nie pomogła)"
+                    return f"{t:.0f}°C (even max. excitation power did not help)"
                 return f"{t:.0f}°C"
             temps_txt = ", ".join(_wtxt(w) for w in warns)
-            lines.append(f"⚠ Test relay nie złapał oscylacji dla: {temps_txt} — "
-                         f"użyto wartości bazowych (10.0/0.30/0.80) zamiast realnie zmierzonych.")
-        # Ostrzezenia o pojedynczych rampach, ktore nie zeszly ponizej progu
-        # bledu sledzenia (test rampowania PO relay - relay tej temperatury
-        # sam w sobie sie udal, zostaje jego wynik dla tej rampy - to NIE
-        # jest to samo co powyzej, wiec osobna, mniej alarmujaca linia).
+            lines.append(f"⚠ Relay test did not catch oscillation for: {temps_txt} — "
+                         f"base values (10.0/0.30/0.80) were used instead of actually measured ones.")
+        # Warnings about individual ramps that did not get below the tracking
+        # error threshold (ramp test AFTER relay - the relay for that temperature
+        # itself succeeded, its result stays for that ramp - this is NOT
+        # the same as above, hence a separate, less alarming line).
         rwarns = getattr(app, 'cal_ramp_warnings', [])
         if rwarns:
             def _rwtxt(w):
                 t, r, err = w
                 rtxt = f"{r:.0f}°C/min" if r is not None else "?"
-                etxt = f", błąd {err:.1f}°C" if err is not None else ""
+                etxt = f", error {err:.1f}°C" if err is not None else ""
                 return f"{t:.0f}°C @ {rtxt}{etxt}"
-            lines.append("⚠ Test rampowania nie zbił błędu śledzenia ASP poniżej progu dla: "
+            lines.append("⚠ Ramp test did not bring the ASP tracking error below threshold for: "
                          + ", ".join(_rwtxt(w) for w in rwarns)
-                         + " — zostaje profil bazowy z relay (dalej realnie zmierzony) dla tych ramp.")
+                         + " — the base profile from relay (still actually measured) stays for those ramps.")
         self.lbl_warn.config(text="\n".join(lines))
 
-        # Lista temperatur - buduj raz, potem aktualizuj statusy
+        # Temperature list - build once, then update statuses
         if len(self.step_widgets) != len(app.cal_plan):
             for w in self.steps_frame.winfo_children():
                 w.destroy()
@@ -4628,9 +5134,9 @@ class CalibrationWindow:
                 stat.pack(side='right')
                 self.step_widgets.append((bar, num, txt, stat))
 
-        # Statusy + kolory
-        phase_txt = {'heating': '→ grzanie', 'stabil': '~ stabilizacja',
-                     'relay': '◇ relay pomiar'}
+        # Statuses + colors
+        phase_txt = {'heating': '→ heating', 'stabil': '~ stabilization',
+                     'relay': '◇ relay measurement'}
         warn_temps = {round(w[0]) for w in getattr(app, 'cal_warnings', [])}
         for i, (bar, num, txt, stat) in enumerate(self.step_widgets):
             step_no = i + 1
@@ -4639,19 +5145,19 @@ class CalibrationWindow:
             if step_no < cur:
                 if failed:
                     bar.config(bg=C['red']); txt.config(fg=C['dim2'])
-                    num.config(fg=C['red']); stat.config(text="⚠ bazowe (fail)", fg=C['red'])
+                    num.config(fg=C['red']); stat.config(text="⚠ base (fail)", fg=C['red'])
                 else:
                     bar.config(bg=C['green']); txt.config(fg=C['dim2'])
-                    num.config(fg=C['green']); stat.config(text="✓ gotowe", fg=C['green'])
+                    num.config(fg=C['green']); stat.config(text="✓ done", fg=C['green'])
             elif step_no == cur:
                 bar.config(bg=C['orange']); txt.config(fg=C['text'])
                 num.config(fg=C['orange'])
-                stat.config(text=phase_txt.get(phase, "● teraz"), fg=C['orange'])
+                stat.config(text=phase_txt.get(phase, "● now"), fg=C['orange'])
                 try: self.canvas.yview_moveto(max(0, (i-3))/max(1, len(self.step_widgets)))
                 except: pass
             else:
                 bar.config(bg=C['bg2']); txt.config(fg=C['dim'])
-                num.config(fg=C['dim2']); stat.config(text="oczekuje", fg=C['dim2'])
+                num.config(fg=C['dim2']); stat.config(text="pending", fg=C['dim2'])
 
     def abort(self):
         if messagebox.askyesno("Abort?", "Abort calibration?"):
@@ -4662,22 +5168,22 @@ class CalibrationWindow:
 
 
 # ════════════════════════════════════════════════════════
-#  OKNO DIAGNOSTYKI - log wszystkich zdarzen z firmware + aktywne alarmy
+#  DIAGNOSTICS WINDOW - log of all firmware events + active alarms
 # ════════════════════════════════════════════════════════
 class DiagnosticsWindow:
-    """Pokazuje wszystko co firmware wysyla przez Serial, nie tylko
-    telemetrie CSV: kody bledow (ERR:) zdekodowane na czytelny opis PL,
-    ostrzezenia kalibracji (CALWARN) i kazda inna linie tekstowa (np.
-    'Flash: zapisano.', 'AUTOCAL START'), ktora wczesniej byla po cichu
-    odrzucana przez apke. Ulatwia to lapanie i zglaszanie bledow, bo nie
-    trzeba juz podpinac osobnego Serial Monitora (i tak nie da sie tego
-    zrobic rownolegle z apka na tym samym porcie COM)."""
+    """Shows everything the firmware sends over Serial, not just the
+    CSV telemetry: error codes (ERR:) decoded into a readable description,
+    calibration warnings (CALWARN) and every other text line (e.g.
+    'Flash: zapisano.', 'AUTOCAL START') that the app used to drop
+    silently. This makes catching and reporting errors easier, because
+    you no longer need to attach a separate Serial Monitor (which cannot
+    be done in parallel with the app on the same COM port anyway)."""
     LEVEL_COLOR = {'ERR': 'red', 'WARN': 'orange', 'INFO': 'dim'}
 
     def __init__(self, parent, app):
         self.app = app
         self.win = tk.Toplevel(parent)
-        self.win.title("Diagnostyka")
+        self.win.title("Diagnostics")
         self.win.configure(bg=C['bg'])
         size_win(self.win, 640, 560, 480, 360, parent=parent)
         self.win.transient(parent)
@@ -4687,16 +5193,16 @@ class DiagnosticsWindow:
         inner = tk.Frame(self.win, bg=C['bg'])
         inner.pack(fill='both', expand=True, padx=20, pady=16)
 
-        tk.Label(inner, text="DIAGNOSTYKA", bg=C['bg'], fg=C['text'],
+        tk.Label(inner, text="DIAGNOSTICS", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(14), 'bold')).pack(anchor='w')
-        tk.Label(inner, text="Wszystkie zdarzenia i bledy zglaszane przez firmware",
+        tk.Label(inner, text="All events and errors reported by the firmware",
                  bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 12))
 
-        # Banner aktywnych alarmow (widoczny tylko gdy err_active nie jest puste)
+        # Active alarms banner (visible only when err_active is not empty)
         self.active_frame = tk.Frame(inner, bg=C['bg2'])
         self.active_frame.pack(fill='x', pady=(0, 12))
 
-        # Log - Text ze znacznikami kolorow per poziom
+        # Log - Text with color tags per level
         log_wrap = tk.Frame(inner, bg=C['bg2'])
         log_wrap.pack(fill='both', expand=True)
         sb = tk.Scrollbar(log_wrap)
@@ -4713,9 +5219,9 @@ class DiagnosticsWindow:
 
         btn_row = tk.Frame(inner, bg=C['bg'])
         btn_row.pack(fill='x', pady=(12, 0))
-        mk_btn(btn_row, "ZAPISZ DO PLIKU", self.export_log, C['cyan']).pack(side='left')
-        mk_btn_outline(btn_row, "WYCZYSC", self.clear_log, C['dim']).pack(side='left', padx=(8, 0))
-        mk_btn_outline(btn_row, "ZAMKNIJ", self._on_close, C['red']).pack(side='right')
+        mk_btn(btn_row, "SAVE TO FILE", self.export_log, C['cyan']).pack(side='left')
+        mk_btn_outline(btn_row, "CLEAR", self.clear_log, C['dim']).pack(side='left', padx=(8, 0))
+        mk_btn_outline(btn_row, "CLOSE", self._on_close, C['red']).pack(side='right')
 
         self.refresh_active()
         self.reload_log()
@@ -4724,7 +5230,7 @@ class DiagnosticsWindow:
         for w in self.active_frame.winfo_children():
             w.destroy()
         if not self.app.err_active:
-            tk.Label(self.active_frame, text="Brak aktywnych alarmow.", bg=C['bg2'],
+            tk.Label(self.active_frame, text="No active alarms.", bg=C['bg2'],
                      fg=C['green'], font=(FONT, fsz(9)), anchor='w').pack(
                      fill='x', padx=10, pady=8)
             return
@@ -4745,8 +5251,8 @@ class DiagnosticsWindow:
         self.text.see('end')
 
     def append_entry(self, entry):
-        """Wywolywane z app._log_diag() gdy okno jest otwarte - dopisuje na
-        biezaco zamiast czekac na reload_log()."""
+        """Called from app._log_diag() when the window is open - appends live
+        instead of waiting for reload_log()."""
         try:
             self.text.config(state='normal')
             self._insert_entry(entry)
@@ -4774,9 +5280,9 @@ class DiagnosticsWindow:
                 for ts, level, text in self.app.diag_log:
                     tstr = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
                     f.write(f"[{tstr}] {level:<4} {text}\n")
-            messagebox.showinfo("Zapisano", f"Log zapisany:\n{fn}")
+            messagebox.showinfo("Saved", f"Log saved:\n{fn}")
         except Exception as e:
-            messagebox.showerror("Blad zapisu", str(e))
+            messagebox.showerror("Save error", str(e))
 
     def _on_close(self):
         self.app.diag_win = None
@@ -4784,7 +5290,7 @@ class DiagnosticsWindow:
 
 
 # ════════════════════════════════════════════════════════
-#  OKNO PRESETÓW (zapisywalne zestawy nastaw)
+#  PRESETS WINDOW (savable sets of settings)
 # ════════════════════════════════════════════════════════
 class PresetWindow:
     def __init__(self, parent, app):
@@ -4804,7 +5310,7 @@ class PresetWindow:
         tk.Label(inner, text="Save & load complete settings (setpoint, ramps, PID, fan)",
                  bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
 
-        # Zapis nowego presetu
+        # Save a new preset
         save_box = tk.Frame(inner, bg=C['bg2'])
         save_box.pack(fill='x', pady=(0, 16))
         si = tk.Frame(save_box, bg=C['bg2'])
@@ -4821,7 +5327,7 @@ class PresetWindow:
         self.name_entry.bind('<Return>', lambda e: self.save_preset())
         mk_btn(erow, "SAVE", self.save_preset, C['green']).pack(side='right')
 
-        # Lista zapisanych presetow
+        # List of saved presets
         tk.Label(inner, text="SAVED PRESETS", bg=C['bg'], fg=C['dim'],
                  font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(0, 6))
         list_wrap = tk.Frame(inner, bg=C['bg2'])
@@ -4855,11 +5361,11 @@ class PresetWindow:
             info.pack(side='left', fill='x', expand=True)
             tk.Label(info, text=name, bg=C['bg2'], fg=C['text'],
                      font=(FONT, fsz(10), 'bold'), anchor='w').pack(anchor='w')
-            # Krotki opis nastaw
+            # Short description of the settings
             desc = f"SP {settings.get('sp','?')}°C · ↑{settings.get('ru','?')} ↓{settings.get('rd','?')}°C/min · fan {settings.get('fan','?')}%"
             tk.Label(info, text=desc, bg=C['bg2'], fg=C['dim2'],
                      font=(FONT, fsz(8)), anchor='w').pack(anchor='w')
-            # Przyciski
+            # Buttons
             mk_btn(row, "LOAD", lambda n=name: self.load_preset(n), C['green']).pack(
                 side='left', padx=(4, 2))
             mk_btn_outline(row, "DEL", lambda n=name: self.del_preset(n), C['red']).pack(
@@ -4895,7 +5401,7 @@ class PresetWindow:
 
 
 # ════════════════════════════════════════════════════════
-#  DIALOG ZAPISU CYKLU
+#  CYCLE SAVE DIALOG
 # ════════════════════════════════════════════════════════
 class SaveCycleDialog:
     def __init__(self, parent, app, tmp_path):
@@ -4906,7 +5412,7 @@ class SaveCycleDialog:
         self.win.configure(bg=C['bg'])
         size_win(self.win, 440, 230, 400, 200, parent=parent)
         self.win.transient(parent)
-        self.win.grab_set()  # modalne
+        self.win.grab_set()  # modal
 
         tk.Frame(self.win, bg=C['green'], height=4).pack(fill='x')
         inner = tk.Frame(self.win, bg=C['bg'])
@@ -4915,7 +5421,7 @@ class SaveCycleDialog:
         tk.Label(inner, text="SAVE CYCLE TO ARCHIVE", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(13), 'bold')).pack(anchor='w')
 
-        # Info ile probek
+        # Info on the number of samples
         rows = getattr(app, 'cyc_rows', 0)
         tk.Label(inner, text=f"Recorded {rows} data samples",
                  bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(4, 16))
@@ -4928,14 +5434,14 @@ class SaveCycleDialog:
                               highlightthickness=2, highlightbackground=C['green'],
                               highlightcolor=_lighten(C['green'], 0.2))
         self.entry.pack(fill='x', ipady=6, pady=(4, 16))
-        # Domyslna nazwa
+        # Default name
         default = datetime.now().strftime("test_%H%M")
         self.entry.insert(0, default)
         self.entry.select_range(0, 'end')
         self.entry.focus()
         self.entry.bind('<Return>', lambda e: self.save())
 
-        # Przyciski
+        # Buttons
         bf = tk.Frame(inner, bg=C['bg'])
         bf.pack(fill='x')
         mk_btn(bf, "SAVE", self.save, C['green']).pack(side='left', fill='x',
@@ -4943,7 +5449,7 @@ class SaveCycleDialog:
         mk_btn_outline(bf, "DISCARD", self.discard, C['red']).pack(side='left',
                                                           fill='x', expand=True, padx=(4, 0))
 
-        self.win.protocol("WM_DELETE_WINDOW", self.save)  # zamkniecie = zapisz
+        self.win.protocol("WM_DELETE_WINDOW", self.save)  # closing = save
 
     def save(self):
         name = self.entry.get().strip()
@@ -4960,7 +5466,7 @@ class SaveCycleDialog:
 
 
 # ════════════════════════════════════════════════════════
-#  OKNO PROFILI WIELOETAPOWYCH
+#  MULTI-STEP PROFILES WINDOW
 # ════════════════════════════════════════════════════════
 class ProfileWindow:
     def __init__(self, parent, app):
@@ -4977,11 +5483,11 @@ class ProfileWindow:
         tk.Label(hd, text="MULTI-STEP PROFILES", bg=C['bg'], fg=C['text'],
                  font=(FONT, fsz(12), 'bold')).pack(side='left')
 
-        # Tabela etapow
+        # Step table
         self.rows_frame = tk.Frame(self.win, bg=C['bg'])
         self.rows_frame.pack(fill='both', expand=True, padx=16)
 
-        # Naglowki
+        # Headers
         h = tk.Frame(self.rows_frame, bg=C['bg'])
         h.pack(fill='x', pady=(0, 4))
         for txt, w in [("#", 3), ("TEMP °C", 10), ("RATE", 8), ("TIME min", 10), ("", 6)]:
@@ -4991,7 +5497,7 @@ class ProfileWindow:
         self.steps_container = tk.Frame(self.rows_frame, bg=C['bg'])
         self.steps_container.pack(fill='both', expand=True)
 
-        # Formularz dodawania
+        # Add form
         addf = tk.Frame(self.win, bg=C['panel'])
         addf.pack(fill='x', padx=16, pady=12)
         tk.Frame(addf, bg=C['green'], height=3).pack(fill='x')
@@ -5013,7 +5519,7 @@ class ProfileWindow:
         self.e_time.pack(side='left', padx=2); self.e_time.insert(0, "10")
         mk_btn(ai, "+ ADD", self.add_step, C['green']).pack(side='left', padx=(8, 0))
 
-        # Uruchom
+        # Run
         rf = tk.Frame(self.win, bg=C['bg'])
         rf.pack(fill='x', padx=16, pady=(0, 12))
         mk_btn(rf, "▶ RUN PROFILE", self.run_profile, C['purple'], fg='#fff').pack(
@@ -5029,7 +5535,7 @@ class ProfileWindow:
             self.app.profile_steps.append({'temp': temp, 'ramp': ramp, 'time': tmin})
             self.refresh_steps()
         except ValueError:
-            messagebox.showerror("Error", "Wpisz poprawne liczby.")
+            messagebox.showerror("Error", "Enter valid numbers.")
 
     def del_step(self, idx):
         if 0 <= idx < len(self.app.profile_steps):
@@ -5057,7 +5563,7 @@ class ProfileWindow:
                       activebackground=C['panel3']).pack(side='left', padx=4)
 
     def run_profile(self):
-        """Wykonaj profil - sekwencyjnie wysylaj etapy z opoznieniem"""
+        """Run the profile - send the steps sequentially with a delay"""
         if not self.app.connected:
             messagebox.showwarning("Not connected", "Connect to the device first.")
             return
@@ -5072,7 +5578,7 @@ class ProfileWindow:
         self.win.destroy()
 
     def _run_profile_thread(self):
-        """Watek wykonujacy profil"""
+        """Thread that executes the profile"""
         for i, s in enumerate(self.app.profile_steps):
             self.app.send(f"SP:{s['temp']:.1f}")
             self.app.send(f"RU:{s['ramp']:.1f}")
@@ -5080,29 +5586,29 @@ class ProfileWindow:
             if i == 0:
                 time.sleep(0.1)
                 self.app.send("START")
-            # Czekaj czas etapu (time w minutach)
+            # Wait out the step time (time in minutes)
             time.sleep(max(1, s['time'] * 60))
-        # Po profilu - stop
+        # After the profile - stop
         self.app.send("STOP")
-        print("Profil zakonczony")
+        print("Profile finished")
 
 
 # ════════════════════════════════════════════════════════
 #  MAIN
 # ════════════════════════════════════════════════════════
 def _enable_dpi_awareness():
-    """Wlacz DPI awareness na Windows - eliminuje rozmyty tekst przy skalowaniu 125%/150%."""
+    """Enable DPI awareness on Windows - eliminates blurry text at 125%/150% scaling."""
     if sys.platform != 'win32':
         return 1.0
     try:
         import ctypes
-        # Per-Monitor DPI Aware v2 (Windows 10 1703+) - najlepsza ostrosc
+        # Per-Monitor DPI Aware v2 (Windows 10 1703+) - best sharpness
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
-            # Fallback dla starszych Windows
+            # Fallback for older Windows
             ctypes.windll.user32.SetProcessDPIAware()
-        # Odczytaj rzeczywiste skalowanie
+        # Read the actual scaling
         try:
             hdc = ctypes.windll.user32.GetDC(0)
             dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
@@ -5115,33 +5621,37 @@ def _enable_dpi_awareness():
 
 
 def main():
-    # WAZNE: DPI awareness PRZED utworzeniem okna - daje ostry tekst
+    # IMPORTANT: DPI awareness BEFORE creating the window - gives sharp text
     scale = _enable_dpi_awareness()
 
-    # Ustaw globalny mnoznik fontow wg DPI (ostre I czytelne)
+    # Set the global font multiplier from DPI (sharp AND readable)
     global FS
     if scale and scale > 1.05:
-        FS = scale  # np. 1.25 dla 125%, 1.5 dla 150%
+        FS = scale  # e.g. 1.25 for 125%, 1.5 for 150%
     else:
         FS = 1.0
 
     root = tk.Tk()
 
-    # USUNIETE: root.tk.call('tk','scaling', scale)
-    # To bylo DRUGIE, niezalezne skalowanie nalozone na FS - i oba sie bily.
-    # Tk przelicza rozmiar fontu (podany dodatnio = w PUNKTACH) na piksele
-    # przez wlasny wspolczynnik 'tk scaling'. Kod ustawial go na dpi/96
-    # (np. 1.5), podczas gdy domyslny na Windows to 96/72 = 1.333 - a
-    # JEDNOCZESNIE mnozyl kazdy rozmiar fontu przez FS=1.5. Wychodzilo
-    # ~1.69x zamiast 1.5x, i to NIESPoJNIE miedzy widgetami (ttk kontra
-    # zwykle tk), bo nie kazdy widget przechodzi ta sama sciezka.
-    # Teraz zostaje JEDEN mnoznik: FS - fonty przez fsz(), piksele przez
-    # SC()/size_win(). Font zakladek ttk.Notebook i tak jest ustawiany
-    # jawnie w _build_styles(), wiec nic na tym nie traci.
+    # REMOVED: root.tk.call('tk','scaling', scale)
+    # That was a SECOND, independent scaling stacked on top of FS - and the two fought.
+    # Tk converts a font size (given positive = in POINTS) into pixels
+    # through its own 'tk scaling' factor. The code set it to dpi/96
+    # (e.g. 1.5), while the Windows default is 96/72 = 1.333 - and it
+    # SIMULTANEOUSLY multiplied every font size by FS=1.5. The result was
+    # ~1.69x instead of 1.5x, and INCONSISTENTLY across widgets (ttk versus
+    # plain tk), because not every widget goes through the same path.
+    # Now ONE multiplier remains: FS - fonts via fsz(), pixels via
+    # SC()/size_win(). The ttk.Notebook tab font is set explicitly in
+    # _build_styles() anyway, so nothing is lost here.
 
     app = PeltierControl(root)
 
     def on_close():
+        # Always hand the system back its right to sleep - otherwise the lock
+        # would outlive the closed program until logout (see _wake_lock).
+        try: app._wake_lock(False)
+        except Exception: pass
         app.disconnect()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
