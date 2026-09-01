@@ -1,17 +1,17 @@
 @echo off
-REM Build PeltierControl.exe przez PyInstaller
-echo === PeltierControl - budowanie .exe ===
+REM Build IGNI.exe with PyInstaller
+echo === IGNI - building .exe ===
 
-REM Instalacja zaleznosci
+REM Install dependencies
 pip install pyserial matplotlib pyinstaller
 
-REM Budowa jednego pliku exe bez konsoli
+REM Single-file exe, no console window
 pyinstaller --onefile --windowed ^
-  --name PeltierControl ^
+  --name IGNI ^
   --collect-all matplotlib ^
   app\peltier_control.py
 
 echo.
-echo === GOTOWE ===
-echo Plik: dist\PeltierControl.exe
+echo === DONE ===
+echo File: dist\IGNI.exe
 pause
