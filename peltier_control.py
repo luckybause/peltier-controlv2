@@ -34,7 +34,7 @@ try:
     import matplotlib
     matplotlib.use('TkAgg')
     from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 except ImportError as e:
     print(f"pip install matplotlib numpy\n{e}"); input(); sys.exit(1)
 
@@ -87,7 +87,7 @@ FONT_UI   = 'Roboto Mono'   # falls back to Consolas if not available
 # separately in the title bar). Bump it with every version sent out, so the
 # title bar immediately tells you whether this really is the new file.
 APP_NAME  = "LACHI"
-APP_BUILD = "2026-09-01.21"
+APP_BUILD = "2026-09-01.23"
 
 # Safety limits for the automatic MEASUREMENT SERIES (see the PeltierControl
 # class, self.series_*) - a safeguard in case the approach/return never
@@ -871,38 +871,176 @@ def section(parent, title, color=None, bg=None, pady=(14, 6)):
                                                   expand=True, pady=(SC(5), 0))
     return head
 
-def medallion_watermark(fig, color=None, alpha=0.075, size=0.34,
-                        cx=0.5, cy=0.5):
-    """The same emblem (EMBLEM_SOLID/EMBLEM_VOID) as a faint watermark behind
-    the traces, so the mark in the title bar and the one on the chart are the
-    same animal.
+# ── CHART NAVIGATION: drag to zoom, wheel to zoom, right-click to reset ──
+# Replaces matplotlib's NavigationToolbar. That toolbar brought its own icon
+# set and its own light-grey chrome into a dark instrument panel, and its
+# mode-based zoom (click the magnifier first, THEN drag) is a step nobody
+# wants on a live trace. These three gestures are the whole interaction:
+#
+#   left-drag   - rubber-band a rectangle, release to zoom into it
+#   wheel       - zoom about the cursor; over the plot it scales BOTH axes,
+#                 over an axis strip it scales that axis only
+#   right-click - back to the automatic view
+#
+# The one thing this has to get right is the live chart: its redraw clears the
+# axes ~4x a second, which would throw away any manual zoom on the next frame.
+# So a zoom LOCKS the view - locked=True - and the redraw re-applies the saved
+# limits instead of autoscaling, until a right-click releases it.
+class ChartNav:
+    WHEEL_STEP = 1.18          # zoom factor per wheel notch
 
-    Deliberately very low alpha: this is an instrument, and decoration that
-    competes with the curves would be a bug, not a feature. It lives in figure
-    coordinates below every axis (zorder 0), so it never moves when the data
-    rescales and never intercepts a click. print_theme() hides it entirely for
-    anything that leaves the app."""
-    from matplotlib.patches import Ellipse, Polygon
-    color = color or C['gold']
-    r = size / 2.0
-    # Figure coordinates run 0..1 on BOTH axes, so anything "round" there comes
-    # out stretched by the figure aspect. Dividing every x by ar undoes that.
-    ar = fig.get_figwidth() / max(fig.get_figheight(), 1e-6)
-    def P(x, y):
-        return (cx + x * r * 0.62 / ar, cy + y * r * 0.62)
-    ring = Ellipse((cx, cy), 2 * r / ar, 2 * r, transform=fig.transFigure,
-                   figure=fig, fill=False, ec=color, lw=r * 90, alpha=alpha,
-                   zorder=0)
-    ring.set_clip_on(False); ring.set_gid('wolf')
-    fig.patches.append(ring)
-    for poly, col, al in ([(_spline(p), color, alpha) for p in EMBLEM_SOLID] +
-                          [(_spline(p, 6), fig.get_facecolor(), 1.0)
-                           for p in EMBLEM_VOID]):
-        pa = Polygon([P(x, y) for x, y in poly], closed=True,
-                     transform=fig.transFigure, figure=fig,
-                     fc=col, ec='none', alpha=al, zorder=0)
-        pa.set_clip_on(False); pa.set_gid('wolf')
-        fig.patches.append(pa)
+    def __init__(self, canvas, axes, on_change=None, share_x=True):
+        self.canvas = canvas
+        self.axes = list(axes)
+        self.on_change = on_change
+        self.share_x = share_x
+        self.locked = False
+        self._lim = {}                       # axes -> (xlim, ylim)
+        self._press = None                   # (x, y, axes) while dragging
+        self._rect = None
+        c = canvas.mpl_connect
+        c('button_press_event', self._on_press)
+        c('motion_notify_event', self._on_motion)
+        c('button_release_event', self._on_release)
+        c('scroll_event', self._on_scroll)
+
+    # ── state ────────────────────────────────────────────────────────────
+    def remember(self):
+        self._lim = {ax: (ax.get_xlim(), ax.get_ylim()) for ax in self.axes}
+
+    def restore(self):
+        """Called by the redraw AFTER re-plotting: re-apply a locked view."""
+        if not self.locked:
+            return
+        for ax, (xl, yl) in self._lim.items():
+            ax.set_xlim(xl)
+            ax.set_ylim(yl)
+
+    def reset(self):
+        self.locked = False
+        self._lim = {}
+        for ax in self.axes:
+            ax.relim()
+            ax.autoscale(True)
+        if self.on_change:
+            self.on_change()
+        else:
+            self.canvas.draw_idle()
+
+    def _lock(self):
+        self.locked = True
+        self.remember()
+        self.canvas.draw_idle()
+
+    # ── rubber band ──────────────────────────────────────────────────────
+    def _on_press(self, e):
+        if e.button == 3:                    # right button - back to auto
+            self.reset()
+            return
+        if e.button == 1 and e.inaxes in self.axes:
+            self._press = (e.xdata, e.ydata, e.inaxes)
+
+    def _on_motion(self, e):
+        if not self._press or e.inaxes is not self._press[2] or e.xdata is None:
+            return
+        x0, y0, ax = self._press
+        if self._rect is not None:
+            try: self._rect.remove()
+            except Exception: pass
+        from matplotlib.patches import Rectangle
+        self._rect = Rectangle((min(x0, e.xdata), min(y0, e.ydata)),
+                               abs(e.xdata - x0), abs(e.ydata - y0),
+                               fill=True, fc=C['gold'], ec=C['gold'],
+                               alpha=0.16, lw=1.0, zorder=50)
+        ax.add_patch(self._rect)
+        self.canvas.draw_idle()
+
+    def _on_release(self, e):
+        if not self._press:
+            return
+        x0, y0, ax = self._press
+        self._press = None
+        if self._rect is not None:
+            try: self._rect.remove()
+            except Exception: pass
+            self._rect = None
+        if e.xdata is None or e.inaxes is not ax:
+            self.canvas.draw_idle()
+            return
+        # A click, not a drag - ignore, so a stray click does not zoom to a point
+        if abs(e.x - ax.transData.transform((x0, y0))[0]) < 8 and \
+           abs(e.y - ax.transData.transform((x0, y0))[1]) < 8:
+            self.canvas.draw_idle()
+            return
+        xlo, xhi = sorted((x0, e.xdata))
+        ylo, yhi = sorted((y0, e.ydata))
+        for a in self.axes:
+            if self.share_x or a is ax:
+                a.set_xlim(xlo, xhi)
+            if a is ax:
+                a.set_ylim(ylo, yhi)
+        self._lock()
+
+    # ── wheel ────────────────────────────────────────────────────────────
+    def _on_scroll(self, e):
+        ax = e.inaxes
+        if ax not in self.axes:
+            return
+        f = 1 / self.WHEEL_STEP if e.button == 'up' else self.WHEEL_STEP
+        for a in self.axes:
+            if self.share_x or a is ax:
+                lo, hi = a.get_xlim()
+                cx = e.xdata if e.xdata is not None else (lo + hi) / 2
+                a.set_xlim(cx - (cx - lo) * f, cx + (hi - cx) * f)
+            if a is ax and e.ydata is not None:
+                lo, hi = a.get_ylim()
+                a.set_ylim(e.ydata - (e.ydata - lo) * f,
+                           e.ydata + (hi - e.ydata) * f)
+        self._lock()
+
+
+def _align_inside(ax):
+    """Pull the tick labels inside the plotting area.
+
+    This has to run on every DRAW, not once at setup: matplotlib recomputes
+    tick locations lazily, so any alignment applied to the labels that existed
+    at style time is thrown away as soon as the data - and with it the tick
+    positions - change. Without this the bottom-most y label and the whole x
+    row hang outside the axes and get clipped by the canvas edge."""
+    for t in ax.get_yticklabels():
+        t.set_horizontalalignment('left')
+        t.set_verticalalignment('bottom')
+    for t in ax.get_xticklabels():
+        t.set_verticalalignment('bottom')
+        t.set_horizontalalignment('left')
+
+
+def style_axes(ax, xunit=None, yunit=None, show_x=True):
+    """Frameless axes with the scale drawn INSIDE the plot.
+
+    The old style spent a wide margin on spines, tick marks and axis titles -
+    on a panel this size that margin was a noticeable slice of the chart. Now
+    there is no frame at all, the tick labels sit just inside the plotting
+    area, and the unit is a small corner caption instead of a full axis title.
+    The captions are held off the very corners so they cannot land on top of
+    the first tick label."""
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.tick_params(axis='y', direction='in', length=0, pad=-SC(4),
+                   colors=C['dim'], labelsize=8)
+    ax.tick_params(axis='x', direction='in', length=0, pad=-SC(13),
+                   colors=C['dim'], labelsize=8, labelbottom=show_x)
+    ax.set_xlabel(''); ax.set_ylabel('')
+    _align_inside(ax)
+    if not getattr(ax, '_inside_hooked', False):
+        ax.figure.canvas.mpl_connect('draw_event', lambda e, a=ax: _align_inside(a))
+        ax._inside_hooked = True
+    if yunit:
+        ax.text(0.008, 0.93, yunit, transform=ax.transAxes, ha='left', va='top',
+                color=C['dim2'], fontsize=8)
+    if xunit and show_x:
+        ax.text(0.995, 0.075, xunit, transform=ax.transAxes, ha='right',
+                va='bottom', color=C['dim2'], fontsize=8)
 
 
 # ── PRINT / EXPORT PALETTE ──────────────────────────────────────────────
@@ -949,21 +1087,15 @@ def print_theme(*figures):
     that ends up in a report."""
     saved = dict(C)
     saved_faces = [(f, f.get_facecolor()) for f in figures]
-    hidden = []
     C.update(C_PRINT)
     for f in figures:
         f.set_facecolor('white')
-        for pt in f.patches:
-            if pt.get_gid() == 'wolf' and pt.get_visible():
-                pt.set_visible(False); hidden.append(pt)
     try:
         yield
     finally:
         C.clear(); C.update(saved)
         for f, fc in saved_faces:
             f.set_facecolor(fc)
-        for pt in hidden:
-            pt.set_visible(True)
 
 def decode_tc_fault(bits):
     names = [name for mask, name in TC_FAULT_BITS if bits & mask]
@@ -2161,16 +2293,22 @@ class PeltierControl:
                                   font=F(9, 1))
         self.reach_lbl.pack(side='right')
 
+        # Frameless and edge to edge: no watermark, no outer margins beyond
+        # what the inside-drawn scale needs. The old layout kept 7-8% of the
+        # canvas as blank margin for spines and axis titles.
         self.fig = Figure(figsize=(9, 6), facecolor=C['panel'], dpi=110)
-        medallion_watermark(self.fig, size=0.30, cx=0.52, cy=0.55)
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.2,
-                                   left=0.07, right=0.97, top=0.97, bottom=0.08)
+        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05,
+                                   left=0.012, right=0.995, top=0.985,
+                                   bottom=0.015)
         self.ax1 = self.fig.add_subplot(gs[0])
         self.ax2 = self.fig.add_subplot(gs[1], sharex=self.ax1)
         for ax in [self.ax1, self.ax2]:
-            ax.set_facecolor(C['panel2'])
+            ax.set_facecolor(C['panel'])      # same as the card - no visible box
 
         self.cv = FigureCanvasTkAgg(self.fig, master=wrap)
+        self.nav = ChartNav(self.cv, [self.ax1, self.ax2],
+                            on_change=self._nav_redraw)
+
         # ORDER MATTERS. The toolbar row is created and packed to the BOTTOM
         # first, so it reserves its height before the expanding canvas claims
         # what is left. Packed the other way round the matplotlib canvas wins
@@ -2180,7 +2318,8 @@ class PeltierControl:
         toolbar_row = tk.Frame(wrap, bg=C['panel'])
         toolbar_row.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
 
-        self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
+        self.cv.get_tk_widget().pack(fill='both', expand=True, padx=SC(2),
+                                     pady=(0, SC(2)))
 
         # PAUSE button - stops scrolling so you can zoom in
         self.btn_pause = tk.Button(toolbar_row, text="⏸ PAUSE", command=self.toggle_pause,
@@ -2201,28 +2340,49 @@ class PeltierControl:
                          activebackground=C['panel3'])
             b.pack(side='left', padx=2)
 
-        # Matplotlib toolbar (zoom, pan, save) - compact
-        tb_frame = tk.Frame(toolbar_row, bg=C['panel'])
-        tb_frame.pack(side='right')
+        # matplotlib's NavigationToolbar is gone (see ChartNav). Its save
+        # button was the one thing worth keeping, so it comes back here in the
+        # app's own style - and still goes through the print palette, so the
+        # file lands on white.
+        mk_btn_outline(toolbar_row, "⤓ PNG", self.save_live_chart,
+                       C['cyan']).pack(side='right', padx=(6, 0))
+        # Short enough to survive a 1366-wide window: the long form
+        # ("drag = zoom · wheel = zoom · right-click = reset") overflowed the
+        # row by 57 px there once the PAUSE and WINDOW buttons had their share.
+        tk.Label(toolbar_row, text="drag / wheel = zoom · right-click = reset",
+                 bg=C['panel'], fg=C['dim2'], font=F(8)).pack(side='right')
+
+    def _nav_redraw(self):
+        """Called by ChartNav after a reset - repaint from the current data so
+        the automatic limits come back."""
+        args = getattr(self, '_live_args', None)
+        if args:
+            self._redraw_live(*args)
+        else:
+            self.cv.draw_idle()
+
+    def save_live_chart(self):
+        """Save the live chart. Always on white - see print_theme()."""
         try:
-            self.mpl_toolbar = NavigationToolbar2Tk(self.cv, tb_frame, pack_toolbar=False)
-            # The toolbar's own floppy-disk button bypasses everything we do
-            # here and would write the dark screen theme straight into the
-            # file. Wrap it so it goes through the print palette too.
-            _orig_save = self.mpl_toolbar.save_figure
-            def _save_light(*a, **kw):
-                args = getattr(self, '_live_args', None)
-                with print_theme(self.fig):
-                    if args: self._redraw_live(*args)
-                    r = _orig_save(*a, **kw)
-                if args: self._redraw_live(*args)   # wroc do motywu ekranowego
-                return r
-            self.mpl_toolbar.save_figure = _save_light
-            self.mpl_toolbar.config(bg=C['panel'])
-            self.mpl_toolbar.update()
-            self.mpl_toolbar.pack(side='right')
+            from tkinter import filedialog
+            dest = filedialog.asksaveasfilename(
+                title="Save chart as image", defaultextension=".png",
+                initialfile="live_chart.png",
+                filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"),
+                           ("SVG", "*.svg")])
+            if not dest:
+                return
+            args = getattr(self, '_live_args', None)
+            with print_theme(self.fig):
+                if args:
+                    self._redraw_live(*args)
+                self.fig.savefig(dest, dpi=200, facecolor='white',
+                                 edgecolor='none', bbox_inches='tight')
+            if args:
+                self._redraw_live(*args)
+            messagebox.showinfo("Saved", f"Chart saved to:\n{dest}")
         except Exception as e:
-            print(f"toolbar err: {e}")
+            messagebox.showerror("Save error", str(e))
 
     def toggle_pause(self):
         """Pause/resume chart scrolling (for zooming in)"""
@@ -2973,9 +3133,10 @@ class PeltierControl:
         # 1600x900 and 1366x768). That is why all control rows are packed
         # FIRST, from the bottom (side='bottom'), and the canvas gets the rest.
         self.fig_a = Figure(figsize=(8, 4.5), facecolor=C['panel'], dpi=110)
-        medallion_watermark(self.fig_a, size=0.34, cx=0.52, cy=0.55)
-        self.ax_a = self.fig_a.add_subplot(111)
-        self.ax_a.set_facecolor(C['panel2'])
+        # Edge to edge, like the live chart: the scale is drawn inside, so the
+        # only margin left is the sliver the labels need.
+        self.ax_a = self.fig_a.add_axes([0.012, 0.02, 0.983, 0.965])
+        self.ax_a.set_facecolor(C['panel'])
 
         # Run settings panel - the bottom row
         self.arch_settings = tk.Frame(cf, bg=C['bg2'])
@@ -2995,25 +3156,15 @@ class PeltierControl:
         xrow.pack(side='bottom', fill='x', padx=8, pady=(0, 4))
         atb = tk.Frame(cf, bg=C['panel'])
         atb.pack(side='bottom', fill='x', padx=8, pady=(2, 6))
-        tbf = tk.Frame(cf, bg='#3a3f44')
-        tbf.pack(side='bottom', fill='x', padx=8, pady=(4, 0))
-
         # The canvas gets ALL the remaining space
         self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
-        self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(8, 4))
-        # First draw BEFORE the toolbar - it initializes the canvas
+        self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=SC(2),
+                                       pady=(SC(4), SC(2)))
         self.cv_a.draw()
-        try:
-            self.mpl_toolbar_a = NavigationToolbar2Tk(self.cv_a, tbf, pack_toolbar=False)
-            self.mpl_toolbar_a.config(bg='#3a3f44')
-            # Toolbar buttons readable on the dark background
-            for child in self.mpl_toolbar_a.winfo_children():
-                try: child.config(bg='#3a3f44')
-                except: pass
-            self.mpl_toolbar_a.update()
-            self.mpl_toolbar_a.pack(side='left', fill='x')
-        except Exception as e:
-            print(f"arch toolbar err: {e}")
+        # Same three gestures as the live chart, and no matplotlib toolbar -
+        # see ChartNav. The archive chart has one axes, so share_x is moot.
+        self.nav_a = ChartNav(self.cv_a, [self.ax_a],
+                              on_change=self._redraw_arch)
 
         # Export buttons - in the 'atb' row created above
         mk_btn_outline(atb, "⤓ CSV", self.export_arch_csv, C['green']).pack(
@@ -3665,7 +3816,7 @@ class PeltierControl:
             try: self._ax_pwm.remove()
             except Exception: pass
             self._ax_pwm = None
-        self.ax_a.set_facecolor(C['panel2'])
+        self.ax_a.set_facecolor(C['panel'])
 
         mode = self.arch_xmode.get() if hasattr(self, 'arch_xmode') else 't0'
         show = {k: v.get() for k, v in getattr(self, 'arch_show', {}).items()} or \
@@ -3687,6 +3838,7 @@ class PeltierControl:
             self.ax_a.text(0.5, 0.5, "Select one or more runs on the left",
                           ha='center', va='center', color=C['dim2'],
                           fontsize=11, transform=self.ax_a.transAxes)
+            if hasattr(self, 'nav_a'): self.nav_a.restore()
             self.cv_a.draw()
             if hasattr(self, 'arch_settings_lbl'):
                 self.arch_settings_lbl.config(text="")
@@ -3708,7 +3860,9 @@ class PeltierControl:
                                t2=list(self._last_temp2 or []),
                                pc=list(self._last_pc or [])))
         if not series:
-            self.cv_a.draw(); return
+            if hasattr(self, 'nav_a'): self.nav_a.restore()
+            self.cv_a.draw()
+            return
         # Order = the same as in the list on the left. Important for the
         # "difference rel. to 1st" mode - the reference must be the trace the
         # user sees first, not an arbitrary ordering of the selection dict.
@@ -3812,6 +3966,7 @@ class PeltierControl:
                     ax2 = self.ax_a.twinx(); self._ax_pwm = ax2
                     ax2.set_ylabel('PWM [%]', color=C['dim'], fontsize=9)
                     ax2.tick_params(colors=C['dim'], labelsize=8)
+                    for sp in ax2.spines.values(): sp.set_visible(False)
                 ax2.plot(tx, s['pwm'], color=col, lw=0.9, ls='-.', alpha=0.5)
 
         # Reference line in "rel. to temperature" mode
@@ -3839,16 +3994,21 @@ class PeltierControl:
                        'ramp': '  ·  0 = start of the ramp',
                        'temp': f'  ·  0 = crossing {tref:.1f}°C',
                        }.get(mode, '')
-        self.ax_a.set_xlabel(xlabel, color=C['dim'], fontsize=9)
-        self.ax_a.set_ylabel(
-            (f'temperature difference vs {ref_name} [°C]' if delta_mode else 'temperature [°C]'),
-            color=C['dim'], fontsize=9)
-        self.ax_a.tick_params(colors=C['dim'], labelsize=8)
+        # The caption goes in the corner INSIDE the plot now, so it has to be
+        # short - the full "time [s] · 0 = start of the run" ran straight over
+        # the last x tick labels. The reference-point explanation moves to the
+        # top-left, under the y caption, where there is room for it.
+        style_axes(self.ax_a, xunit=xlabel.split('  ·  ')[0],
+                   yunit=(f'\u0394T vs {ref_name} [°C]' if delta_mode
+                          else 'temperature [°C]'))
+        if '  ·  ' in xlabel:
+            self.ax_a.text(0.008, 0.875, xlabel.split('  ·  ')[1],
+                           transform=self.ax_a.transAxes, ha='left', va='top',
+                           color=C['dim2'], fontsize=8)
         self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
-                        labelcolor=C['dim'], fontsize=8, loc='best')
+                        labelcolor=C['dim'], fontsize=8, loc='best',
+                        framealpha=0.85)
         self.ax_a.grid(True, alpha=0.3, color=C['grid'])
-        for sp in self.ax_a.spines.values():
-            sp.set_color(C['border'])
 
         # Title: statistics (single run) or the number being compared
         if not multi:
@@ -3868,6 +4028,7 @@ class PeltierControl:
             self.ax_a.set_title(f"Comparing {len(selected)} cycles",
                               color=C['dim'], fontsize=9, loc='left')
         self.fig_a.tight_layout()
+        if hasattr(self, 'nav_a'): self.nav_a.restore()
         self.cv_a.draw()
 
         # Run settings panel (only when a single run is selected)
@@ -4603,33 +4764,29 @@ class PeltierControl:
         writes. Exporting on a white background needs exactly this part and
         nothing else (see print_theme), so it now stands on its own."""
         self.ax1.clear()
-        self.ax1.set_facecolor(C['panel2'])
+        self.ax1.set_facecolor(C['panel'])
         # target final (dashed orange)
         self.ax1.plot(t, spt, color=C['orange'], lw=1.3, ls='--', label='target', alpha=0.7)
         # actual setpoint - ramp (dotted cyan) - shows how the setpoint creeps
         self.ax1.plot(t, spa, color=C['cyan'], lw=1.5, ls=':', label='setpoint (ramp)')
         # actual temperature (thick blue)
         self.ax1.plot(t, temp, color=C['blue'], lw=2.2, label='temp')
-        self.ax1.set_ylabel('°C', color=C['dim'], fontsize=9)
-        self.ax1.tick_params(colors=C['dim'], labelsize=8, length=0)
+        style_axes(self.ax1, yunit='°C', show_x=False)
         self.ax1.grid(True, axis='y', alpha=0.35, color=C['grid'])
-        for sp in ['top', 'right']: self.ax1.spines[sp].set_visible(False)
-        for sp in ['left', 'bottom']: self.ax1.spines[sp].set_color(C['border'])
         leg = self.ax1.legend(facecolor=C['panel'], edgecolor=C['border'],
                              labelcolor=C['dim'], fontsize=8, loc='upper right')
 
         self.ax2.clear()
-        self.ax2.set_facecolor(C['panel2'])
+        self.ax2.set_facecolor(C['panel'])
         self.ax2.fill_between(t, 0, pwm, color=C['green'], alpha=0.3)
         self.ax2.plot(t, pwm, color=C['green'], lw=1.5)
-        self.ax2.set_ylabel('PWM %', color=C['dim'], fontsize=9)
-        self.ax2.set_xlabel('time [s]', color=C['dim'], fontsize=9)
+        style_axes(self.ax2, xunit='time [s]', yunit='PWM %')
         self.ax2.set_ylim(-105, 105)
-        self.ax2.tick_params(colors=C['dim'], labelsize=8, length=0)
+        self.ax2.set_yticks([-100, 0, 100])
         self.ax2.grid(True, axis='y', alpha=0.35, color=C['grid'])
-        for sp in ['top', 'right']: self.ax2.spines[sp].set_visible(False)
-        for sp in ['left', 'bottom']: self.ax2.spines[sp].set_color(C['border'])
 
+        # A manual zoom must survive the ~4 Hz redraw - see ChartNav.
+        if hasattr(self, 'nav'): self.nav.restore()
         self.cv.draw_idle()
 
     # ────────────────────────────────────────────────────
