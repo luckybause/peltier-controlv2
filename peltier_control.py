@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IGNI - Illumination & Gradient Nanoampere Instrument
+LACHI - Light-Activated Current & Heat Instrument
 
 Control bench for photocurrent and pyrocurrent measurements: it drives the
-Peltier stage, so the sample can be held at a temperature (photocurrent, the
-illumination term) or ramped at a commanded rate (pyrocurrent, the gradient
-term dT/dt), and it archives every run.
+Peltier stage, so the sample can be held at a temperature (photocurrent - the
+light-activated term) or ramped at a commanded rate (pyrocurrent - the heat
+term, dT/dt), and it archives every run.
 
-  Illumination  - the optical / photocurrent side of the experiment
-  Gradient      - the controlled dT/dt that produces the pyrocurrent
-  Nanoampere    - the magnitude of what actually gets measured
-  Instrument    - it is one, and it is treated as one
+  Light-Activated Current  - the photocurrent side of the experiment
+  Heat                     - the controlled dT/dt that drives the pyrocurrent
+  Instrument               - it is one, and it is treated as one
 
 Two-way link with the board: setpoint, ramps, PID, calibration, profiles.
 Requires firmware v19 (PC MODE) or newer on the ItsyBitsy M0.
 """
 
-import sys, os, time, csv, json, threading, queue, contextlib
+import sys, os, time, csv, json, math, threading, queue, contextlib
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +26,7 @@ except ImportError:
     print("pip install pyserial"); input(); sys.exit(1)
 try:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import ttk, messagebox
 except ImportError:
     print("tkinter not available"); input(); sys.exit(1)
@@ -86,7 +86,8 @@ FONT_UI   = 'Roboto Mono'   # falls back to Consolas if not available
 # firmware version the app reads from the board with the VER command and shows
 # separately in the title bar). Bump it with every version sent out, so the
 # title bar immediately tells you whether this really is the new file.
-APP_BUILD = "2026-09-01.16"
+APP_NAME  = "LACHI"
+APP_BUILD = "2026-09-01.21"
 
 # Safety limits for the automatic MEASUREMENT SERIES (see the PeltierControl
 # class, self.series_*) - a safeguard in case the approach/return never
@@ -127,6 +128,50 @@ def SC(px):
     (560x680 and 640x780). Now every fixed size goes through SC().
     """
     return int(round(px * FS))
+
+# ── NAMED FONTS: ONE registry, so the size can change at runtime ────────
+# Until APP .16 every widget was built with a plain tuple, font=F(9).
+# A tuple is copied into the widget at creation, so the only way to change the
+# text size afterwards was to rebuild the entire UI. Tk *named* fonts work the
+# other way round: the widget keeps a reference, and reconfiguring the font
+# updates every widget using it, live.
+#
+# So all 146 call sites now go through F(), which hands out one shared font
+# object per (size, weight) pair, and set_ui_scale() simply resizes those
+# objects. That is the whole mechanism behind the scale selector on the DEVICE
+# tab - no rebuild, no restart, no lost state.
+_FONTS = {}
+
+
+def F(n, bold=0):
+    """The named font for design size n (bold optional). Created on first use -
+    which means after the Tk root exists, since every call site is inside a
+    widget-building method."""
+    key = (n, bool(bold))
+    f = _FONTS.get(key)
+    if f is None:
+        f = tkfont.Font(family=FONT, size=fsz(n),
+                        weight=('bold' if bold else 'normal'))
+        _FONTS[key] = f
+    return f
+
+
+def set_ui_scale(scale):
+    """Change the global text scale and push it into every live font.
+
+    Only the TEXT rescales. Fixed pixel geometry (SC(), panel widths, window
+    sizes) is measured when the UI is built, so after scaling UP the layout is
+    roomier than it needs to be rather than tighter - which is why this is safe
+    to do live. The saved value is what the next start builds geometry from."""
+    global FS
+    FS = max(0.6, min(2.0, float(scale)))
+    for (n, bold), f in _FONTS.items():
+        try:
+            f.configure(size=fsz(n))
+        except Exception:
+            pass
+    return FS
+
 
 def make_scrollable(parent, bg, padx=0, pady=0):
     """Returns a frame that scrolls vertically when the content does not fit the window.
@@ -227,7 +272,7 @@ def mk_btn(parent, text, cmd, bg=None, fg='#1a1c1f', **kw):
     """Brutalist button - sharp edges, monospace"""
     bg = bg or C['green']
     b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
-                  font=(FONT, fsz(10), 'bold'), padx=16, pady=8,
+                  font=F(10, 1), padx=16, pady=8,
                   relief='flat', cursor='hand2', bd=0,
                   activebackground=_lighten(bg, 0.15), activeforeground=fg, **kw)
     def on_enter(e):
@@ -241,7 +286,7 @@ def mk_btn(parent, text, cmd, bg=None, fg='#1a1c1f', **kw):
 def mk_btn_outline(parent, text, cmd, color, **kw):
     """Button with an outline instead of a fill"""
     b = tk.Button(parent, text=text, command=cmd, bg=C['bg2'], fg=color,
-                  font=(FONT, fsz(10), 'bold'), padx=14, pady=7,
+                  font=F(10, 1), padx=14, pady=7,
                   relief='flat', cursor='hand2', bd=0,
                   highlightthickness=2, highlightbackground=color,
                   highlightcolor=color,
@@ -271,10 +316,10 @@ class SliderField:
         top = tk.Frame(self.frame, bg=C['bg2'])
         top.pack(fill='x')
         tk.Label(top, text=label, bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(9)), anchor='w').pack(side='left')
+                 font=F(9), anchor='w').pack(side='left')
         if unit:
             tk.Label(top, text=unit, bg=C['bg2'], fg=C['dim2'],
-                     font=(FONT, fsz(8)), anchor='e').pack(side='right')
+                     font=F(8), anchor='e').pack(side='right')
 
         # Row: slider + field
         row = tk.Frame(self.frame, bg=C['bg2'])
@@ -282,7 +327,7 @@ class SliderField:
 
         # Numeric field (Entry) - on the right
         self.entry = tk.Entry(row, width=7, bg=C['panel'], fg=color,
-                              font=(FONT, fsz(12), 'bold'), justify='center',
+                              font=F(12, 1), justify='center',
                               relief='flat', bd=0,
                               highlightthickness=1.5, highlightbackground=color,
                               highlightcolor=_lighten(color, 0.2),
@@ -511,6 +556,279 @@ def _spline(pts, steps=10):
     return out
 
 
+# ── ANTI-ALIASED RENDERING OF THE MARK ──────────────────────────────────
+# Tk's canvas has NO anti-aliasing: create_polygon() writes hard pixels, so
+# every diagonal in the emblem and in the letterforms came out as a visible
+# staircase - worst exactly where it matters, at title-bar size.
+#
+# Fix without touching a single coordinate: draw the very same geometry into a
+# PIL image at SS times the final size and scale it down with LANCZOS, which
+# averages the edge pixels properly. _PILCanvas below exposes just the three
+# calls the drawing routines use, so draw_medallion() and draw_wordmark() do
+# not know or care which back-end they are painting into.
+#
+# Pillow arrives with matplotlib, so it is available in practice - but the
+# import is guarded and everything falls back to plain canvas polygons if it
+# is not. A slightly jagged logo is a cosmetic problem; refusing to start is
+# not acceptable for an instrument.
+try:
+    from PIL import Image, ImageDraw, ImageTk
+    _PIL_OK = True
+except Exception:
+    _PIL_OK = False
+
+MARK_SS = 4          # supersampling factor
+
+
+class _PILCanvas:
+    """The slice of the Tk canvas API that the mark drawing uses, backed by
+    PIL at MARK_SS resolution."""
+
+    def __init__(self, draw, ss):
+        self.d = draw
+        self.ss = ss
+
+    def create_polygon(self, *pts, **kw):
+        f = kw.get('fill') or kw.get('outline')
+        self.d.polygon([(pts[i] * self.ss, pts[i + 1] * self.ss)
+                        for i in range(0, len(pts), 2)], fill=f)
+
+    def create_oval(self, x0, y0, x1, y1, **kw):
+        w = max(1, int(round(kw.get('width', 1) * self.ss)))
+        self.d.ellipse([x0 * self.ss, y0 * self.ss, x1 * self.ss, y1 * self.ss],
+                       outline=kw.get('outline'), width=w)
+
+    def create_rectangle(self, x0, y0, x1, y1, **kw):
+        self.d.rectangle([x0 * self.ss, y0 * self.ss, x1 * self.ss, y1 * self.ss],
+                         fill=kw.get('fill') or kw.get('outline'))
+
+
+def make_mark(w, h, bg, painter):
+    """Paint `painter(canvas)` anti-aliased into a Tk image of w x h pixels.
+    Returns None when Pillow is missing - the caller then paints straight onto
+    the Tk canvas as before. The returned image MUST be kept referenced by the
+    caller, or Tk garbage-collects it and shows nothing."""
+    if not _PIL_OK:
+        return None
+    try:
+        im = Image.new('RGB', (max(1, w * MARK_SS), max(1, h * MARK_SS)), bg)
+        painter(_PILCanvas(ImageDraw.Draw(im), MARK_SS))
+        im = im.resize((max(1, w), max(1, h)), Image.LANCZOS)
+        return ImageTk.PhotoImage(im)
+    except Exception as e:
+        print(f"mark render fallback: {e}")
+        return None
+
+
+# ── WORDMARK ────────────────────────────────────────────────────────────
+# The letters are geometry, not a font. A font would look like whatever
+# Consolas fallback the machine happens to have; these are drawn from the same
+# vocabulary as the emblem - flat planes, chamfered corners, one light source
+# in the upper left - so the mark reads as one designed object rather than a
+# picture next to some text.
+#
+# Coordinates: x to the right, y UP, baseline at y=0, cap height y=1. Each
+# entry is (advance_width, [polygons]). W is the stroke weight, K the chamfer
+# that keeps the corners from looking machined.
+_W = 0.26          # stroke weight
+_K = 0.075         # corner chamfer
+
+# ── THE A, AND WHY IT NEEDS ITS OWN ARITHMETIC ─────────────────────────
+# The A was the one letter that looked wrong next to the others, for two
+# reasons that stacked:
+#
+#  1. It had been given a THINNER stroke (0.20 against 0.26) to stop its two
+#     legs merging and closing the counter. That alone made it 23% lighter.
+#  2. A SLANTED stroke of a given HORIZONTAL width is thinner measured across
+#     itself: the leg runs 0.40 sideways per 1 of height, so a horizontal
+#     0.20 is only 0.186 perpendicular. Together the A came out 29% lighter
+#     than L, C, H and I - which is exactly what the eye picks up.
+#
+# The fix is the one type designers use: do NOT thin the stroke to make room.
+# Widen the letter, sharpen the apex, and derive the horizontal extent from
+# the perpendicular weight you actually want:
+#     _AW = _W * sqrt(1 + R^2),  R = horizontal run per unit height
+# THIRD PASS - the apex. With a 0.12 apex the letter tapered almost to a point
+# and read as a triangle wedged between four slab-sided neighbours. Widening
+# it to 0.40 gives a properly FLAT top that matches the squared terminals of
+# L, C, H and I; the price is a smaller counter (it now closes at 57% of the
+# cap height instead of 80%), which is simply what a flat-apex A costs - the
+# two inner edges have already crossed by the apex width at the top.
+#
+# FOURTH PASS - the counter was then too cramped: with the bar at 0.24 and a
+# 0.68 weight it left only 0.15 of cap height of open triangle. Three small
+# moves buy it back without touching the flat top or the stroke weight:
+# the letter widened 1.08 -> 1.14 (pushes the crossing point up), the crossbar
+# dropped 0.24 -> 0.17, and the bar itself thinned to 0.60 of the stem. The
+# counter now spans 0.33..0.59 - about 0.27 of cap height, nearly double.
+#
+# FIFTH PASS - bigger still. Widened again to 1.24, the apex trimmed 0.40 ->
+# 0.34 (still unmistakably flat, just less of a plateau), the crossbar dropped
+# to 0.12 and thinned to 0.56 of the stem. The counter now runs 0.27..0.66,
+# roughly 0.40 of cap height - two and a half times the fourth pass. The A is
+# deliberately the widest glyph in the set; that is what an open counter under
+# a flat apex costs, and it is what A and V do in most display faces anyway.
+#
+# SIXTH PASS - position, not size. The counter was sitting low, pinned to the
+# crossbar, with its centre at 0.46 of the cap height. Raising the bar alone
+# would just have eaten it from below, so the apex was trimmed 0.34 -> 0.24
+# as well: a narrower apex pushes the point where the two inner edges cross
+# from 0.66 up to 0.75, which buys back at the top exactly what the higher bar
+# takes at the bottom. Net effect - the counter keeps its height (0.40 of cap)
+# and its centre moves 0.46 -> 0.55, so it now sits in the upper half of the
+# letter where the eye expects it. The apex is still flat, just less of a
+#
+# SEVENTH PASS - stroke audit. Rasterising every glyph and measuring the pixel
+# runs showed the horizontal bars had drifted apart badly: stems and the L and
+# C bars sat at 0.262, but the H waist was 0.190, the I slabs 0.184 and this
+# crossbar only 0.146 - up to 44% lighter than the stems they join. All bars
+# are now exactly _W. The A's bar dropped 0.20 -> 0.17 so that going from
+# 0.146 to 0.260 thick does not eat the counter from below.
+# (Type design normally draws horizontals a hair LIGHTER than verticals, since
+# equal measures look heavier horizontally. This face is deliberately
+# monolinear instead - one weight everywhere, which suits its slab geometry.)
+# EIGHTH PASS - the A's legs were the last uneven stroke. The audit measured
+# them at 0.233 perpendicular against 0.262 everywhere else, and the reason is
+# that they were not parallelograms at all: the OUTER edge ran (A-P)/2 = 0.53
+# sideways per unit height while the INNER edge ran only 0.476, so each leg
+# tapered as it climbed. The _AW = _W*sqrt(1+R^2) correction assumed parallel
+# edges and therefore fixed the width at exactly one height, not along the leg.
+#
+# For genuinely parallel edges the apex width MUST equal the leg's horizontal
+# extent - top and bottom edges of a parallelogram are the same length. So the
+# apex is no longer chosen freely; it is solved together with the width:
+#     _AW = _W * sqrt(1 + R^2),   R = (A - _AW) / 2,   apex = _AW
+# Two unknowns, two equations, and the fixed point converges in a handful of
+# iterations. The apex lands at 0.291 - still flat, close to the 0.24 it was
+# eyeballed at - and every stroke in the alphabet is now one weight.
+_A_ADV, _A_BAR = 1.30, 0.17                 # width, crossbar height
+
+
+def _solve_leg(adv, w):
+    """Leg horizontal extent for a TRUE parallelogram: the apex width equals
+    it, so the slant depends on the answer. Fixed-point, converges fast."""
+    aw = w
+    for _ in range(40):
+        r = (adv - aw) / 2.0
+        nw = w * math.sqrt(1.0 + r * r)
+        if abs(nw - aw) < 1e-12:
+            break
+        aw = nw
+    return aw
+
+
+_AW = _solve_leg(_A_ADV, _W)                # leg extent ...
+_A_APEX = _AW                               # ... and the apex, necessarily equal
+_A_CTR = _A_ADV / 2.0
+
+
+def _a_inner(y, left=True):
+    """x of a leg's INNER edge at height y (0 = baseline, 1 = cap)."""
+    x0 = _AW if left else _A_ADV - _AW
+    x1 = _A_CTR + (_A_APEX / 2 if left else -_A_APEX / 2)
+    return x0 + y * (x1 - x0)
+
+
+GLYPHS = {
+    # L - stem plus foot, chamfered at the outer bottom corner
+    'L': (0.68, [[(0, 1), (_W, 1), (_W, _W), (0.68, _W), (0.68 - _K, 0),
+                  (0, 0)]]),
+    # A - two splayed legs meeting at a flat apex, plus a fitted crossbar
+    'A': (_A_ADV, [
+        [(0, 0), (_AW, 0), (_A_CTR + _A_APEX / 2, 1), (_A_CTR - _A_APEX / 2, 1)],
+        [(_A_ADV, 0), (_A_ADV - _AW, 0), (_A_CTR - _A_APEX / 2, 1),
+         (_A_CTR + _A_APEX / 2, 1)],
+        [(_a_inner(_A_BAR, True), _A_BAR),
+         (_a_inner(_A_BAR, False), _A_BAR),
+         (_a_inner(_A_BAR + _W, False), _A_BAR + _W),
+         (_a_inner(_A_BAR + _W, True), _A_BAR + _W)],
+    ]),
+    # C - an angular ring, opened on the right by exactly one stroke width so
+    # it cannot be read as a bracket
+    'C': (0.78, [[(0.78, 1), (0.20, 1), (0, 1 - 0.22), (0, 0.22), (0.20, 0),
+                  (0.78, 0), (0.78, _W), (0.26, _W), (_W, _W + 0.13),
+                  (_W, 1 - _W - 0.13), (0.26, 1 - _W), (0.78, 1 - _W)]]),
+    # H - two stems and a waist bar
+    'H': (0.84, [
+        [(0, 1), (_W, 1), (_W, 0), (0, 0)],
+        [(0.84 - _W, 1), (0.84, 1), (0.84, 0), (0.84 - _W, 0)],
+        [(_W, 0.50 + _W / 2), (0.84 - _W, 0.50 + _W / 2),
+         (0.84 - _W, 0.50 - _W / 2), (_W, 0.50 - _W / 2)],
+    ]),
+    # I - stem with slab serifs, so it cannot be mistaken for a divider
+    'I': (0.56, [
+        [(0, 1), (0.56, 1), (0.56, 1 - _W), (0, 1 - _W)],
+        [(0, _W), (0.56, _W), (0.56, 0), (0, 0)],
+        [(0.28 - _W / 2, 1 - _W), (0.28 + _W / 2, 1 - _W),
+         (0.28 + _W / 2, _W), (0.28 - _W / 2, _W)],
+    ]),
+}
+TRACKING = 0.20    # base gap between letter BOXES, in cap-height units
+
+# ── KERNING ─────────────────────────────────────────────────────────────
+# TRACKING alone spaces the bounding BOXES, and boxes are a poor model of what
+# the eye sees: ink does not reach the box edge everywhere. Measured on the
+# rasterised letters, the white area between pairs came out
+#     LA 0.773   AC 0.497   CH 0.449   HI 0.272
+# - the LA pair nearly THREE TIMES looser than HI. The cause is structural: H
+# and I are slab-sided, so their gap is exactly TRACKING at every height, while
+# above the L's foot the L is only 0.26 wide and the A's edge runs away toward
+# its apex, so that pair opens up as it climbs.
+#
+# WHICH RULE TO EQUALISE. Equalising the white AREA is the classic answer, but
+# for this alphabet it fails: rendered side by side it forced HI apart to a
+# 0.56 gap and the word read as "LA CH I". In an alphabet that is four
+# parallel-sided letters plus one A, what the eye actually judges is the
+# NEAREST APPROACH, so that is what these kerns equalise - every pair now comes
+# within exactly TRACKING of its neighbour at its closest point. Some residual
+# opening at the top of LA stays, because L followed by A does that in every
+# typeface ever cut.
+KERN = {
+    'LA': -0.075,   # L's arm is empty above the foot; A's leg meets it at the baseline
+    'AC': -0.112,   # A's right leg leans away from C's flat left side
+}
+
+
+def wordmark_width(text=APP_NAME, h=1.0):
+    """Total width of the wordmark at cap height h - needed to centre it or to
+    reserve space for it before anything is drawn. Includes the kerns, or the
+    canvas would be sized for a wider word than actually gets drawn."""
+    adv = sum(GLYPHS[c][0] for c in text if c in GLYPHS)
+    n = len([c for c in text if c in GLYPHS])
+    kern = sum(KERN.get(text[i:i + 2], 0.0) for i in range(len(text) - 1))
+    return (adv + TRACKING * max(0, n - 1) + kern) * h
+
+
+def draw_wordmark(cv, x, y, h, color, bg, text=APP_NAME):
+    """Render the wordmark on a Tk canvas with (x, y) at the BASELINE LEFT.
+
+    The chiselled look comes from three passes rather than per-stroke facet
+    geometry: a dark copy pushed down-right, then a light copy pulled up-left,
+    then the solid letters on top. Cheap, and it cannot get out of step with
+    the outline the way hand-placed facets would."""
+    lit = _lighten(color, 0.55)
+    shade = _darken(color, 0.45)
+    d = h * 0.028
+    for dx, dy, col in ((d, d, shade), (-d * 0.6, -d * 0.6, lit), (0, 0, color)):
+        cx = x + dx
+        prev = None
+        for ch in text:
+            if prev is not None:
+                cx += KERN.get(prev + ch, 0.0) * h
+            prev = ch
+            g = GLYPHS.get(ch)
+            if not g:
+                cx += 0.4 * h
+                continue
+            adv, polys = g
+            for poly in polys:
+                pts = []
+                for px, py in poly:
+                    pts += [cx + px * h, y - py * h + dy]   # y grows down in Tk
+                cv.create_polygon(*pts, fill=col, outline=col)
+            cx += (adv + TRACKING) * h
+
+
 def draw_medallion(cv, cx, cy, r, color, bg):
     """Render the emblem onto a Tk canvas, centred at (cx, cy) with radius r.
     Purely decorative - nothing in the control path depends on it."""
@@ -548,7 +866,7 @@ def section(parent, title, color=None, bg=None, pady=(14, 6)):
     head.pack(fill='x', pady=pady)
     tk.Frame(head, bg=color, width=SC(3), height=SC(11)).pack(side='left')
     tk.Label(head, text=title, bg=bg, fg=color,
-             font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(SC(6), SC(8)))
+             font=F(8, 1)).pack(side='left', padx=(SC(6), SC(8)))
     tk.Frame(head, bg=C['border'], height=1).pack(side='left', fill='x',
                                                   expand=True, pady=(SC(5), 0))
     return head
@@ -658,7 +976,7 @@ def decode_tc_fault(bits):
 class PeltierControl:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"IGNI - photocurrent & pyrocurrent bench  [APP {APP_BUILD}]")
+        self.root.title(f"{APP_NAME} - photocurrent & pyrocurrent bench  [APP {APP_BUILD}]")
         self.root.configure(bg=C['bg'])
         # The main window size is ALSO scaled by DPI and clipped to the screen -
         # see the comment at SC()/size_win().
@@ -737,6 +1055,14 @@ class PeltierControl:
         self.cfg_dir.mkdir(exist_ok=True)
         self.settings_file = self.cfg_dir / "ustawienia.json"
         self.log_dir = self._load_data_dir()
+        # Text scale BEFORE the UI is built: the DPI value auto-detected in
+        # main() is only the fallback, and the layout's fixed pixel geometry
+        # (SC()) is measured against whatever FS holds at build time - so the
+        # remembered value has to be in place first.
+        self._dpi_scale = FS
+        _saved_scale = self._load_ui_scale()
+        if _saved_scale:
+            set_ui_scale(_saved_scale)
         self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
         # Name hint for the NEXT archive save (see cyc_stop) - when set, it
         # skips the interactive "SAVE CYCLE TO ARCHIVE" dialog (which is
@@ -839,7 +1165,7 @@ class PeltierControl:
         except: pass
         st.configure('TNotebook', background=C['bg2'], borderwidth=0, tabmargins=[0,0,0,0])
         st.configure('TNotebook.Tab', background=C['bg2'], foreground=C['dim2'],
-                     padding=[SC(18), SC(10)], font=(FONT, fsz(10), 'bold'),
+                     padding=[SC(18), SC(10)], font=F(10, 1),
                      borderwidth=0)
         # The selected tab is marked by BOTH a lighter ground and gold text -
         # on the darker .15 background a background change alone was too
@@ -1092,6 +1418,7 @@ class PeltierControl:
                 self._cfg_synced = True
             if 'CAL' in d:
                 self.dev_cal = (d['CAL'] == '1')
+                self._update_cal_summary()
             if 'STATE' in d:
                 self.cur_state = d['STATE']
             # Polarity
@@ -1458,7 +1785,7 @@ class PeltierControl:
         win.configure(bg=C['bg'])
         size_win(win, 720, 520, 560, 400, parent=self.root)
         tk.Label(win, text="CALIBRATION TABLE — heating PID (Kp / Ki / Kd)",
-                 bg=C['bg'], fg=C['purple'], font=(FONT, fsz(12), 'bold')).pack(
+                 bg=C['bg'], fg=C['purple'], font=F(12, 1)).pack(
                  anchor='w', padx=16, pady=(14, 4))
         n_valid = sum(1 for p in profiles if p['valid'])
         n_fallback = sum(1 for p in profiles if p['valid'] and self._is_base_profile(p))
@@ -1470,7 +1797,7 @@ class PeltierControl:
                          "(shown in red below).")
         tk.Label(win, text=info_txt,
                  bg=C['bg'], fg=(C['red'] if n_fallback else C['dim']),
-                 font=(FONT, fsz(9)), justify='left').pack(anchor='w', padx=16)
+                 font=F(9), justify='left').pack(anchor='w', padx=16)
         # Map idx -> profile
         pmap = {p['idx']: p for p in profiles}
         # Scrollable table
@@ -1486,16 +1813,16 @@ class PeltierControl:
         sb.pack(side='right', fill='y')
         # Header: ramps
         tk.Label(inner, text="Temp\\Ramp", bg=C['panel'], fg=C['cyan'],
-                 font=(FONT, fsz(9), 'bold'), width=10, anchor='w').grid(
+                 font=F(9, 1), width=10, anchor='w').grid(
                  row=0, column=0, sticky='nsew', padx=1, pady=1)
         for ci, r in enumerate(PR):
             tk.Label(inner, text=f"{r}°C/min", bg=C['panel'], fg=C['cyan'],
-                     font=(FONT, fsz(9), 'bold'), width=16).grid(
+                     font=F(9, 1), width=16).grid(
                      row=0, column=ci+1, sticky='nsew', padx=1, pady=1)
         # Rows: temperatures
         for ri, t in enumerate(PT):
             tk.Label(inner, text=f"{t}°C", bg=C['panel'], fg=C['orange'],
-                     font=(FONT, fsz(9), 'bold'), width=10, anchor='w').grid(
+                     font=F(9, 1), width=10, anchor='w').grid(
                      row=ri+1, column=0, sticky='nsew', padx=1, pady=1)
             for ci, r in enumerate(PR):
                 idx = ri * len(PR) + ci  # pi_(ti,ri) = ti*PR_N+ri
@@ -1511,14 +1838,14 @@ class PeltierControl:
                     txt = "—"
                     fg = C['dim2']; bg = C['panel2']
                 tk.Label(inner, text=txt, bg=bg, fg=fg,
-                         font=(FONT, fsz(8)), width=16).grid(
+                         font=F(8), width=16).grid(
                          row=ri+1, column=ci+1, sticky='nsew', padx=1, pady=1)
         # Footer
         tk.Label(win, text="Each cell: Kp / Ki / Kd for that temperature and ramp rate.\n"
                  "On START, the app interpolates between the 4 nearest points automatically.\n"
                  "⚠ = identical to the base defaults - almost certainly a failed relay test "
                  "(no real oscillation measured), not a genuine calibration.",
-                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(8)), justify='left').pack(
+                 bg=C['bg'], fg=C['dim'], font=F(8), justify='left').pack(
                  anchor='w', padx=16, pady=(0, 12))
 
     def _is_base_profile(self, p):
@@ -1637,35 +1964,57 @@ class PeltierControl:
         top.pack(fill='x'); top.pack_propagate(False)
         tk.Frame(top, bg=C['gold'], width=SC(4)).pack(side='left', fill='y')
 
-        badge = tk.Canvas(top, width=SC(30), height=SC(30), bg=C['bg2'],
+        bw = SC(30)
+        badge = tk.Canvas(top, width=bw, height=bw, bg=C['bg2'],
                           highlightthickness=0)
         badge.pack(side='left', padx=(SC(10), SC(8)))
-        draw_medallion(badge, SC(15), SC(15), SC(12), C['gold'], C['bg2'])
+        self._img_badge = make_mark(
+            bw, bw, C['bg2'],
+            lambda c: draw_medallion(c, bw / 2, bw / 2, SC(12), C['gold'], C['bg2']))
+        if self._img_badge is not None:
+            badge.create_image(0, 0, anchor='nw', image=self._img_badge)
+        else:
+            draw_medallion(badge, bw / 2, bw / 2, SC(12), C['gold'], C['bg2'])
 
         idbox = tk.Frame(top, bg=C['bg2'])
         idbox.pack(side='left')
+        # The name is DRAWN, not typed: the same chiselled letterforms as the
+        # emblem (see GLYPHS), so the mark in the title bar is one object
+        # rather than a picture standing next to some text in whatever
+        # monospace font the machine happens to have.
         nrow = tk.Frame(idbox, bg=C['bg2'])
         nrow.pack(anchor='w')
-        tk.Label(nrow, text="IGNI", bg=C['bg2'], fg=C['text'],
-                 font=(FONT, fsz(15), 'bold')).pack(side='left')
+        wh = SC(17)                                   # cap height
+        ww = int(wordmark_width(h=wh)) + SC(4)
+        wht = wh + SC(6)
+        wm = tk.Canvas(nrow, width=ww, height=wht, bg=C['bg2'],
+                       highlightthickness=0)
+        wm.pack(side='left')
+        self._img_wm = make_mark(
+            ww, wht, C['bg2'],
+            lambda c: draw_wordmark(c, SC(2), wh + SC(1), wh, C['gold'], C['bg2']))
+        if self._img_wm is not None:
+            wm.create_image(0, 0, anchor='nw', image=self._img_wm)
+        else:
+            draw_wordmark(wm, SC(2), wh + SC(1), wh, C['gold'], C['bg2'])
         tk.Label(nrow, text="  photocurrent & pyrocurrent bench",
                  bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(side='left', pady=(SC(4), 0))
+                 font=F(9)).pack(side='left', pady=(SC(5), 0))
         vrow = tk.Frame(idbox, bg=C['bg2'])
         vrow.pack(anchor='w')
         tk.Label(vrow, text=f"APP {APP_BUILD}", bg=C['bg2'], fg=C['dim2'],
-                 font=(FONT, fsz(8))).pack(side='left')
+                 font=F(8)).pack(side='left')
         tk.Label(vrow, text="·", bg=C['bg2'], fg=C['dim2'],
-                 font=(FONT, fsz(8))).pack(side='left', padx=SC(5))
+                 font=F(8)).pack(side='left', padx=SC(5))
         self.fw_build_lbl = tk.Label(vrow, text="FW —", bg=C['bg2'], fg=C['dim2'],
-                                      font=(FONT, fsz(8)))
+                                      font=F(8))
         self.fw_build_lbl.pack(side='left')
 
         # Live state on the right
         sf = tk.Frame(top, bg=C['bg2'])
         sf.pack(side='right', padx=SC(16))
         self.btn_diag = tk.Button(sf, text="DIAG", command=self.open_diag_window,
-                                   bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9), 'bold'),
+                                   bg=C['bg2'], fg=C['dim'], font=F(9, 1),
                                    relief='flat', cursor='hand2', bd=0, padx=SC(10), pady=SC(4),
                                    activebackground=C['panel3'])
         self.btn_diag.pack(side='left', padx=(0, SC(16)))
@@ -1674,7 +2023,7 @@ class PeltierControl:
         self.s_dot.pack(side='left', padx=(0, SC(8)))
         self._draw_dot(C['dim2'], glow=False)
         self.s_lbl = tk.Label(sf, text="DISCONNECTED", bg=C['bg2'], fg=C['dim'],
-                              font=(FONT, fsz(10)))
+                              font=F(10))
         self.s_lbl.pack(side='left')
 
         # ── TABS, ORDERED BY HOW OFTEN THEY ARE USED ────────────────────
@@ -1745,19 +2094,19 @@ class PeltierControl:
         ctrl.pack(side='right', padx=(8, 0))
         self.is_running = False  # state: is a run in progress
         self.btn_run = tk.Button(ctrl, text="▶ START", command=self.toggle_run,
-                                 bg=C['green'], fg='#1a1c1f', font=(FONT, fsz(12), 'bold'),
+                                 bg=C['green'], fg='#1a1c1f', font=F(12, 1),
                                  relief='flat', cursor='hand2', bd=0, padx=16, pady=12,
                                  activebackground=_lighten(C['green'], 0.15))
         self.btn_run.pack(side='left', padx=(0, 4), fill='y')
         # FREEZE - freeze the gal for a sample swap
         self.btn_freeze = tk.Button(ctrl, text="❄ FREEZE", command=self.do_freeze,
-                                    bg=C['bg2'], fg=C['cyan'], font=(FONT, fsz(12), 'bold'),
+                                    bg=C['bg2'], fg=C['cyan'], font=F(12, 1),
                                     relief='flat', cursor='hand2', bd=0, padx=12, pady=12,
                                     highlightthickness=2, highlightbackground=C['cyan'],
                                     activebackground=C['panel3'])
         self.btn_freeze.pack(side='left', padx=(0, 4), fill='y')
         self.btn_estop = tk.Button(ctrl, text="⛔", command=self.do_estop,
-                                   bg=C['red'], fg='#fff', font=(FONT, fsz(14), 'bold'),
+                                   bg=C['red'], fg='#fff', font=F(14, 1),
                                    relief='flat', cursor='hand2', bd=0, padx=12, pady=12,
                                    activebackground=_lighten(C['red'], 0.15))
         self.btn_estop.pack(side='left', fill='y')
@@ -1786,14 +2135,14 @@ class PeltierControl:
         inner = tk.Frame(card, bg=C['panel'])
         inner.pack(fill='both', expand=True, padx=SC(11), pady=(SC(7), SC(8)))
         tk.Label(inner, text=title, bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(8)), anchor='w').pack(anchor='w')
+                 font=F(8), anchor='w').pack(anchor='w')
         vrow = tk.Frame(inner, bg=C['panel'])
         vrow.pack(anchor='w', pady=(SC(3), 0))
         val = tk.Label(vrow, text="--", bg=C['panel'], fg=color,
-                       font=(FONT, fsz(22), 'bold'))
+                       font=F(22, 1))
         val.pack(side='left')
         unit_lbl = tk.Label(vrow, text=" " + unit, bg=C['panel'], fg=C['dim2'],
-                            font=(FONT, fsz(8)))
+                            font=F(8))
         unit_lbl.pack(side='left', pady=(SC(8), 0))
         return {'val': val, 'unit': unit, 'unit_lbl': unit_lbl, 'extra': None, 'row': vrow}
 
@@ -1805,11 +2154,11 @@ class PeltierControl:
         hd = tk.Frame(wrap, bg=C['panel'])
         hd.pack(fill='x', padx=14, pady=(10, 4))
         tk.Label(hd, text="LIVE CHART", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+                 font=F(10, 1)).pack(side='left')
 
         # Setpoint approach statistics (right side of the header)
         self.reach_lbl = tk.Label(hd, text="", bg=C['panel'], fg=C['green'],
-                                  font=(FONT, fsz(9), 'bold'))
+                                  font=F(9, 1))
         self.reach_lbl.pack(side='right')
 
         self.fig = Figure(figsize=(9, 6), facecolor=C['panel'], dpi=110)
@@ -1822,15 +2171,20 @@ class PeltierControl:
             ax.set_facecolor(C['panel2'])
 
         self.cv = FigureCanvasTkAgg(self.fig, master=wrap)
-        self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
-
-        # Chart toolbar: pause, time window, matplotlib zoom
+        # ORDER MATTERS. The toolbar row is created and packed to the BOTTOM
+        # first, so it reserves its height before the expanding canvas claims
+        # what is left. Packed the other way round the matplotlib canvas wins
+        # the negotiation and squeezes the row - at 125% text scale that
+        # cost the PAUSE/WINDOW buttons ~20 px of height each and cut their
+        # labels in half. Same failure mode as the control rows in ARCHIVE.
         toolbar_row = tk.Frame(wrap, bg=C['panel'])
-        toolbar_row.pack(fill='x', padx=8, pady=(0, 8))
+        toolbar_row.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
+
+        self.cv.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=(0, 4))
 
         # PAUSE button - stops scrolling so you can zoom in
         self.btn_pause = tk.Button(toolbar_row, text="⏸ PAUSE", command=self.toggle_pause,
-                                   bg=C['bg2'], fg=C['yellow'], font=(FONT, fsz(9), 'bold'),
+                                   bg=C['bg2'], fg=C['yellow'], font=F(9, 1),
                                    relief='flat', cursor='hand2', bd=0, padx=12, pady=6,
                                    highlightthickness=1, highlightbackground=C['yellow'],
                                    activebackground=C['panel3'])
@@ -1838,11 +2192,11 @@ class PeltierControl:
 
         # Time window selection (how many last seconds to show)
         tk.Label(toolbar_row, text="WINDOW:", bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(8))).pack(side='left', padx=(8, 4))
+                 font=F(8)).pack(side='left', padx=(8, 4))
         for label, secs in [("ALL", 0), ("5m", 300), ("2m", 120), ("1m", 60)]:
             b = tk.Button(toolbar_row, text=label,
                          command=lambda s=secs: self.set_chart_window(s),
-                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(8)),
+                         bg=C['bg2'], fg=C['dim'], font=F(8),
                          relief='flat', cursor='hand2', bd=0, padx=10, pady=5,
                          activebackground=C['panel3'])
             b.pack(side='left', padx=2)
@@ -1925,9 +2279,9 @@ class PeltierControl:
         # repeated the tab name, and its three groups were separated by
         # anonymous hairlines. Named sections say what each group is FOR.
         tk.Label(inner, text="RUN SETUP", bg=C['bg2'], fg=C['text'],
-                 font=(FONT, fsz(13), 'bold')).pack(anchor='w')
+                 font=F(13, 1)).pack(anchor='w')
         tk.Label(inner, text="applied on START", bg=C['bg2'], fg=C['dim2'],
-                 font=(FONT, fsz(8))).pack(anchor='w', pady=(1, 0))
+                 font=F(8)).pack(anchor='w', pady=(1, 0))
         section(inner, "SETPOINT & RAMPS", C['orange'], C['bg2'], pady=(12, 8))
 
         # Setting sliders
@@ -1950,10 +2304,10 @@ class PeltierControl:
         fan_hd = tk.Frame(inner, bg=C['bg2'])
         fan_hd.pack(fill='x', pady=(0, 4))
         tk.Label(fan_hd, text="STATE", bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(9), 'bold')).pack(side='left')
+                 font=F(9, 1)).pack(side='left')
         self.fan_on = False
         self.btn_fan = tk.Button(fan_hd, text="○ OFF", command=self.toggle_fan,
-                                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9), 'bold'),
+                                 bg=C['bg2'], fg=C['dim2'], font=F(9, 1),
                                  relief='flat', cursor='hand2', bd=0, padx=12, pady=4,
                                  highlightthickness=1, highlightbackground=C['dim'],
                                  activebackground=C['panel3'])
@@ -1968,8 +2322,8 @@ class PeltierControl:
         auto = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
                         highlightbackground=C['green'])
         auto.pack(fill='x', pady=(0, 10))
-        tk.Label(auto, text="● AUTO: direction by setpoint", bg=C['bg2'],
-                 fg=C['green'], font=(FONT, fsz(9))).pack(padx=8, pady=6)
+        tk.Label(auto, text="● AUTO direction", bg=C['bg2'],
+                 fg=C['green'], font=F(9)).pack(padx=8, pady=6)
 
         # Multi-step profiles
         # Profiles + Presets
@@ -1982,14 +2336,14 @@ class PeltierControl:
 
         # Calibration status - clickable (shows progress while calibration runs)
         self.cal_status = tk.Label(inner, text="", bg=C['bg2'], fg=C['purple'],
-                                   font=(FONT, fsz(8)), anchor='w', cursor='hand2')
+                                   font=F(8), anchor='w', cursor='hand2')
         self.cal_status.pack(fill='x', pady=(0, 4))
         self.cal_status.bind('<Button-1>', lambda e: self.open_cal_window())
 
         tk.Label(inner, text="▶ START uses panel values",
-                 bg=C['bg2'], fg=C['green'], font=(FONT, fsz(8))).pack(anchor='w', pady=(4, 0))
+                 bg=C['bg2'], fg=C['green'], font=F(8)).pack(anchor='w', pady=(4, 0))
         tk.Label(inner, text="PID tuning & calibration → TUNING tab",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
+                 bg=C['bg2'], fg=C['dim2'], font=F(8),
                  justify='left', wraplength=SC(312) - SC(44)
                  ).pack(anchor='w', fill='x', pady=(2, 0))
 
@@ -2019,62 +2373,66 @@ class PeltierControl:
         inner.pack(fill='x', padx=4, pady=4)
         inner.configure(width=560)
 
-        tk.Label(inner, text="TUNING — PID & CALIBRATION", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
-        tk.Label(inner, text="Tuning, calibration and device memory",
-                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+        tk.Label(inner, text="TUNING & DEVICE MEMORY", bg=C['bg'], fg=C['text'],
+                 font=F(14, 1)).pack(anchor='w')
+        tk.Label(inner, text="Calibration state, thermocouple offset and Flash backups",
+                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 16))
 
         # ── PID TUNING ──
-        sec1 = self._adv_section(inner, "PID TUNING", C['cyan'])
-        pid_hd = tk.Frame(sec1, bg=C['bg2'])
-        pid_hd.pack(fill='x', pady=(0, 8))
-        tk.Label(pid_hd, text="Manual PID gains", bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(side='left')
-        self.btn_st = mk_btn(pid_hd, "SELF-TUNE", self.do_selftune, C['cyan'])
-        self.btn_st.pack(side='right')
-        self.sl_kp = SliderField(sec1, "Kp", 1, 30, 10.0, C['cyan'], "", 1,
-                                 on_change=lambda v: self.send(f"KP:{v:.1f}"))
-        self.sl_ki = SliderField(sec1, "Ki", 0, 1.5, 0.3, C['cyan'], "", 2,
-                                 on_change=lambda v: self.send(f"KI:{v:.2f}"))
-        self.sl_kd = SliderField(sec1, "Kd", 0, 80, 0.8, C['cyan'], "", 2,
-                                 on_change=lambda v: self.send(f"KD:{v:.2f}"))
-        # Feed-forward (heating): HOLD = power to hold, RAMP = power for ramp dynamics.
-        # Tune live: too strong at the start -> lower RAMP; not reaching -> raise it.
-        self.sl_kffh = SliderField(sec1, "FF HOLD (KFFH)", 0, 8, 2.5, C['yellow'], "PWM/°C", 2,
-                                   on_change=lambda v: self.send(f"KFFH:{v:.2f}"))
-        self.sl_kffr = SliderField(sec1, "FF RAMP (KFFR)", 0, 4, 1.0, C['yellow'], "PWM/(°C/min)", 2,
-                                   on_change=lambda v: self.send(f"KFFR:{v:.2f}"))
+        # ── WHAT USED TO BE HERE, AND WHY IT IS GONE (APP .17) ──────────
+        # This tab held: manual Kp/Ki/Kd/FF sliders, the AUTO-CAL range wizard,
+        # and a "RE-DETECT" button for the Peltier polarity.
+        #
+        # All three were commissioning tools, and commissioning is done. The
+        # PID grid is calibrated and living in the board's Flash, the
+        # feed-forward model is fixed in firmware, and the Peltier is soldered
+        # in one orientation that is not going to change. Leaving them on
+        # screen meant every one of them was a way to break a working
+        # instrument with a single stray click - and the polarity button in
+        # particular would have driven the module for 4 s just to watch which
+        # way the temperature went.
+        #
+        # Nothing was deleted from the device: the calibration is still in
+        # Flash, the firmware still runs the same PID, and SELF-TUNE plus the
+        # calibration table stay available below for diagnosis. The thermocouple
+        # offset stays too - that IS a per-setup measurement value, not a
+        # commissioning knob. If a re-tune is ever needed, the sliders are one
+        # revert away in git.
+        sec1 = self._adv_section(inner, "CALIBRATION STATUS", C['cyan'])
+        self.cal_summary = tk.Label(
+            sec1, text="Reading from device...", bg=C['bg2'], fg=C['dim'],
+            font=F(9), anchor='w', justify='left')
+        self.cal_summary.pack(anchor='w', fill='x')
+        cs_row = tk.Frame(sec1, bg=C['bg2'])
+        cs_row.pack(fill='x', pady=(10, 0))
+        mk_btn_outline(cs_row, "VIEW CAL TABLE", self.show_cal_table,
+                       C['purple']).pack(side='left', fill='x', expand=True,
+                                         padx=(0, 4))
+        self.btn_st = mk_btn_outline(cs_row, "SELF-TUNE HERE", self.do_selftune,
+                                     C['cyan'])
+        self.btn_st.pack(side='left', fill='x', expand=True, padx=(4, 0))
+        tk.Label(sec1, text="SELF-TUNE re-measures the gains for the CURRENT "
+                            "setpoint and rate only, and writes them to Flash.",
+                 bg=C['bg2'], fg=C['dim2'], font=F(8), justify='left',
+                 wraplength=SC(560)).pack(anchor='w', pady=(8, 0))
 
-        # ── AUTO-CALIBRATION ──
-        sec2 = self._adv_section(inner, "AUTO-CALIBRATION", C['purple'])
-        self.btn_autocal = mk_btn(sec2, "⚙ AUTO-CAL (select range)",
-                                  self.do_autocal, C['purple'], fg='#fff')
-        self.btn_autocal.pack(fill='x', pady=(0, 6))
-        mk_btn_outline(sec2, "📋 VIEW CAL TABLE", self.show_cal_table,
-                       C['purple']).pack(fill='x', pady=(0, 6))
-        tk.Label(sec2, text="Calibrates PID for temp × ramp grid, saves to Flash.\n"
-                 "View table shows stored Kp/Ki/Kd per point.",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8)),
-                 justify='left').pack(anchor='w')
-
-        # ── THERMOCOUPLE OFFSET ──
+        # ── THERMOCOUPLE ────────────────────────────────────────────────
         sec3 = self._adv_section(inner, "THERMOCOUPLE", C['purple'])
         self.sl_off = SliderField(sec3, "CAL OFFSET", -20, 20, 0.0,
                                   C['purple'], "°C", 1,
                                   on_change=lambda v: self.send(f"OFFSET:{v:.1f}"))
 
-        # ── PELTIER POLARITY ──
+        # ── PELTIER POLARITY (read-only since .17 / FW .30) ─────────────
         sec4 = self._adv_section(inner, "PELTIER POLARITY", C['orange'])
-        pol_frame = tk.Frame(sec4, bg=C['bg2'])
-        pol_frame.pack(fill='x')
-        self.pol_indicator = tk.Label(pol_frame, text="POL: ?", bg=C['bg2'],
-                                      fg=C['dim2'], font=(FONT, fsz(10), 'bold'))
-        self.pol_indicator.pack(side='left')
-        mk_btn_outline(pol_frame, "RE-DETECT", self.do_repol, C['dim']).pack(side='right')
-        tk.Label(sec4, text="Detected once, saved permanently",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(6, 0))
+        self.pol_indicator = tk.Label(sec4, text="POL: ?", bg=C['bg2'],
+                                      fg=C['dim'], font=F(10, 1))
+        self.pol_indicator.pack(anchor='w')
+        tk.Label(sec4, text="Fixed in the board's Flash and no longer "
+                            "detectable at runtime - the wiring is soldered. "
+                            "Changing it needs POL_DEFAULT in the firmware.",
+                 bg=C['bg2'], fg=C['dim2'], font=F(8), justify='left',
+                 wraplength=SC(560)).pack(anchor='w', pady=(6, 0))
 
-        # ── DEVICE FLASH MEMORY ──
         sec5 = self._adv_section(inner, "DEVICE FLASH", C['green'])
         bf2 = tk.Frame(sec5, bg=C['bg2'])
         bf2.pack(fill='x')
@@ -2083,7 +2441,7 @@ class PeltierControl:
         mk_btn_outline(bf2, "LOAD", lambda: self.send("LOAD"), C['cyan']).pack(
             side='left', fill='x', expand=True, padx=(3, 0))
         tk.Label(sec5, text="Save/load settings to device internal memory",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(6, 0))
+                 bg=C['bg2'], fg=C['dim2'], font=F(8)).pack(anchor='w', pady=(6, 0))
 
         # ── PC CALIBRATION BACKUP ──
         sec6 = self._adv_section(inner, "PC CALIBRATION BACKUP", C['purple'])
@@ -2096,7 +2454,7 @@ class PeltierControl:
                        self._manual_load_cal, C['cyan']).pack(
                        side='left', fill='x', expand=True, padx=(3, 0))
         tk.Label(sec6, text="Backup profiles to a file (auto-loaded on connect)",
-                 bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(8))).pack(anchor='w', pady=(6, 0))
+                 bg=C['bg2'], fg=C['dim2'], font=F(8)).pack(anchor='w', pady=(6, 0))
 
         # ── RESET ──
         sec7 = self._adv_section(inner, "RESET", C['red'])
@@ -2118,11 +2476,11 @@ class PeltierControl:
         # Sliders always enabled (values can be set before connecting)
         # START/STOP enabled too - they check the connection at click time
         # (we disable only when we explicitly want to block them)
-        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_kp', 'sl_ki', 'sl_kd', 'sl_off', 'sl_fan']:
+        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_off', 'sl_fan']:
             if hasattr(self, sl):
                 getattr(self, sl).set_enabled(True)
         # Buttons always clickable - they respond with a message if not connected
-        for b in ['btn_run', 'btn_st', 'btn_autocal', 'btn_estop', 'btn_freeze', 'btn_fan']:
+        for b in ['btn_run', 'btn_st', 'btn_estop', 'btn_freeze', 'btn_fan']:
             if hasattr(self, b):
                 getattr(self, b).config(state='normal')
 
@@ -2173,9 +2531,11 @@ class PeltierControl:
         self.send(f"RU:{self.sl_ru.get():.1f}")
         self.send(f"RD:{self.sl_rd.get():.1f}")
         self.send(f"TMAX:{self.sl_tmax.get():.0f}")
-        self.send(f"KP:{self.sl_kp.get():.1f}")
-        self.send(f"KI:{self.sl_ki.get():.2f}")
-        self.send(f"KD:{self.sl_kd.get():.2f}")
+        # Kp/Ki/Kd are NOT pushed from here any more (APP .17). They used to be
+        # sent from the manual sliders on every START, which quietly OVERWROTE
+        # whatever the board had just interpolated from its calibration grid
+        # for this setpoint and rate. Now the board's own calibrated values
+        # stand - which is the whole point of having calibrated it.
         self.send(f"OFFSET:{self.sl_off.get():.1f}")
         time.sleep(0.05)
         self.send("START")
@@ -2253,17 +2613,20 @@ class PeltierControl:
                 "This clears all profiles and calibration!"):
             self.send("RESET")
 
-    def do_repol(self):
-        """Force re-detection of the Peltier polarity"""
-        if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+    def _update_cal_summary(self):
+        """One line on the TUNING tab saying whether the board is calibrated.
+        Replaces the sliders that used to live there - what matters day to day
+        is not the individual gains, it is whether the grid in Flash is valid."""
+        if not hasattr(self, 'cal_summary'):
             return
-        if messagebox.askyesno("Re-detect polarity",
-                "Re-detect Peltier polarity?\n\n"
-                "The device will briefly heat to check direction (~4s).\n"
-                "Do not touch the thermocouple during the test.\n"
-                "Result is saved permanently."):
-            self.send("REPOL")
+        if getattr(self, 'dev_cal', False):
+            self.cal_summary.config(
+                text="Calibrated - the board interpolates Kp/Ki/Kd from its "
+                     "Flash grid for each setpoint and rate.", fg=C['green'])
+        else:
+            self.cal_summary.config(
+                text="NOT calibrated - the board is running base gains. "
+                     "Use SELF-TUNE, or restore a backup below.", fg=C['orange'])
 
     def _update_pol_indicator(self):
         """Update the polarity indicator in the panel"""
@@ -2429,17 +2792,17 @@ class PeltierControl:
         inner.pack(fill='x', padx=20, pady=16)
 
         tk.Label(inner, text="SERIAL CONNECTION", bg=C['panel'], fg=C['text'],
-                 font=(FONT, fsz(12), 'bold')).pack(anchor='w', pady=(0, 12))
+                 font=F(12, 1)).pack(anchor='w', pady=(0, 12))
 
         tk.Label(inner, text="Available ports:", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(10))).pack(anchor='w')
+                 font=F(10)).pack(anchor='w')
 
         lf = tk.Frame(inner, bg=C['panel'])
         lf.pack(fill='x', pady=8)
         sb = tk.Scrollbar(lf)
         sb.pack(side='right', fill='y')
         self.conn_list = tk.Listbox(lf, bg=C['bg2'], fg=C['text'],
-                                    font=(FONT, fsz(10)), height=6,
+                                    font=F(10), height=6,
                                     selectbackground=C['blue'], borderwidth=0,
                                     highlightthickness=1, highlightbackground=C['border'],
                                     yscrollcommand=sb.set, activestyle='none')
@@ -2460,7 +2823,7 @@ class PeltierControl:
         ii = tk.Frame(info, bg=C['panel'])
         ii.pack(fill='x', padx=20, pady=16)
         tk.Label(ii, text="INSTRUCTIONS", bg=C['panel'], fg=C['text'],
-                 font=(FONT, fsz(11), 'bold')).pack(anchor='w', pady=(0, 8))
+                 font=F(11, 1)).pack(anchor='w', pady=(0, 8))
         for line in [
             "1. Connect ItsyBitsy (firmware v19 PC MODE) via USB",
             "2. Select COM port from the list and click CONNECT",
@@ -2469,7 +2832,44 @@ class PeltierControl:
             "5. Chart shows live data, samples are logged to CSV",
         ]:
             tk.Label(ii, text=line, bg=C['panel'], fg=C['dim'],
-                     font=(FONT, fsz(9)), anchor='w').pack(anchor='w', pady=1)
+                     font=F(9), anchor='w').pack(anchor='w', pady=1)
+
+        # ── INTERFACE: text size ────────────────────────────────────────
+        # Windows DPI scaling is a decent first guess and a bad final answer:
+        # on a 150% display it made every label 1.5x, which on this layout is
+        # simply too big. So the auto value is only the DEFAULT now, and this
+        # row overrides it. Takes effect immediately - see set_ui_scale().
+        ui = tk.Frame(wrap, bg=C['panel'])
+        ui.pack(fill='x', pady=(0, 16))
+        tk.Frame(ui, bg=C['gold'], height=SC(3)).pack(fill='x')
+        uii = tk.Frame(ui, bg=C['panel'])
+        uii.pack(fill='x', padx=SC(20), pady=SC(16))
+        tk.Label(uii, text="INTERFACE", bg=C['panel'], fg=C['text'],
+                 font=F(11, 1)).pack(anchor='w', pady=(0, SC(8)))
+        row = tk.Frame(uii, bg=C['panel'])
+        row.pack(anchor='w')
+        tk.Label(row, text="TEXT SIZE", bg=C['panel'], fg=C['dim'],
+                 font=F(9, 1)).pack(side='left', padx=(0, SC(12)))
+        self.scale_btns = []
+        for label, val in (("AUTO", None), ("75%", 0.75), ("85%", 0.85),
+                           ("100%", 1.0), ("115%", 1.15), ("130%", 1.30),
+                           ("150%", 1.50)):
+            b = tk.Button(row, text=label, font=F(9, 1), relief='flat',
+                          cursor='hand2', bd=0, padx=SC(11), pady=SC(5),
+                          bg=C['bg2'], fg=C['dim'],
+                          highlightthickness=1, highlightbackground=C['border2'],
+                          activebackground=C['panel3'],
+                          command=lambda v=val: self._set_ui_scale(v))
+            b.pack(side='left', padx=(0, SC(4)))
+            self.scale_btns.append((val, b))
+        self.scale_note = tk.Label(uii, text="", bg=C['panel'], fg=C['dim2'],
+                                   font=F(8), anchor='w')
+        self.scale_note.pack(anchor='w', pady=(SC(8), 0))
+        pct = int(round(FS * 100))
+        src = "auto (display DPI)" if self._load_ui_scale() is None else "manual"
+        self.scale_note.config(
+            text=f"Text at {pct}% - {src}. Spacing re-measures on restart.")
+        self._refresh_scale_buttons()
 
         self.refresh_ports()
 
@@ -2497,9 +2897,9 @@ class PeltierControl:
         hd = tk.Frame(wrap, bg=C['bg'])
         hd.pack(fill='x', pady=(0, 6))
         tk.Label(hd, text="CYCLE ARCHIVE", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(12), 'bold')).pack(side='left')
+                 font=F(12, 1)).pack(side='left')
         tk.Label(hd, text="  tick cycles on the left, pick curves and X axis below",
-                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8))).pack(side='left', padx=(8, 0))
+                 bg=C['bg'], fg=C['dim2'], font=F(8)).pack(side='left', padx=(8, 0))
         mk_btn(hd, "REFRESH", self.refresh_arch, C['cyan']).pack(side='right')
 
         # ── MEASUREMENT DATA FOLDER ─────────────────────────────────────
@@ -2510,9 +2910,9 @@ class PeltierControl:
         dd.pack(fill='x', pady=(0, 10))
         tk.Frame(dd, bg=C['green'], width=SC(4)).pack(side='left', fill='y')
         tk.Label(dd, text="DATA:", bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(9), 'bold')).pack(side='left', padx=(10, 6), pady=6)
+                 font=F(9, 1)).pack(side='left', padx=(10, 6), pady=6)
         self.data_dir_lbl = tk.Label(dd, text="", bg=C['bg2'], fg=C['text'],
-                                     font=(FONT, fsz(9)), anchor='w')
+                                     font=F(9), anchor='w')
         self.data_dir_lbl.pack(side='left', fill='x', expand=True, pady=6)
         mk_btn_outline(dd, "📂 OPEN", self.open_log_folder, C['dim']).pack(
             side='right', padx=(4, 8), pady=4)
@@ -2534,7 +2934,7 @@ class PeltierControl:
         lhd = tk.Frame(lf, bg=C['panel'])
         lhd.pack(fill='x', padx=12, pady=8)
         tk.Label(lhd, text="SAVED CYCLES", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+                 font=F(10, 1)).pack(side='left')
         mk_btn_outline(lhd, "CLEAR", self._arch_clear_sel, C['dim']).pack(side='right')
 
         # Scrollable list of checkboxes
@@ -2581,7 +2981,7 @@ class PeltierControl:
         self.arch_settings = tk.Frame(cf, bg=C['bg2'])
         self.arch_settings.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
         self.arch_settings_lbl = tk.Label(self.arch_settings, text="",
-                                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
+                                         bg=C['bg2'], fg=C['dim'], font=F(9),
                                          anchor='w', justify='left')
         self.arch_settings_lbl.pack(fill='x', padx=10, pady=6)
 
@@ -2632,21 +3032,21 @@ class PeltierControl:
         self.arch_align = tk.BooleanVar(value=True)
         self.arch_xmode = tk.StringVar(value='t0')
         tk.Label(xrow, text="X AXIS:", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
+                 font=F(8, 1)).pack(side='left', padx=(0, 6))
         for val, txt in (('t0', 'from start'), ('abs', 'file time'),
                          ('pc', 'PC clock'), ('ramp', 'ramp start'),
                          ('temp', 'rel. temperature')):
             tk.Radiobutton(xrow, text=txt, value=val, variable=self.arch_xmode,
                            command=self._on_xmode_change, bg=C['panel'], fg=C['dim'],
                            selectcolor=C['bg2'], activebackground=C['panel'],
-                           activeforeground=C['text'], font=(FONT, fsz(8)),
+                           activeforeground=C['text'], font=F(8),
                            bd=0, highlightthickness=0).pack(side='left')
         # Reference temperature for the "rel. temperature" mode
         self.arch_treflbl = tk.Label(xrow, text="T=", bg=C['panel'], fg=C['dim'],
-                                     font=(FONT, fsz(8)))
+                                     font=F(8))
         self.arch_treflbl.pack(side='left', padx=(8, 2))
         self.arch_tref = tk.Entry(xrow, width=6, bg=C['bg2'], fg=C['text'],
-                                  font=(FONT, fsz(9)), relief='flat',
+                                  font=F(9), relief='flat',
                                   insertbackground=C['text'])
         self.arch_tref.insert(0, "40.0")
         self.arch_tref.pack(side='left')
@@ -2655,7 +3055,7 @@ class PeltierControl:
 
         # ── WHICH CURVES TO DRAW ────────────────────────────────────────
         tk.Label(crow, text="CURVES:", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(8), 'bold')).pack(side='left', padx=(0, 6))
+                 font=F(8, 1)).pack(side='left', padx=(0, 6))
         self.arch_show = {}
         for key, txt, dflt in (('temp', 'temperature', True),
                                ('sa', 'setpoint', True),
@@ -2667,7 +3067,7 @@ class PeltierControl:
             tk.Checkbutton(crow, text=txt, variable=v, command=self._redraw_arch,
                            bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                            activebackground=C['panel'], activeforeground=C['text'],
-                           font=(FONT, fsz(8)), bd=0, highlightthickness=0
+                           font=F(8), bd=0, highlightthickness=0
                            ).pack(side='left', padx=(0, 4))
         mk_btn_outline(crow, "SELECT ALL", self._arch_select_all, C['dim']
                        ).pack(side='right')
@@ -2676,10 +3076,10 @@ class PeltierControl:
         # (interpolated onto a common time axis). Differences are far easier
         # to see than two nearly identical curves overlaid on each other.
         self.arch_delta = tk.BooleanVar(value=False)
-        tk.Checkbutton(xrow, text="delta vs 1st", variable=self.arch_delta,
+        tk.Checkbutton(xrow, text="\u0394 1st", variable=self.arch_delta,
                        command=self._redraw_arch, bg=C['panel'], fg=C['yellow'],
                        selectcolor=C['bg2'], activebackground=C['panel'],
-                       activeforeground=C['text'], font=(FONT, fsz(8)),
+                       activeforeground=C['text'], font=F(8),
                        bd=0, highlightthickness=0).pack(side='right', padx=(0, 10))
 
         # (run settings panel created above, as the bottom row)
@@ -2696,11 +3096,11 @@ class PeltierControl:
         wrap.pack(fill='both', expand=True, padx=16, pady=16)
 
         tk.Label(wrap, text="MEASUREMENT SERIES", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(12), 'bold')).pack(anchor='w')
+                 font=F(12, 1)).pack(anchor='w')
         tk.Label(wrap,
                  text="Add tests (SP/RATE/hold time) - the app runs them one by one, "
                       "returns to base between tests and archives every result itself.",
-                 bg=C['bg'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
+                 bg=C['bg'], fg=C['dim2'], font=F(8), justify='left',
                  wraplength=SC(760)
                  ).pack(anchor='w', pady=(2, SC(12)))
 
@@ -2730,8 +3130,8 @@ class PeltierControl:
 
         def _field(label, default):
             tk.Label(lin, text=label, bg=C['panel'], fg=C['dim'],
-                     font=(FONT, fsz(9))).pack(anchor='w', pady=(8, 2))
-            e = tk.Entry(lin, bg=C['bg2'], fg=C['text'], font=(FONT, fsz(11), 'bold'),
+                     font=F(9)).pack(anchor='w', pady=(8, 2))
+            e = tk.Entry(lin, bg=C['bg2'], fg=C['text'], font=F(11, 1),
                          relief='flat', insertbackground=C['text'])
             e.insert(0, default)
             e.pack(fill='x', ipady=4)
@@ -2750,9 +3150,9 @@ class PeltierControl:
 
         tk.Frame(lin, bg=C['border2'], height=1).pack(fill='x', pady=12)
         tk.Label(lin, text="BASE BETWEEN TESTS (°C)", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 2))
+                 font=F(9)).pack(anchor='w', pady=(0, 2))
         self.series_e_base = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
-                                       font=(FONT, fsz(11), 'bold'), relief='flat',
+                                       font=F(11, 1), relief='flat',
                                        insertbackground=C['text'])
         self.series_e_base.insert(0, f"{self.series_base_sp:.1f}")
         self.series_e_base.bind('<FocusOut>', self._on_series_base_change)
@@ -2760,9 +3160,9 @@ class PeltierControl:
         self.series_e_base.pack(fill='x', ipady=4)
 
         tk.Label(lin, text="RETURN RATE (°C/min)", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(anchor='w', pady=(10, 2))
+                 font=F(9)).pack(anchor='w', pady=(10, 2))
         self.series_e_return_rate = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
-                                              font=(FONT, fsz(11), 'bold'), relief='flat',
+                                              font=F(11, 1), relief='flat',
                                               insertbackground=C['text'])
         # CHANGED after analysing log 20260827 145616 (step/"hump" at the start
         # of every return): the default 25.0 was SLOWER than the natural
@@ -2786,7 +3186,7 @@ class PeltierControl:
         tk.Label(lin,
                  text="Independent of COOL RATE on CONTROL. Max by default - "
                       "a slower return gives a 'hump' at the start.",
-                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
+                 bg=C['panel'], fg=C['dim2'], font=F(8), justify='left',
                  wraplength=self._ser_wrap
                  ).pack(anchor='w', fill='x', pady=(3, 0))
 
@@ -2808,13 +3208,13 @@ class PeltierControl:
         # archive anyway, so it is compared exactly like a manual one.
         self.series_mode = tk.StringVar(value='seria')
         tk.Label(lin, text="MODE", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(anchor='w', pady=(SC(10), 2))
+                 font=F(9)).pack(anchor='w', pady=(SC(10), 2))
         for val, txt in (('seria', 'test series (return to base)'),
                          ('program', 'program (step by step)')):
             tk.Radiobutton(lin, text=txt, value=val, variable=self.series_mode,
                            bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                            activebackground=C['panel'], activeforeground=C['text'],
-                           font=(FONT, fsz(8)), bd=0, highlightthickness=0,
+                           font=F(8), bd=0, highlightthickness=0,
                            anchor='w', wraplength=self._ser_wrap,
                            justify='left').pack(anchor='w', fill='x')
         pf = tk.Frame(lin, bg=C['panel'])
@@ -2829,24 +3229,24 @@ class PeltierControl:
                        variable=self.series_cool_as_test,
                        bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
                        activebackground=C['panel'], activeforeground=C['text'],
-                       font=(FONT, fsz(9)), bd=0, highlightthickness=0,
+                       font=F(9), bd=0, highlightthickness=0,
                        anchor='w').pack(anchor='w', fill='x', pady=(SC(10), 0))
         tk.Label(lin,
                  text="Collects data for cooling calibration. Otherwise the descent "
                       "runs at max rate (return only).",
-                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
+                 bg=C['panel'], fg=C['dim2'], font=F(8), justify='left',
                  wraplength=self._ser_wrap
                  ).pack(anchor='w', fill='x', pady=(3, 0))
 
         tk.Label(lin, text="QUICK FILL", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(anchor='w', pady=(16, 2))
+                 font=F(9)).pack(anchor='w', pady=(16, 2))
         # Shorter caption - the full one ("SP from field x ramps 10/20/30/40/50/60/70")
         # did not fit in the column at larger fonts, and a button does not
         # wrap text, so the ends were cut off.
         mk_btn_outline(lin, "SP × ramps 10…70",
                        self._on_series_quickfill, C['purple']).pack(fill='x')
         tk.Label(lin, text="adds 7 tests: 10/20/30/40/50/60/70 °C/min",
-                 bg=C['panel'], fg=C['dim2'], font=(FONT, fsz(8)), justify='left',
+                 bg=C['panel'], fg=C['dim2'], font=F(8), justify='left',
                  wraplength=self._ser_wrap).pack(anchor='w', fill='x', pady=(3, 0))
 
         # ── Right column: list + status + start/stop ────────────
@@ -2857,10 +3257,10 @@ class PeltierControl:
         rhd = tk.Frame(right, bg=C['panel'])
         rhd.pack(fill='x', padx=14, pady=(10, 4))
         tk.Label(rhd, text="TEST LIST", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(side='left')
+                 font=F(10, 1)).pack(side='left')
 
         self.series_listbox = tk.Listbox(right, bg=C['bg2'], fg=C['text'],
-                                          font=(FONT, fsz(10)), relief='flat',
+                                          font=F(10), relief='flat',
                                           selectbackground=C['cyan'], height=14,
                                           highlightthickness=0, bd=0)
         self.series_listbox.pack(fill='both', expand=True, padx=14, pady=(0, 8))
@@ -2868,7 +3268,7 @@ class PeltierControl:
         stf = tk.Frame(right, bg=C['panel'])
         stf.pack(fill='x', padx=14, pady=(0, 10))
         self.series_status_lbl = tk.Label(stf, text="Series inactive",
-                                           bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
+                                           bg=C['bg2'], fg=C['dim'], font=F(9),
                                            anchor='w', justify='left')
         self.series_status_lbl.pack(fill='x', ipady=8, padx=2)
 
@@ -2939,7 +3339,7 @@ class PeltierControl:
             tw.wm_overrideredirect(True)
             tw.wm_geometry(f"+{e.x_root+10}+{e.y_root+10}")
             tk.Label(tw, text=text, bg='#1a1c1f', fg='#e8e8e8',
-                     font=(FONT, fsz(8)), padx=6, pady=3,
+                     font=F(8), padx=6, pady=3,
                      relief='solid', bd=1).pack()
             tip['win'] = tw
         def hide(e):
@@ -2960,7 +3360,7 @@ class PeltierControl:
                             C['cyan'], C['purple'], C['yellow'], '#ff8fab']
         if not files:
             tk.Label(self.arch_items, text="No saved cycles yet.\nRun a cycle and give it a name.",
-                     bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9)), justify='left').pack(
+                     bg=C['bg2'], fg=C['dim2'], font=F(9), justify='left').pack(
                      anchor='w', padx=12, pady=12)
             return
 
@@ -2980,7 +3380,7 @@ class PeltierControl:
             hdr = tk.Frame(self.arch_items, bg=C['panel'])
             hdr.pack(fill='x', pady=(6, 1))
             tk.Label(hdr, text=f"▸ {day_label}  ({len(day_files)})", bg=C['panel'],
-                     fg=C['cyan'], font=(FONT, fsz(8), 'bold'), anchor='w').pack(
+                     fg=C['cyan'], font=F(8, 1), anchor='w').pack(
                      side='left', padx=8, pady=3)
             # Files in the group
             for f in day_files:
@@ -2994,7 +3394,7 @@ class PeltierControl:
                 # then the dot (left), and finally the checkbox fills the middle.
                 # This way a long name does not cover the bin.
                 delb = tk.Button(row, text="🗑", command=lambda p=f: self._delete_cycle(p),
-                                bg=C['bg2'], fg=C['red'], font=(FONT, fsz(11), 'bold'),
+                                bg=C['bg2'], fg=C['red'], font=F(11, 1),
                                 relief='flat', cursor='hand2', bd=0, padx=10, pady=2,
                                 activebackground=C['red'], activeforeground='#fff')
                 delb.pack(side='right', padx=(2, 6))
@@ -3008,7 +3408,7 @@ class PeltierControl:
                                    variable=var, command=self._redraw_arch,
                                    bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
                                    activebackground=C['bg2'], activeforeground=col,
-                                   font=(FONT, fsz(9)), bd=0, highlightthickness=0,
+                                   font=F(9), bd=0, highlightthickness=0,
                                    anchor='w')
                 # Full name in the tooltip (on hover)
                 if len(full_name) > 22:
@@ -3588,6 +3988,59 @@ class PeltierControl:
         default.mkdir(exist_ok=True)
         return default
 
+    def _load_ui_scale(self):
+        """The remembered text scale, or None when the user has not chosen one
+        (then the Windows DPI value picked at startup stands)."""
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    v = json.load(f).get('ui_scale')
+                if v: return float(v)
+        except Exception:
+            pass
+        return None
+
+    def _save_ui_scale(self, value):
+        """Remember the text scale (merged into the other settings). None
+        clears it and hands the decision back to the DPI auto-detection."""
+        d = {}
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+        except Exception:
+            d = {}
+        if value is None:
+            d.pop('ui_scale', None)
+        else:
+            d['ui_scale'] = round(float(value), 3)
+        try:
+            self.cfg_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(d, f, indent=2)
+        except Exception as e:
+            print(f"ui_scale not saved: {e}")
+
+    def _set_ui_scale(self, value):
+        """Apply a text scale and remember it. value=None = back to auto (DPI)."""
+        target = self._dpi_scale if value is None else value
+        set_ui_scale(target)
+        self._save_ui_scale(value)
+        self._refresh_scale_buttons()
+        if hasattr(self, 'scale_note'):
+            pct = int(round(FS * 100))
+            src = "auto (display DPI)" if value is None else "manual"
+            self.scale_note.config(
+                text=f"Text at {pct}% - {src}. Spacing re-measures on restart.")
+
+    def _refresh_scale_buttons(self):
+        cur = self._load_ui_scale()
+        for val, btn in getattr(self, 'scale_btns', []):
+            on = (val is None and cur is None) or (
+                 val is not None and cur is not None and abs(val - cur) < 1e-6)
+            btn.config(fg=(C['bg2'] if on else C['dim']),
+                       bg=(C['gold'] if on else C['bg2']))
+
     def _save_data_dir(self):
         """Remember the chosen data folder (merging it with the other settings)."""
         d = {}
@@ -3711,9 +4164,9 @@ class PeltierControl:
 
         from pathlib import Path as _P
         tk.Label(inner, text="CYCLE STATISTICS", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+                 font=F(14, 1)).pack(anchor='w')
         tk.Label(inner, text=self._cycle_display_name(_P(path)), bg=C['bg'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+                 font=F(9)).pack(anchor='w', pady=(2, 16))
 
         def settle_str():
             return f"{st['settle_time']:.0f} s" if st['settle_time'] is not None else "not reached"
@@ -3739,9 +4192,9 @@ class PeltierControl:
             r = tk.Frame(inner, bg=C['bg2'])
             r.pack(fill='x', pady=2)
             tk.Label(r, text=label, bg=C['bg2'], fg=C['dim'],
-                     font=(FONT, fsz(9)), anchor='w').pack(side='left', padx=10, pady=6)
+                     font=F(9), anchor='w').pack(side='left', padx=10, pady=6)
             tk.Label(r, text=val, bg=C['bg2'], fg=col or C['text'],
-                     font=(FONT, fsz(10), 'bold'), anchor='e').pack(side='right', padx=10)
+                     font=F(10, 1), anchor='e').pack(side='right', padx=10)
 
         # Noise interpretation
         noise = st['noise_std']
@@ -3749,7 +4202,7 @@ class PeltierControl:
                   "Moderate noise" if noise < 0.5 else
                   "High noise - check shielding/grounding")
         tk.Label(inner, text=f"Noise: {interp}", bg=C['bg'],
-                 fg=C['dim2'], font=(FONT, fsz(8)), wraplength=380,
+                 fg=C['dim2'], font=F(8), wraplength=380,
                  justify='left').pack(anchor='w', pady=(12, 0))
 
     def export_arch_pdf(self):
@@ -3795,7 +4248,7 @@ class PeltierControl:
             fig.patch.set_facecolor('white')
 
             # Header
-            fig.text(0.5, 0.96, "IGNI - Run Report", ha='center',
+            fig.text(0.5, 0.96, f"{APP_NAME} - Run Report", ha='center',
                      fontsize=16, fontweight='bold')
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             fig.text(0.5, 0.935, f"{self._cycle_display_name(_P(path))}  ·  generated {ts}",
@@ -3848,8 +4301,66 @@ class PeltierControl:
     # ────────────────────────────────────────────────────
     #  TICK + CHART
     # ────────────────────────────────────────────────────
+    # ── SLEEP / STALL GUARD + HEARTBEAT ─────────────────────────────────
+    # Two halves of the same safety story, one on each side of the USB cable.
+    #
+    # PC SIDE (here): tick() runs every ~250 ms. If the wall clock jumps by
+    # much more than that, this process was NOT running - the machine slept,
+    # hibernated, or was frozen hard enough that a measurement was no longer
+    # being supervised or logged. In that case the safe thing is to end the
+    # run, not to silently carry on with a hole in the data.
+    #
+    # BOARD SIDE: the app arms the firmware watchdog (PCWD:1) when a run
+    # starts and pings it every second. If the PC vanishes, the board stops
+    # itself after PC_TIMEOUT_MS - which is the case this half cannot cover,
+    # because a sleeping PC runs no code at all.
+    STALL_LIMIT_S = 6.0      # tick period is ~0.25 s; 6 s is unambiguous
+    PING_EVERY_S  = 1.0
+
+    def _guard_tick(self):
+        now = time.time()
+        last = getattr(self, '_last_tick_wall', None)
+        self._last_tick_wall = now
+        # heartbeat for the firmware watchdog
+        if self.connected and now - getattr(self, '_last_ping', 0) >= self.PING_EVERY_S:
+            self._last_ping = now
+            self.send("PING:1")
+        if last is None:
+            return
+        gap = now - last
+        if gap < self.STALL_LIMIT_S:
+            return
+        # We were away. If nothing was running, just note it and carry on.
+        if not (self.cyc_on or self.series_running):
+            print(f"Tick gap {gap:.1f}s (idle) - ignored")
+            return
+        print(f"!!! Tick gap {gap:.1f}s during a run - safe stop")
+        try:
+            if self.series_running:
+                self._series_abort(f"PC was asleep for {gap:.0f}s")
+        except Exception:
+            pass
+        try:
+            self.send("STOP")
+            self._update_run_button(False)
+        except Exception:
+            pass
+        try:
+            self.cyc_stop(f"interrupted - PC asleep {gap:.0f}s")
+        except Exception:
+            pass
+        self.set_status(f"RUN STOPPED - the PC was asleep for {gap:.0f} s", C['red'])
+        messagebox.showwarning(
+            "Measurement interrupted",
+            f"The computer stopped running this program for {gap:.0f} s "
+            f"(sleep, hibernation or a hard freeze).\n\n"
+            "The run was ended safely: the Peltier is off and the fans are "
+            "running on their cool-down.\n\n"
+            "Data collected up to that moment has been saved.")
+
     def tick(self):
         try:
+            self._guard_tick()
             # SELF-TUNE/calibration changed the PID - update the sliders (tables)
             stp = getattr(self, '_st_pid_update', None)
             if stp is not None:
@@ -4139,16 +4650,23 @@ class PeltierControl:
     # That is why, for the duration of a measurement, we ask the system NOT TO
     # SLEEP. This is an ordinary per-process API - it does NOT change any system
     # settings, does not require administrator rights and stops working the
-    # moment the lock is released or the program is closed. The screen may blank
-    # normally - we deliberately do NOT keep it lit.
+    # moment the lock is released or the program is closed. Since .17 it also
+    # keeps the SCREEN awake (see ES_DISPLAY_REQUIRED below).
     def _wake_lock(self, on):
         try:
             if sys.platform.startswith('win'):
                 import ctypes
-                ES_CONTINUOUS      = 0x80000000
-                ES_SYSTEM_REQUIRED = 0x00000001
+                ES_CONTINUOUS       = 0x80000000
+                ES_SYSTEM_REQUIRED  = 0x00000001
+                ES_DISPLAY_REQUIRED = 0x00000002
+                # ES_DISPLAY_REQUIRED added in .17: the screen saver and
+                # display blanking are blocked too, not just system sleep.
+                # Blanking on its own is harmless, but on most machines it is
+                # the step right before sleep - and the whole point is that a
+                # measurement in progress is never interrupted by idle policy.
                 # ES_CONTINUOUS alone = release the lock (back to normal).
-                flags = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) if on else ES_CONTINUOUS
+                flags = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
+                         ES_DISPLAY_REQUIRED) if on else ES_CONTINUOUS
                 ok = ctypes.windll.kernel32.SetThreadExecutionState(flags)
                 if on and not ok:
                     print("WARNING: failed to block system sleep")
@@ -4158,7 +4676,7 @@ class PeltierControl:
                 if on:
                     if getattr(self, '_wl_proc', None) is None:
                         self._wl_proc = subprocess.Popen(
-                            ['caffeinate', '-s', '-w', str(os.getpid())])
+                            ['caffeinate', '-d', '-i', '-s', '-w', str(os.getpid())])
                 else:
                     p = getattr(self, '_wl_proc', None)
                     if p is not None:
@@ -4170,7 +4688,7 @@ class PeltierControl:
                 if on:
                     if getattr(self, '_wl_proc', None) is None:
                         self._wl_proc = subprocess.Popen(
-                            ['systemd-inhibit', '--what=sleep:idle',
+                            ['systemd-inhibit', '--what=sleep:idle:handle-lid-switch',
                              '--who=PeltierControl', '--why=measurement in progress',
                              'sleep', 'infinity'])
                 else:
@@ -4179,7 +4697,7 @@ class PeltierControl:
                         try: p.terminate()
                         except Exception: pass
                         self._wl_proc = None
-            print("WAKE LOCK: %s" % ("enabled (the system will not sleep during the measurement)"
+            print("WAKE LOCK: %s" % ("enabled (no sleep, no screen blanking during the measurement)"
                                      if on else "released"))
         except Exception as e:
             # No caffeinate/systemd-inhibit, or an exotic system - the
@@ -4189,6 +4707,11 @@ class PeltierControl:
     def _cyc_start(self, temp0):
         self.cyc_on = True
         self._wake_lock(True)
+        # Arm the board-side watchdog: from now on the firmware expects a PING
+        # at least every PC_TIMEOUT_MS and stops itself if the PC goes quiet.
+        # See _guard_tick() and the PC_TIMEOUT_MS comment in the firmware.
+        self.send("PCWD:1")
+        self._last_ping = 0.0
         self.cyc_t0 = time.time()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         # Temporary file - the user names it after STOP
@@ -4239,6 +4762,7 @@ class PeltierControl:
         # system sleep in that gap.
         if not getattr(self, 'series_running', False):
             self._wake_lock(False)
+            self.send("PCWD:0")     # disarm - nothing is running to protect
         print(f"CYC STOP: {reason} ({getattr(self,'cyc_rows',0)} samples)")
         if getattr(self, 'series_skip_archive', False):
             # The "return to base" leg in a SERIES - not a test, just an approach
@@ -4760,9 +5284,9 @@ class CalRangeDialog:
         inner = make_scrollable(self.win, C['bg'], padx=24, pady=20)
 
         tk.Label(inner, text="AUTO-CALIBRATION RANGE", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+                 font=F(14, 1)).pack(anchor='w')
         tk.Label(inner, text="Select temperature range and ramps to calibrate",
-                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 16))
 
         # Temperature range - sliders
         tmin0 = getattr(app, 'dev_cal_min', 50.0)
@@ -4777,7 +5301,7 @@ class CalRangeDialog:
 
         # Temperature step (info - the firmware uses every 10C)
         tk.Label(inner, text="TEMP STEP: 10°C (fixed)", bg=C['bg'], fg=C['dim2'],
-                 font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 12))
+                 font=F(9)).pack(anchor='w', pady=(0, 12))
 
         # MAX RATE - slider (up to 80)
         self.sl_maxrate = SliderField(inner, "MAX RATE", 5, 80, 40,
@@ -4786,7 +5310,7 @@ class CalRangeDialog:
 
         # RATE STEP - choice of 5/10/20/40
         tk.Label(inner, text="RATE STEP [°C/min]:", bg=C['bg'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(8, 6))
+                 font=F(10, 1)).pack(anchor='w', pady=(8, 6))
 
         self.rate_step = 5  # default step
         self.step_btns = {}
@@ -4795,7 +5319,7 @@ class CalRangeDialog:
         for st in [5, 10, 20, 40]:
             b = tk.Button(step_frame, text=f"{st}",
                          command=lambda s=st: self._set_step(s),
-                         bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(12), 'bold'),
+                         bg=C['bg2'], fg=C['dim'], font=F(12, 1),
                          relief='flat', cursor='hand2', bd=0, padx=18, pady=10,
                          activebackground=C['panel3'])
             b.pack(side='left', padx=4, fill='x', expand=True)
@@ -4809,19 +5333,19 @@ class CalRangeDialog:
         self.btn_recommended = tk.Button(
             inner, text="RECOMMENDED (5/10/20/30/40/50/60/70/80 °C/min)",
             command=self._use_recommended_ramps,
-            bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(10), 'bold'),
+            bg=C['bg2'], fg=C['dim'], font=F(10, 1),
             relief='flat', cursor='hand2', bd=0, padx=10, pady=8,
             activebackground=C['panel3'])
         self.btn_recommended.pack(fill='x', pady=(6, 0))
 
         # Preview of the generated ramp list
         self.ramps_preview = tk.Label(inner, text="", bg=C['bg'], fg=C['cyan'],
-                                     font=(FONT, fsz(10)))
+                                     font=F(10))
         self.ramps_preview.pack(anchor='w', pady=(0, 8))
 
         # Estimated time
         self.est_lbl = tk.Label(inner, text="", bg=C['bg'], fg=C['yellow'],
-                               font=(FONT, fsz(10), 'bold'))
+                               font=F(10, 1))
         self.est_lbl.pack(anchor='w', pady=(0, 12))
         self._use_recommended_ramps()  # selected by default (instead of _set_step(10)) - it also called _update_estimate()
 
@@ -4937,9 +5461,9 @@ class CalibrationWindow:
         inner.pack(fill='both', expand=True, padx=20, pady=16)
 
         tk.Label(inner, text="CALIBRATION PROGRESS", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+                 font=F(14, 1)).pack(anchor='w')
         tk.Label(inner, text="Relay autotuning — one test per temperature (fills all ramps)",
-                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 10))
+                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 10))
 
         # Progress bar (counted in temperatures)
         self.prog_frame = tk.Frame(inner, bg=C['bg2'], height=SC(30))
@@ -4948,7 +5472,7 @@ class CalibrationWindow:
         self.prog_bar = tk.Frame(self.prog_frame, bg=C['purple'], height=SC(30))
         self.prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
         self.prog_text = tk.Label(self.prog_frame, text="0 / 0 temperatures", bg=C['bg2'],
-                                  fg=C['text'], font=(FONT, fsz(11), 'bold'))
+                                  fg=C['text'], font=F(11, 1))
         self.prog_text.place(relx=0.5, rely=0.5, anchor='center')
 
         # Current step
@@ -4959,34 +5483,34 @@ class CalibrationWindow:
 
         row1 = tk.Frame(ii, bg=C['panel']); row1.pack(fill='x', pady=2)
         tk.Label(row1, text="NOW:", bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
+                 font=F(9), width=11, anchor='w').pack(side='left')
         self.lbl_now = tk.Label(row1, text="—", bg=C['panel'], fg=C['orange'],
-                                font=(FONT, fsz(12), 'bold'), anchor='w')
+                                font=F(12, 1), anchor='w')
         self.lbl_now.pack(side='left')
 
         # Phase indicator: heating -> stabilization -> relay
         phase_row = tk.Frame(ii, bg=C['panel']); phase_row.pack(fill='x', pady=(8, 4))
         tk.Label(phase_row, text="PHASE:", bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
+                 font=F(9), width=11, anchor='w').pack(side='left')
         self.phase_lbls = {}
         for key, label in self.PHASES:
             l = tk.Label(phase_row, text=label, bg=C['bg2'], fg=C['dim2'],
-                         font=(FONT, fsz(9)), padx=8, pady=4)
+                         font=F(9), padx=8, pady=4)
             l.pack(side='left', padx=(0, 4))
             self.phase_lbls[key] = l
 
         row2 = tk.Frame(ii, bg=C['panel']); row2.pack(fill='x', pady=2)
         tk.Label(row2, text="NEXT:", bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
+                 font=F(9), width=11, anchor='w').pack(side='left')
         self.lbl_next = tk.Label(row2, text="—", bg=C['panel'], fg=C['cyan'],
-                                 font=(FONT, fsz(11)), anchor='w')
+                                 font=F(11), anchor='w')
         self.lbl_next.pack(side='left')
 
         row3 = tk.Frame(ii, bg=C['panel']); row3.pack(fill='x', pady=2)
         tk.Label(row3, text="REMAINING:", bg=C['panel'], fg=C['dim2'],
-                 font=(FONT, fsz(9)), width=11, anchor='w').pack(side='left')
+                 font=F(9), width=11, anchor='w').pack(side='left')
         self.lbl_eta = tk.Label(row3, text="—", bg=C['panel'], fg=C['yellow'],
-                                font=(FONT, fsz(11), 'bold'), anchor='w')
+                                font=F(11, 1), anchor='w')
         self.lbl_eta.pack(side='left')
 
         # Warnings: points where the relay test did not catch oscillation and
@@ -4994,13 +5518,13 @@ class CalibrationWindow:
         # only here - previously this fact went ONLY to the raw
         # serial console as "RELAY FAIL - bazowe")
         self.lbl_warn = tk.Label(inner, text="", bg=C['bg'], fg=C['red'],
-                                 font=(FONT, fsz(9)), anchor='w', justify='left',
+                                 font=F(9), anchor='w', justify='left',
                                  wraplength=580)
         self.lbl_warn.pack(anchor='w', pady=(0, 6))
 
         # List of temperatures to calibrate
         tk.Label(inner, text="TEMPERATURES", bg=C['bg'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(4, 4))
+                 font=F(10, 1)).pack(anchor='w', pady=(4, 4))
 
         list_wrap = tk.Frame(inner, bg=C['bg2'])
         list_wrap.pack(fill='both', expand=True)
@@ -5124,13 +5648,13 @@ class CalibrationWindow:
                 bar = tk.Frame(row, bg=C['bg2'], width=4)
                 bar.pack(side='left', fill='y')
                 num = tk.Label(row, text=f"{i+1:2d}", bg=C['bg2'], fg=C['dim2'],
-                              font=(FONT, fsz(9)), width=4, anchor='w')
+                              font=F(9), width=4, anchor='w')
                 num.pack(side='left')
                 txt = tk.Label(row, text=self._step_label(t, r),
-                              bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(10)), anchor='w')
+                              bg=C['bg2'], fg=C['dim'], font=F(10), anchor='w')
                 txt.pack(side='left', fill='x', expand=True, padx=(2, 0))
                 stat = tk.Label(row, text="", bg=C['bg2'], fg=C['dim2'],
-                               font=(FONT, fsz(9)), anchor='e', width=18)
+                               font=F(9), anchor='e', width=18)
                 stat.pack(side='right')
                 self.step_widgets.append((bar, num, txt, stat))
 
@@ -5194,9 +5718,9 @@ class DiagnosticsWindow:
         inner.pack(fill='both', expand=True, padx=20, pady=16)
 
         tk.Label(inner, text="DIAGNOSTICS", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+                 font=F(14, 1)).pack(anchor='w')
         tk.Label(inner, text="All events and errors reported by the firmware",
-                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 12))
+                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 12))
 
         # Active alarms banner (visible only when err_active is not empty)
         self.active_frame = tk.Frame(inner, bg=C['bg2'])
@@ -5207,7 +5731,7 @@ class DiagnosticsWindow:
         log_wrap.pack(fill='both', expand=True)
         sb = tk.Scrollbar(log_wrap)
         sb.pack(side='right', fill='y')
-        self.text = tk.Text(log_wrap, bg=C['bg2'], fg=C['dim'], font=(FONT, fsz(9)),
+        self.text = tk.Text(log_wrap, bg=C['bg2'], fg=C['dim'], font=F(9),
                              relief='flat', bd=0, wrap='word', state='disabled',
                              yscrollcommand=sb.set, padx=10, pady=8)
         self.text.pack(side='left', fill='both', expand=True)
@@ -5231,7 +5755,7 @@ class DiagnosticsWindow:
             w.destroy()
         if not self.app.err_active:
             tk.Label(self.active_frame, text="No active alarms.", bg=C['bg2'],
-                     fg=C['green'], font=(FONT, fsz(9)), anchor='w').pack(
+                     fg=C['green'], font=F(9), anchor='w').pack(
                      fill='x', padx=10, pady=8)
             return
         for code, text in self.app.err_active.items():
@@ -5239,7 +5763,7 @@ class DiagnosticsWindow:
             row.pack(fill='x')
             tk.Frame(row, bg=C['red'], width=4).pack(side='left', fill='y')
             tk.Label(row, text=f"⚠ [{code}] {text}", bg=C['bg2'], fg=C['red'],
-                     font=(FONT, fsz(9), 'bold'), anchor='w', justify='left',
+                     font=F(9, 1), anchor='w', justify='left',
                      wraplength=560).pack(side='left', fill='x', expand=True, padx=8, pady=6)
 
     def reload_log(self):
@@ -5306,9 +5830,9 @@ class PresetWindow:
         inner.pack(fill='both', expand=True, padx=24, pady=20)
 
         tk.Label(inner, text="PRESETS", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(14), 'bold')).pack(anchor='w')
+                 font=F(14, 1)).pack(anchor='w')
         tk.Label(inner, text="Save & load complete settings (setpoint, ramps, PID, fan)",
-                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(2, 16))
+                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 16))
 
         # Save a new preset
         save_box = tk.Frame(inner, bg=C['bg2'])
@@ -5316,10 +5840,10 @@ class PresetWindow:
         si = tk.Frame(save_box, bg=C['bg2'])
         si.pack(fill='x', padx=12, pady=10)
         tk.Label(si, text="Save current settings as:", bg=C['bg2'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(anchor='w', pady=(0, 4))
+                 font=F(9)).pack(anchor='w', pady=(0, 4))
         erow = tk.Frame(si, bg=C['bg2'])
         erow.pack(fill='x')
-        self.name_entry = tk.Entry(erow, bg=C['bg'], fg=C['text'], font=(FONT, fsz(11)),
+        self.name_entry = tk.Entry(erow, bg=C['bg'], fg=C['text'], font=F(11),
                                    relief='flat', bd=0, insertbackground=C['green'],
                                    highlightthickness=2, highlightbackground=C['green'])
         self.name_entry.pack(side='left', fill='x', expand=True, ipady=5, padx=(0, 8))
@@ -5329,7 +5853,7 @@ class PresetWindow:
 
         # List of saved presets
         tk.Label(inner, text="SAVED PRESETS", bg=C['bg'], fg=C['dim'],
-                 font=(FONT, fsz(10), 'bold')).pack(anchor='w', pady=(0, 6))
+                 font=F(10, 1)).pack(anchor='w', pady=(0, 6))
         list_wrap = tk.Frame(inner, bg=C['bg2'])
         list_wrap.pack(fill='both', expand=True)
         psb = tk.Scrollbar(list_wrap)
@@ -5351,7 +5875,7 @@ class PresetWindow:
         presets = self.app._load_presets()
         if not presets:
             tk.Label(self.items, text="No presets yet.\nSave current settings above.",
-                     bg=C['bg2'], fg=C['dim2'], font=(FONT, fsz(9)), justify='left').pack(
+                     bg=C['bg2'], fg=C['dim2'], font=F(9), justify='left').pack(
                      anchor='w', padx=12, pady=12)
             return
         for name, settings in presets.items():
@@ -5360,11 +5884,11 @@ class PresetWindow:
             info = tk.Frame(row, bg=C['bg2'])
             info.pack(side='left', fill='x', expand=True)
             tk.Label(info, text=name, bg=C['bg2'], fg=C['text'],
-                     font=(FONT, fsz(10), 'bold'), anchor='w').pack(anchor='w')
+                     font=F(10, 1), anchor='w').pack(anchor='w')
             # Short description of the settings
             desc = f"SP {settings.get('sp','?')}°C · ↑{settings.get('ru','?')} ↓{settings.get('rd','?')}°C/min · fan {settings.get('fan','?')}%"
             tk.Label(info, text=desc, bg=C['bg2'], fg=C['dim2'],
-                     font=(FONT, fsz(8)), anchor='w').pack(anchor='w')
+                     font=F(8), anchor='w').pack(anchor='w')
             # Buttons
             mk_btn(row, "LOAD", lambda n=name: self.load_preset(n), C['green']).pack(
                 side='left', padx=(4, 2))
@@ -5419,17 +5943,17 @@ class SaveCycleDialog:
         inner.pack(fill='both', expand=True, padx=24, pady=20)
 
         tk.Label(inner, text="SAVE CYCLE TO ARCHIVE", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(13), 'bold')).pack(anchor='w')
+                 font=F(13, 1)).pack(anchor='w')
 
         # Info on the number of samples
         rows = getattr(app, 'cyc_rows', 0)
         tk.Label(inner, text=f"Recorded {rows} data samples",
-                 bg=C['bg'], fg=C['dim'], font=(FONT, fsz(9))).pack(anchor='w', pady=(4, 16))
+                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(4, 16))
 
         tk.Label(inner, text="Cycle name:", bg=C['bg'], fg=C['dim'],
-                 font=(FONT, fsz(10))).pack(anchor='w')
+                 font=F(10)).pack(anchor='w')
         self.entry = tk.Entry(inner, bg=C['bg2'], fg=C['text'],
-                              font=(FONT, fsz(12)), relief='flat', bd=0,
+                              font=F(12), relief='flat', bd=0,
                               insertbackground=C['green'],
                               highlightthickness=2, highlightbackground=C['green'],
                               highlightcolor=_lighten(C['green'], 0.2))
@@ -5481,7 +6005,7 @@ class ProfileWindow:
         hd = tk.Frame(self.win, bg=C['bg'])
         hd.pack(fill='x', padx=16, pady=12)
         tk.Label(hd, text="MULTI-STEP PROFILES", bg=C['bg'], fg=C['text'],
-                 font=(FONT, fsz(12), 'bold')).pack(side='left')
+                 font=F(12, 1)).pack(side='left')
 
         # Step table
         self.rows_frame = tk.Frame(self.win, bg=C['bg'])
@@ -5492,7 +6016,7 @@ class ProfileWindow:
         h.pack(fill='x', pady=(0, 4))
         for txt, w in [("#", 3), ("TEMP °C", 10), ("RATE", 8), ("TIME min", 10), ("", 6)]:
             tk.Label(h, text=txt, bg=C['bg'], fg=C['dim2'],
-                     font=(FONT, fsz(9)), width=w, anchor='w').pack(side='left')
+                     font=F(9), width=w, anchor='w').pack(side='left')
 
         self.steps_container = tk.Frame(self.rows_frame, bg=C['bg'])
         self.steps_container.pack(fill='both', expand=True)
@@ -5504,17 +6028,17 @@ class ProfileWindow:
         ai = tk.Frame(addf, bg=C['panel'])
         ai.pack(fill='x', padx=12, pady=10)
         tk.Label(ai, text="ADD STEP:", bg=C['panel'], fg=C['dim'],
-                 font=(FONT, fsz(9))).pack(side='left', padx=(0, 8))
+                 font=F(9)).pack(side='left', padx=(0, 8))
         self.e_temp = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['orange'],
-                               font=(FONT, fsz(10)), justify='center', relief='flat',
+                               font=F(10), justify='center', relief='flat',
                                highlightthickness=1, highlightbackground=C['border'])
         self.e_temp.pack(side='left', padx=2); self.e_temp.insert(0, "40")
         self.e_ramp = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['yellow'],
-                               font=(FONT, fsz(10)), justify='center', relief='flat',
+                               font=F(10), justify='center', relief='flat',
                                highlightthickness=1, highlightbackground=C['border'])
         self.e_ramp.pack(side='left', padx=2); self.e_ramp.insert(0, "2.0")
         self.e_time = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['dim'],
-                               font=(FONT, fsz(10)), justify='center', relief='flat',
+                               font=F(10), justify='center', relief='flat',
                                highlightthickness=1, highlightbackground=C['border'])
         self.e_time.pack(side='left', padx=2); self.e_time.insert(0, "10")
         mk_btn(ai, "+ ADD", self.add_step, C['green']).pack(side='left', padx=(8, 0))
@@ -5550,15 +6074,15 @@ class ProfileWindow:
             r.pack(fill='x', pady=2)
             tk.Frame(r, bg=C['orange'], width=4).pack(side='left', fill='y')
             tk.Label(r, text=str(i+1), bg=C['bg2'], fg=C['text'],
-                     font=(FONT, fsz(10), 'bold'), width=3, anchor='w').pack(side='left', padx=(6,0))
+                     font=F(10, 1), width=3, anchor='w').pack(side='left', padx=(6,0))
             tk.Label(r, text=f"{s['temp']:.0f}", bg=C['bg2'], fg=C['orange'],
-                     font=(FONT, fsz(10)), width=10, anchor='w').pack(side='left')
+                     font=F(10), width=10, anchor='w').pack(side='left')
             tk.Label(r, text=f"{s['ramp']:.1f}", bg=C['bg2'], fg=C['yellow'],
-                     font=(FONT, fsz(10)), width=8, anchor='w').pack(side='left')
+                     font=F(10), width=8, anchor='w').pack(side='left')
             tk.Label(r, text=f"{s['time']:.0f}", bg=C['bg2'], fg=C['dim'],
-                     font=(FONT, fsz(10)), width=10, anchor='w').pack(side='left')
+                     font=F(10), width=10, anchor='w').pack(side='left')
             tk.Button(r, text="DEL", command=lambda idx=i: self.del_step(idx),
-                      bg=C['bg2'], fg=C['red'], font=(FONT, fsz(8), 'bold'),
+                      bg=C['bg2'], fg=C['red'], font=F(8, 1),
                       relief='flat', cursor='hand2', bd=0,
                       activebackground=C['panel3']).pack(side='left', padx=4)
 
