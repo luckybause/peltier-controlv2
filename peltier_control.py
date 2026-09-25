@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LACHI - Light-Activated Current & Heat Instrument
+LACHI - Light-Activated Current & Heat Instrument.
 
 Control bench for photocurrent and pyrocurrent measurements: it drives the
 Peltier stage, so the sample can be held at a temperature (photocurrent - the
@@ -14,1114 +14,99 @@ term, dT/dt), and it archives every run.
 
 Two-way link with the board: setpoint, ramps, PID, calibration, profiles.
 Requires firmware v19 (PC MODE) or newer on the ItsyBitsy M0.
-"""
 
-import sys, os, time, csv, json, math, threading, queue, contextlib
+═══════════════════════════════════════════════════════════════════════════
+WHY THIS FILE IS PyQt6 AND NOT TKINTER
+═══════════════════════════════════════════════════════════════════════════
+The instrument logic below is the same logic that ran under Tkinter, down to
+the comments explaining the bugs it fixes - the sleep guard, the smooth leg
+switch that closed the 1.4-1.7 s hole between heating and cooling, the ramp
+phase measured separately from the approach tail. None of that changed. What
+changed is the interface layer: Qt has a stylesheet engine close enough to CSS
+that Apple's design tokens can be expressed directly, and a canvas widget that
+embeds matplotlib natively - so the live trace still redraws four times a
+second and still zooms under the mouse, which a framework that ships the figure
+to the browser as an image cannot do.
+
+The look lives in lachi/theme.py (the palette and the stylesheet),
+lachi/widgets.py (the Cupertino components Qt does not ship) and
+lachi/icons.py (an SF-shaped icon set, drawn rather than licensed).
+
+The older Tkinter build stays in the repository as peltier_control.py and
+still runs; nothing here touches it.
+"""
+from __future__ import annotations
+
+import csv
+import json
+import os
+import queue
+import re
+import statistics
+import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
 try:
-    import serial, serial.tools.list_ports
+    import serial
+    import serial.tools.list_ports
 except ImportError:
-    print("pip install pyserial"); input(); sys.exit(1)
-try:
-    import tkinter as tk
-    import tkinter.font as tkfont
-    from tkinter import ttk, messagebox
-except ImportError:
-    print("tkinter not available"); input(); sys.exit(1)
-try:
-    import matplotlib
-    matplotlib.use('TkAgg')
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-except ImportError as e:
-    print(f"pip install matplotlib numpy\n{e}"); input(); sys.exit(1)
-
-# ════════════════════════════════════════════════════════
-#  BRUTALIST THEME - concrete, steel, raw edges
-# ════════════════════════════════════════════════════════
-# ── PALETTE ─────────────────────────────────────────────────────────────
-# Reworked in APP .15. The old palette was cold "concrete grey"; this one is
-# warmer and darker - charcoal and oiled leather with burnished bronze - and
-# every accent is picked from the Witcher-sign family, which happens to map
-# cleanly onto what this rig already needed to signal:
-#     Aard  (pale steel-blue)  -> temperature, the thing we measure
-#     Igni  (ember amber)      -> setpoint / heating, the thing we command
-#     Quen  (shield gold)      -> rate, headings, the medallion
-#     Axii  (moss green)       -> PWM / OK / START
-#     Yrden (violet)           -> calibration and profiles
-#     blood red                -> STOP, alarms, recording
-# The KEYS are unchanged, so every widget keeps its meaning; only the hues
-# moved. Contrast was checked against the panel background - the readouts a
-# safety-relevant instrument depends on stay high-contrast on purpose.
-C = {
-    'bg':       '#22201d',   # charcoal, faintly warm
-    'bg2':      '#191715',   # near-black (bars, fields)
-    'panel':    '#2a2724',   # cards
-    'panel2':   '#191715',   # inner elements
-    'panel3':   '#38342f',   # hover
-    'border':   '#3d3833',   # frames
-    'border2':  '#575047',   # lighter frames
-    'text':     '#efe7d8',   # parchment
-    'dim':      '#b3a892',   # dimmed parchment
-    'dim2':     '#736a5c',   # very dimmed
-    'blue':     '#7fb6d9',   # Aard  - temperature
-    'orange':   '#d98436',   # Igni  - setpoint
-    'yellow':   '#d9b036',   # Quen  - rate / headings
-    'green':    '#8fae5c',   # Axii  - pwm / ok / start
-    'red':      '#a3251f',   # blood - stop / alarm
-    'cyan':     '#6fb2b8',   # frost - cooling
-    'purple':   '#8f6bb5',   # Yrden - calibration / profiles
-    'rec':      '#a3251f',   # recording
-    'grid':     '#312d29',   # chart grid
-    'gold':     '#c8a24a',   # medallion / section rules
-}
-
-# Fonts - monospace for brutalist
-FONT      = 'Consolas'
-FONT_UI   = 'Roboto Mono'   # falls back to Consolas if not available
-
-# Version number of the PC APPLICATION (not to be confused with FW - the
-# firmware version the app reads from the board with the VER command and shows
-# separately in the title bar). Bump it with every version sent out, so the
-# title bar immediately tells you whether this really is the new file.
-APP_NAME  = "LACHI"
-APP_BUILD = "2026-09-01.23"
-
-# Safety limits for the automatic MEASUREMENT SERIES (see the PeltierControl
-# class, self.series_*) - a safeguard in case the approach/return never
-# reaches its target (e.g. a disconnected sensor) - the series should move
-# on instead of hanging forever.
-SERIES_HEAT_TIMEOUT_S = 20 * 60
-SERIES_COOL_TIMEOUT_S = 12 * 60
-
-# ── "REACHED" CRITERION ──────────────────────────────────────────────────
-# Was: a single sample within 0.5 C and done. For the DESCENT leg in a
-# SERIES (which ends immediately after reaching), this meant that EVERY
-# descent was cut off the moment it entered tolerance - in the logs from
-# 20260831 all seven descents end at 30.35-30.49 C and contain NOT A
-# SINGLE hold sample. That made it impossible to check at all whether the
-# descent gets to the target and whether it crosses it - and that is
-# exactly what we were trying to diagnose.
-# Now: |error| <= REACH_TOL_C held CONTINUOUSLY for REACH_STABLE_S.
-# A single brush against the tolerance caused by noise is no longer enough.
-REACH_TOL_C    = 0.2
-REACH_STABLE_S = 3.0
-
-# Global font size multiplier (set at startup according to DPI)
-FS = 1.0
-def fsz(n):
-    """Scales the font size according to the global DPI."""
-    return max(6, int(round(n * FS)))
-
-def SC(px):
-    """Scales a size IN PIXELS by the same multiplier as the fonts.
-
-    THE PROBLEM THIS FIXES: fonts were scaled by FS (e.g. x1.5 at DPI
-    150%), but window sizes were HARD-CODED IN PIXELS ("640x780" etc.).
-    Because the application is Per-Monitor DPI Aware v2, Windows DOES NOT
-    SCALE IT - those 640x780 are physical pixels, so on a high-DPI screen
-    the window is PHYSICALLY SMALLER while the text in it is AT THE SAME
-    TIME larger. The effect: the text did not fit and was clipped - worst
-    of all in the calibration windows, because they have the most content
-    (560x680 and 640x780). Now every fixed size goes through SC().
-    """
-    return int(round(px * FS))
-
-# ── NAMED FONTS: ONE registry, so the size can change at runtime ────────
-# Until APP .16 every widget was built with a plain tuple, font=F(9).
-# A tuple is copied into the widget at creation, so the only way to change the
-# text size afterwards was to rebuild the entire UI. Tk *named* fonts work the
-# other way round: the widget keeps a reference, and reconfiguring the font
-# updates every widget using it, live.
-#
-# So all 146 call sites now go through F(), which hands out one shared font
-# object per (size, weight) pair, and set_ui_scale() simply resizes those
-# objects. That is the whole mechanism behind the scale selector on the DEVICE
-# tab - no rebuild, no restart, no lost state.
-_FONTS = {}
-
-
-def F(n, bold=0):
-    """The named font for design size n (bold optional). Created on first use -
-    which means after the Tk root exists, since every call site is inside a
-    widget-building method."""
-    key = (n, bool(bold))
-    f = _FONTS.get(key)
-    if f is None:
-        f = tkfont.Font(family=FONT, size=fsz(n),
-                        weight=('bold' if bold else 'normal'))
-        _FONTS[key] = f
-    return f
-
-
-def set_ui_scale(scale):
-    """Change the global text scale and push it into every live font.
-
-    Only the TEXT rescales. Fixed pixel geometry (SC(), panel widths, window
-    sizes) is measured when the UI is built, so after scaling UP the layout is
-    roomier than it needs to be rather than tighter - which is why this is safe
-    to do live. The saved value is what the next start builds geometry from."""
-    global FS
-    FS = max(0.6, min(2.0, float(scale)))
-    for (n, bold), f in _FONTS.items():
-        try:
-            f.configure(size=fsz(n))
-        except Exception:
-            pass
-    return FS
-
-
-def make_scrollable(parent, bg, padx=0, pady=0):
-    """Returns a frame that scrolls vertically when the content does not fit the window.
-
-    Why: at high DPI, windows are clipped to the screen height (see
-    size_win), so the content can be taller than the window. Without
-    scrolling the bottom fields and buttons are then physically unreachable.
-    """
-    wrap = tk.Frame(parent, bg=bg)
-    wrap.pack(fill='both', expand=True)
-    cv = tk.Canvas(wrap, bg=bg, highlightthickness=0, bd=0)
-    sb = tk.Scrollbar(wrap, orient='vertical', command=cv.yview)
-    cv.configure(yscrollcommand=sb.set)
-    sb.pack(side='right', fill='y')
-    cv.pack(side='left', fill='both', expand=True, padx=padx, pady=pady)
-    inner = tk.Frame(cv, bg=bg)
-    wid = cv.create_window((0, 0), window=inner, anchor='nw')
-
-    def _cfg(_e=None):
-        try:
-            cv.configure(scrollregion=cv.bbox('all'))
-            cv.itemconfigure(wid, width=cv.winfo_width())
-        except Exception:
-            pass
-    inner.bind('<Configure>', _cfg)
-    cv.bind('<Configure>', _cfg)
-
-    def _wheel(e):
-        try:
-            cv.yview_scroll(int(-e.delta / 120), 'units')
-        except Exception:
-            pass
-    # Mouse wheel only while the cursor is over this area - so that it does not
-    # take over scrolling for the whole application.
-    cv.bind('<Enter>', lambda e: cv.bind_all('<MouseWheel>', _wheel))
-    cv.bind('<Leave>', lambda e: cv.unbind_all('<MouseWheel>'))
-    return inner
-
-
-def size_win(win, w, h, minw=None, minh=None, parent=None):
-    """Set the window size: scale by DPI, clip to the screen, center it.
-
-    Clipping to the screen matters: after x1.5 scaling a 640x780 window would
-    grow to 960x1170, that is MORE than the height of a typical 1080p screen -
-    and part of the content (buttons included) would land outside the visible
-    area. Windows are also always resizable, so they can be enlarged by hand.
-    """
-    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-    W = min(SC(w), max(320, sw - SC(40)))
-    H = min(SC(h), max(240, sh - SC(80)))
-    win.geometry(f"{W}x{H}")
-    if minw is not None and minh is not None:
-        win.minsize(min(SC(minw), W), min(SC(minh), H))
-    try:
-        win.resizable(True, True)
-    except Exception:
-        pass
-    try:
-        if parent is not None:
-            parent.update_idletasks()
-            px = parent.winfo_rootx() + parent.winfo_width() // 2 - W // 2
-            py = parent.winfo_rooty() + parent.winfo_height() // 2 - H // 2
-        else:
-            px = (sw - W) // 2
-            py = (sh - H) // 2
-        px = max(0, min(px, sw - W))
-        py = max(0, min(py, sh - H))
-        win.geometry(f"+{px}+{py}")
-    except Exception:
-        pass
-    return W, H
-
-def _font(size, weight='normal'):
-    """Returns a font tuple with a fallback"""
-    return (FONT, size, weight) if weight != 'normal' else (FONT, size)
-
-def _darken(hex_color, amount=0.30):
-    """Darkens a hex color by the given amount - the counterpart of _lighten(),
-    used for the shadow facets of the emblem."""
-    hex_color = hex_color.lstrip('#')
-    r, g, b = (int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-    f = max(0.0, 1.0 - amount)
-    return f'#{int(r*f):02x}{int(g*f):02x}{int(b*f):02x}'
-
-
-def _lighten(hex_color, amount=0.15):
-    """Lightens a hex color by the given amount"""
-    hex_color = hex_color.lstrip('#')
-    r = int(hex_color[0:2], 16)
-    g = int(hex_color[2:4], 16)
-    b = int(hex_color[4:6], 16)
-    r = min(255, int(r + (255 - r) * amount))
-    g = min(255, int(g + (255 - g) * amount))
-    b = min(255, int(b + (255 - b) * amount))
-    return f'#{r:02x}{g:02x}{b:02x}'
-
-def mk_btn(parent, text, cmd, bg=None, fg='#1a1c1f', **kw):
-    """Brutalist button - sharp edges, monospace"""
-    bg = bg or C['green']
-    b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
-                  font=F(10, 1), padx=16, pady=8,
-                  relief='flat', cursor='hand2', bd=0,
-                  activebackground=_lighten(bg, 0.15), activeforeground=fg, **kw)
-    def on_enter(e):
-        if b['state'] != 'disabled': b.config(bg=_lighten(bg, 0.15))
-    def on_leave(e):
-        if b['state'] != 'disabled': b.config(bg=bg)
-    b.bind('<Enter>', on_enter)
-    b.bind('<Leave>', on_leave)
-    return b
-
-def mk_btn_outline(parent, text, cmd, color, **kw):
-    """Button with an outline instead of a fill"""
-    b = tk.Button(parent, text=text, command=cmd, bg=C['bg2'], fg=color,
-                  font=F(10, 1), padx=14, pady=7,
-                  relief='flat', cursor='hand2', bd=0,
-                  highlightthickness=2, highlightbackground=color,
-                  highlightcolor=color,
-                  activebackground=C['panel3'], activeforeground=color, **kw)
-    return b
-
-
-# ════════════════════════════════════════════════════════
-#  WIDGET: Slider + numeric field (key panel element)
-# ════════════════════════════════════════════════════════
-class SliderField:
-    """Slider plus a numeric field next to it. Type a value or drag the slider.
-       on_change(value) is called on change (debounced)."""
-    def __init__(self, parent, label, vmin, vmax, vinit, color,
-                 unit='', decimals=1, on_change=None, width=170):
-        self.vmin = vmin; self.vmax = vmax
-        self.color = color; self.decimals = decimals
-        self.on_change = on_change
-        self._last_sent = None
-        self._after_id = None
-
-        # Container
-        self.frame = tk.Frame(parent, bg=C['bg2'])
-        self.frame.pack(fill='x', pady=(0, 14))
-
-        # Label + unit
-        top = tk.Frame(self.frame, bg=C['bg2'])
-        top.pack(fill='x')
-        tk.Label(top, text=label, bg=C['bg2'], fg=C['dim'],
-                 font=F(9), anchor='w').pack(side='left')
-        if unit:
-            tk.Label(top, text=unit, bg=C['bg2'], fg=C['dim2'],
-                     font=F(8), anchor='e').pack(side='right')
-
-        # Row: slider + field
-        row = tk.Frame(self.frame, bg=C['bg2'])
-        row.pack(fill='x', pady=(4, 0))
-
-        # Numeric field (Entry) - on the right
-        self.entry = tk.Entry(row, width=7, bg=C['panel'], fg=color,
-                              font=F(12, 1), justify='center',
-                              relief='flat', bd=0,
-                              highlightthickness=1.5, highlightbackground=color,
-                              highlightcolor=_lighten(color, 0.2),
-                              insertbackground=color)
-        self.entry.pack(side='right', ipady=4, padx=(8, 0))
-        self.entry.bind('<Return>', self._on_entry)
-        self.entry.bind('<FocusOut>', self._on_entry)
-
-        # Slider (Scale) - fills the rest
-        self.var = tk.DoubleVar(value=vinit)
-        self.scale = tk.Scale(row, from_=vmin, to=vmax, resolution=10**(-decimals),
-                             orient='horizontal', variable=self.var,
-                             showvalue=False, bg=C['bg2'], fg=color,
-                             troughcolor=C['panel'], highlightthickness=0,
-                             bd=0, sliderrelief='flat', sliderlength=18,
-                             activebackground=color, length=width,
-                             command=self._on_slide)
-        self.scale.pack(side='right', fill='x', expand=True)
-
-        self._set_entry(vinit)
-
-    def _set_entry(self, v):
-        self.entry.delete(0, 'end')
-        self.entry.insert(0, f"{v:.{self.decimals}f}")
-
-    def _on_slide(self, val):
-        v = float(val)
-        self._set_entry(v)
-        self._debounced(v)
-
-    def _on_entry(self, evt=None):
-        try:
-            v = float(self.entry.get().replace(',', '.'))
-            v = max(self.vmin, min(self.vmax, v))
-            self.var.set(v)
-            self._set_entry(v)
-            self._debounced(v)
-        except ValueError:
-            self._set_entry(self.var.get())
-
-    def _debounced(self, v):
-        """Send the change with a 150ms delay so as not to flood the serial link"""
-        if self._after_id:
-            self.frame.after_cancel(self._after_id)
-        self._after_id = self.frame.after(150, lambda: self._emit(v))
-
-    def _emit(self, v):
-        if self.on_change and v != self._last_sent:
-            self._last_sent = v
-            self.on_change(v)
-
-    def get(self):
-        return self.var.get()
-
-    def set(self, v, silent=True):
-        """Set the value. silent=True does not call on_change (sync from the device)."""
-        v = max(self.vmin, min(self.vmax, v))
-        if silent:
-            self._last_sent = v
-        self.var.set(v)
-        self._set_entry(v)
-
-    def set_enabled(self, en):
-        st = 'normal' if en else 'disabled'
-        self.scale.config(state=st)
-        self.entry.config(state=st)
-
-
-# ════════════════════════════════════════════════════════
-#  DECODING FIRMWARE ERROR CODES (ERR:code=N,...,active=0/1)
-# ════════════════════════════════════════════════════════
-ERR_CODES = {
-    1: "Main thermocouple fault",
-    2: "Thermocouple reading out of range / noise",
-    3: "TEMP MAX - safe shutdown",
-    4: "MAX31856 not responding (SPI/connection)",
-}
-# MAX31856 fault register bitmask (Adafruit_MAX31856.h)
-TC_FAULT_BITS = [
-    (0x80, "cold junction range (CJ range)"),
-    (0x40, "thermocouple range (TC range)"),
-    (0x20, "cold junction too high (CJ high)"),
-    (0x10, "cold junction too low (CJ low)"),
-    (0x08, "thermocouple too hot (TC high)"),
-    (0x04, "thermocouple too cold (TC low)"),
-    (0x02, "overvoltage/undervoltage (OV/UV)"),
-    (0x01, "open circuit - wire broken/disconnected"),
-]
-
-
-# ── CSV COLUMN NAMES: ENGLISH NOW, POLISH STILL READABLE ────────────────
-# The measurement CSV used to have Polish headers. From APP .15 new files are
-# written with English ones, but every file already sitting in the data folder
-# has the old names - and the ARCHIVE tab must keep opening them. So the
-# writer emits CSV_COLS (English) and the reader passes every row through
-# _csv_row(), which makes BOTH spellings resolve. Nothing downstream had to
-# change, and no existing measurement becomes unreadable.
-CSV_COLS = ['time_s', 'temperature_C', 'setpoint_active', 'setpoint_target',
-            'PWM', 'PWM_%', 'Kp', 'Ki', 'Kd', 'state', 'temperature2_C',
-            'ff', 'p_term', 'i_term', 'd_term', 'pid_raw', 'react_scale',
-            'amb_est', 'pc_time']
-# old (on disk) -> new (written from now on)
-CSV_ALIAS = {
-    'czas_s':            'time_s',
-    'temperatura_C':     'temperature_C',
-    'setpoint_aktywny':  'setpoint_active',
-    'setpoint_cel':      'setpoint_target',
-    'stan':              'state',
-    'temperatura2_C':    'temperature2_C',
-    'czas_pc':           'pc_time',
-}
-_CSV_ALIAS_REV = {v: k for k, v in CSV_ALIAS.items()}
-
-def _csv_row(r):
-    """One CSV row readable under BOTH the old Polish and the new English
-    column names. Cheap (a handful of dict writes per row) and it keeps the
-    whole archive - hundreds of files - working without a migration step."""
-    for old, new in CSV_ALIAS.items():
-        if old in r and new not in r:
-            r[new] = r[old]
-        elif new in r and old not in r:
-            r[old] = r[new]
-    return r
-
-# ── EMBLEM ──────────────────────────────────────────────────────────────
-# An ORIGINAL heraldic beast-head mark, defined once as polygons in a
-# normalised -1..1 space and rendered by two tiny back-ends (Tk canvas for
-# the title bar, matplotlib patches for the chart watermark). No image files
-# ship with the app and nothing is traced from anyone else's artwork.
-#
-# ON THE OBVIOUS QUESTION: this is deliberately NOT a redrawn Witcher School
-# of the Wolf medallion. Redrawing a protected logo produces a derivative
-# work, which is still protected - and that particular head is a trademark on
-# top of that. What is NOT protectable is the genre vocabulary: an angular
-# animal head, faceted planes, gold on near-black. So the vocabulary is
-# borrowed and the drawing is our own: a closed, calm, symmetrical head
-# instead of a snarling open-jawed one, swept horns instead of a spiked
-# halo, plain ring instead of a fanned crest, and no row of sign glyphs
-# underneath - that row is the part that makes their composition theirs.
-#
-# y points UP in these coordinates; the Tk renderer flips it.
-# ONE silhouette rather than a pile of overlapping pieces - the first two
-# attempts stacked separate ears/brow/cheeks/muzzle polygons and the seams
-# between them made the middle of the face mushy. Traced clockwise from the
-# left ear tip: ears with a forehead dip between them, skull, two ranks of
-# cheek ruff, and a blunt snout.
-# Control points of the head, traced clockwise from the left ear tip, in a
-# -1..1 space with y pointing UP. They are NOT drawn as a polygon: everything
-# goes through _spline() first.
-#
-# WHY A SPLINE. Two earlier attempts drew straight-edged polygons. The first
-# came out as a rat (needle snout, swept-back ears); the second, once the
-# facets were tidied up, came out as a Transformers faceplate - because hard
-# straight edges meeting at machined angles is exactly what a robot mask is.
-# Fur and bone are curved, so the outline is now interpolated into a smooth
-# closed curve and the internal "panel line" cuts are gone. The tufts are
-# deliberately NOT matched in length pair-for-pair; slight irregularity is
-# most of what separates fur from bodywork.
-EMBLEM_SOLID = [[
-    (-0.54, 1.10), (-0.34, 0.66), (-0.13, 0.70), (0.13, 0.70), (0.34, 0.66),
-    ( 0.58, 1.12), ( 0.74, 0.54), ( 0.88, 0.18), (1.02, -0.12), (0.68, -0.22),
-    ( 0.88, -0.54), ( 0.46, -0.44), (0.42, -0.66), (0.27, -0.56),
-    ( 0.24, -0.84), ( 0.00, -0.96), (-0.24, -0.84), (-0.27, -0.56),
-    (-0.40, -0.68), (-0.46, -0.44), (-0.84, -0.58), (-0.70, -0.22),
-    (-1.02, -0.12), (-0.86, 0.18), (-0.72, 0.52),
-]]
-# ── FACETS: the chiselled-metal pass ────────────────────────────────────
-# The smooth silhouette alone read flat. These are the planes the light falls
-# on, laid over the base shape with a single convention: the light comes from
-# the upper LEFT, so left-facing planes are lit and right-facing ones are in
-# shadow, with a bright ridge running down the centre of the face.
-# They are drawn WITHOUT spline smoothing on purpose - hard facet edges are
-# what makes it look chiselled rather than moulded - and they are deliberately
-# coarse: five planes per side, not twenty, because this also has to survive
-# being 10 px wide in the title bar.
-EMBLEM_LIT = [
-    [(-0.54, 1.06), (-0.34, 0.66), (-0.15, 0.73), (-0.31, 0.92)],          # ear
-    [(-0.34, 0.66), (-0.13, 0.70), (0.00, 0.22), (-0.22, -0.04),
-     (-0.64, 0.14), (-0.72, 0.46)],                                        # skull
-    [(-1.00, -0.12), (-0.66, -0.20), (-0.50, -0.42), (-0.84, -0.56)],      # ruff
-    [(-0.22, -0.04), (0.00, 0.04), (0.00, -0.90), (-0.17, -0.78),
-     (-0.27, -0.52)],                                                      # snout
-]
-EMBLEM_SHADE = [
-    [( 0.58, 1.08), ( 0.34, 0.66), ( 0.15, 0.73), ( 0.33, 0.92)],
-    [( 0.34, 0.66), ( 0.13, 0.70), (0.00, 0.22), (0.22, -0.04),
-     ( 0.64, 0.14), ( 0.74, 0.46)],
-    [( 1.00, -0.12), ( 0.66, -0.20), (0.50, -0.42), (0.86, -0.54)],
-    [( 0.22, -0.04), ( 0.00, 0.04), (0.00, -0.90), (0.18, -0.78),
-     ( 0.27, -0.52)],
-]
-# The catch-light: a narrow strip down the muzzle ridge, brightest of all.
-EMBLEM_RIDGE = [
-    [(-0.052, 0.52), (0.052, 0.52), (0.028, -0.50), (0.0, -0.60),
-     (-0.028, -0.50)],
-]
-
-# Only the eyes are punched back out. Every extra cut is one more thing that
-# reads as a seam on a mask, and at 10 px in the title bar it is also one more
-# thing that turns to mud.
-EMBLEM_VOID = [
-    [(-0.60, 0.30), (-0.34, 0.16), (-0.20, 0.00), (-0.34, -0.04), (-0.56, 0.10)],
-    [( 0.60, 0.30), ( 0.34, 0.16), ( 0.20, 0.00), ( 0.34, -0.04), ( 0.56, 0.10)],
-]
-
-
-def _spline(pts, steps=10):
-    """Closed Catmull-Rom through pts - the curve passes through every control
-    point, so the ear and tuft tips stay sharp while everything between them
-    curves. Returns a dense point list both renderers can use."""
-    n = len(pts)
-    out = []
-    for i in range(n):
-        p0 = pts[(i - 1) % n]; p1 = pts[i]
-        p2 = pts[(i + 1) % n]; p3 = pts[(i + 2) % n]
-        for j in range(steps):
-            t = j / steps
-            t2 = t * t; t3 = t2 * t
-            out.append((
-                0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t +
-                       (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
-                       (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3),
-                0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t +
-                       (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
-                       (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)))
-    return out
-
-
-# ── ANTI-ALIASED RENDERING OF THE MARK ──────────────────────────────────
-# Tk's canvas has NO anti-aliasing: create_polygon() writes hard pixels, so
-# every diagonal in the emblem and in the letterforms came out as a visible
-# staircase - worst exactly where it matters, at title-bar size.
-#
-# Fix without touching a single coordinate: draw the very same geometry into a
-# PIL image at SS times the final size and scale it down with LANCZOS, which
-# averages the edge pixels properly. _PILCanvas below exposes just the three
-# calls the drawing routines use, so draw_medallion() and draw_wordmark() do
-# not know or care which back-end they are painting into.
-#
-# Pillow arrives with matplotlib, so it is available in practice - but the
-# import is guarded and everything falls back to plain canvas polygons if it
-# is not. A slightly jagged logo is a cosmetic problem; refusing to start is
-# not acceptable for an instrument.
-try:
-    from PIL import Image, ImageDraw, ImageTk
-    _PIL_OK = True
-except Exception:
-    _PIL_OK = False
-
-MARK_SS = 4          # supersampling factor
-
-
-class _PILCanvas:
-    """The slice of the Tk canvas API that the mark drawing uses, backed by
-    PIL at MARK_SS resolution."""
-
-    def __init__(self, draw, ss):
-        self.d = draw
-        self.ss = ss
-
-    def create_polygon(self, *pts, **kw):
-        f = kw.get('fill') or kw.get('outline')
-        self.d.polygon([(pts[i] * self.ss, pts[i + 1] * self.ss)
-                        for i in range(0, len(pts), 2)], fill=f)
-
-    def create_oval(self, x0, y0, x1, y1, **kw):
-        w = max(1, int(round(kw.get('width', 1) * self.ss)))
-        self.d.ellipse([x0 * self.ss, y0 * self.ss, x1 * self.ss, y1 * self.ss],
-                       outline=kw.get('outline'), width=w)
-
-    def create_rectangle(self, x0, y0, x1, y1, **kw):
-        self.d.rectangle([x0 * self.ss, y0 * self.ss, x1 * self.ss, y1 * self.ss],
-                         fill=kw.get('fill') or kw.get('outline'))
-
-
-def make_mark(w, h, bg, painter):
-    """Paint `painter(canvas)` anti-aliased into a Tk image of w x h pixels.
-    Returns None when Pillow is missing - the caller then paints straight onto
-    the Tk canvas as before. The returned image MUST be kept referenced by the
-    caller, or Tk garbage-collects it and shows nothing."""
-    if not _PIL_OK:
-        return None
-    try:
-        im = Image.new('RGB', (max(1, w * MARK_SS), max(1, h * MARK_SS)), bg)
-        painter(_PILCanvas(ImageDraw.Draw(im), MARK_SS))
-        im = im.resize((max(1, w), max(1, h)), Image.LANCZOS)
-        return ImageTk.PhotoImage(im)
-    except Exception as e:
-        print(f"mark render fallback: {e}")
-        return None
-
-
-# ── WORDMARK ────────────────────────────────────────────────────────────
-# The letters are geometry, not a font. A font would look like whatever
-# Consolas fallback the machine happens to have; these are drawn from the same
-# vocabulary as the emblem - flat planes, chamfered corners, one light source
-# in the upper left - so the mark reads as one designed object rather than a
-# picture next to some text.
-#
-# Coordinates: x to the right, y UP, baseline at y=0, cap height y=1. Each
-# entry is (advance_width, [polygons]). W is the stroke weight, K the chamfer
-# that keeps the corners from looking machined.
-_W = 0.26          # stroke weight
-_K = 0.075         # corner chamfer
-
-# ── THE A, AND WHY IT NEEDS ITS OWN ARITHMETIC ─────────────────────────
-# The A was the one letter that looked wrong next to the others, for two
-# reasons that stacked:
-#
-#  1. It had been given a THINNER stroke (0.20 against 0.26) to stop its two
-#     legs merging and closing the counter. That alone made it 23% lighter.
-#  2. A SLANTED stroke of a given HORIZONTAL width is thinner measured across
-#     itself: the leg runs 0.40 sideways per 1 of height, so a horizontal
-#     0.20 is only 0.186 perpendicular. Together the A came out 29% lighter
-#     than L, C, H and I - which is exactly what the eye picks up.
-#
-# The fix is the one type designers use: do NOT thin the stroke to make room.
-# Widen the letter, sharpen the apex, and derive the horizontal extent from
-# the perpendicular weight you actually want:
-#     _AW = _W * sqrt(1 + R^2),  R = horizontal run per unit height
-# THIRD PASS - the apex. With a 0.12 apex the letter tapered almost to a point
-# and read as a triangle wedged between four slab-sided neighbours. Widening
-# it to 0.40 gives a properly FLAT top that matches the squared terminals of
-# L, C, H and I; the price is a smaller counter (it now closes at 57% of the
-# cap height instead of 80%), which is simply what a flat-apex A costs - the
-# two inner edges have already crossed by the apex width at the top.
-#
-# FOURTH PASS - the counter was then too cramped: with the bar at 0.24 and a
-# 0.68 weight it left only 0.15 of cap height of open triangle. Three small
-# moves buy it back without touching the flat top or the stroke weight:
-# the letter widened 1.08 -> 1.14 (pushes the crossing point up), the crossbar
-# dropped 0.24 -> 0.17, and the bar itself thinned to 0.60 of the stem. The
-# counter now spans 0.33..0.59 - about 0.27 of cap height, nearly double.
-#
-# FIFTH PASS - bigger still. Widened again to 1.24, the apex trimmed 0.40 ->
-# 0.34 (still unmistakably flat, just less of a plateau), the crossbar dropped
-# to 0.12 and thinned to 0.56 of the stem. The counter now runs 0.27..0.66,
-# roughly 0.40 of cap height - two and a half times the fourth pass. The A is
-# deliberately the widest glyph in the set; that is what an open counter under
-# a flat apex costs, and it is what A and V do in most display faces anyway.
-#
-# SIXTH PASS - position, not size. The counter was sitting low, pinned to the
-# crossbar, with its centre at 0.46 of the cap height. Raising the bar alone
-# would just have eaten it from below, so the apex was trimmed 0.34 -> 0.24
-# as well: a narrower apex pushes the point where the two inner edges cross
-# from 0.66 up to 0.75, which buys back at the top exactly what the higher bar
-# takes at the bottom. Net effect - the counter keeps its height (0.40 of cap)
-# and its centre moves 0.46 -> 0.55, so it now sits in the upper half of the
-# letter where the eye expects it. The apex is still flat, just less of a
-#
-# SEVENTH PASS - stroke audit. Rasterising every glyph and measuring the pixel
-# runs showed the horizontal bars had drifted apart badly: stems and the L and
-# C bars sat at 0.262, but the H waist was 0.190, the I slabs 0.184 and this
-# crossbar only 0.146 - up to 44% lighter than the stems they join. All bars
-# are now exactly _W. The A's bar dropped 0.20 -> 0.17 so that going from
-# 0.146 to 0.260 thick does not eat the counter from below.
-# (Type design normally draws horizontals a hair LIGHTER than verticals, since
-# equal measures look heavier horizontally. This face is deliberately
-# monolinear instead - one weight everywhere, which suits its slab geometry.)
-# EIGHTH PASS - the A's legs were the last uneven stroke. The audit measured
-# them at 0.233 perpendicular against 0.262 everywhere else, and the reason is
-# that they were not parallelograms at all: the OUTER edge ran (A-P)/2 = 0.53
-# sideways per unit height while the INNER edge ran only 0.476, so each leg
-# tapered as it climbed. The _AW = _W*sqrt(1+R^2) correction assumed parallel
-# edges and therefore fixed the width at exactly one height, not along the leg.
-#
-# For genuinely parallel edges the apex width MUST equal the leg's horizontal
-# extent - top and bottom edges of a parallelogram are the same length. So the
-# apex is no longer chosen freely; it is solved together with the width:
-#     _AW = _W * sqrt(1 + R^2),   R = (A - _AW) / 2,   apex = _AW
-# Two unknowns, two equations, and the fixed point converges in a handful of
-# iterations. The apex lands at 0.291 - still flat, close to the 0.24 it was
-# eyeballed at - and every stroke in the alphabet is now one weight.
-_A_ADV, _A_BAR = 1.30, 0.17                 # width, crossbar height
-
-
-def _solve_leg(adv, w):
-    """Leg horizontal extent for a TRUE parallelogram: the apex width equals
-    it, so the slant depends on the answer. Fixed-point, converges fast."""
-    aw = w
-    for _ in range(40):
-        r = (adv - aw) / 2.0
-        nw = w * math.sqrt(1.0 + r * r)
-        if abs(nw - aw) < 1e-12:
-            break
-        aw = nw
-    return aw
-
-
-_AW = _solve_leg(_A_ADV, _W)                # leg extent ...
-_A_APEX = _AW                               # ... and the apex, necessarily equal
-_A_CTR = _A_ADV / 2.0
-
-
-def _a_inner(y, left=True):
-    """x of a leg's INNER edge at height y (0 = baseline, 1 = cap)."""
-    x0 = _AW if left else _A_ADV - _AW
-    x1 = _A_CTR + (_A_APEX / 2 if left else -_A_APEX / 2)
-    return x0 + y * (x1 - x0)
-
-
-GLYPHS = {
-    # L - stem plus foot, chamfered at the outer bottom corner
-    'L': (0.68, [[(0, 1), (_W, 1), (_W, _W), (0.68, _W), (0.68 - _K, 0),
-                  (0, 0)]]),
-    # A - two splayed legs meeting at a flat apex, plus a fitted crossbar
-    'A': (_A_ADV, [
-        [(0, 0), (_AW, 0), (_A_CTR + _A_APEX / 2, 1), (_A_CTR - _A_APEX / 2, 1)],
-        [(_A_ADV, 0), (_A_ADV - _AW, 0), (_A_CTR - _A_APEX / 2, 1),
-         (_A_CTR + _A_APEX / 2, 1)],
-        [(_a_inner(_A_BAR, True), _A_BAR),
-         (_a_inner(_A_BAR, False), _A_BAR),
-         (_a_inner(_A_BAR + _W, False), _A_BAR + _W),
-         (_a_inner(_A_BAR + _W, True), _A_BAR + _W)],
-    ]),
-    # C - an angular ring, opened on the right by exactly one stroke width so
-    # it cannot be read as a bracket
-    'C': (0.78, [[(0.78, 1), (0.20, 1), (0, 1 - 0.22), (0, 0.22), (0.20, 0),
-                  (0.78, 0), (0.78, _W), (0.26, _W), (_W, _W + 0.13),
-                  (_W, 1 - _W - 0.13), (0.26, 1 - _W), (0.78, 1 - _W)]]),
-    # H - two stems and a waist bar
-    'H': (0.84, [
-        [(0, 1), (_W, 1), (_W, 0), (0, 0)],
-        [(0.84 - _W, 1), (0.84, 1), (0.84, 0), (0.84 - _W, 0)],
-        [(_W, 0.50 + _W / 2), (0.84 - _W, 0.50 + _W / 2),
-         (0.84 - _W, 0.50 - _W / 2), (_W, 0.50 - _W / 2)],
-    ]),
-    # I - stem with slab serifs, so it cannot be mistaken for a divider
-    'I': (0.56, [
-        [(0, 1), (0.56, 1), (0.56, 1 - _W), (0, 1 - _W)],
-        [(0, _W), (0.56, _W), (0.56, 0), (0, 0)],
-        [(0.28 - _W / 2, 1 - _W), (0.28 + _W / 2, 1 - _W),
-         (0.28 + _W / 2, _W), (0.28 - _W / 2, _W)],
-    ]),
-}
-TRACKING = 0.20    # base gap between letter BOXES, in cap-height units
-
-# ── KERNING ─────────────────────────────────────────────────────────────
-# TRACKING alone spaces the bounding BOXES, and boxes are a poor model of what
-# the eye sees: ink does not reach the box edge everywhere. Measured on the
-# rasterised letters, the white area between pairs came out
-#     LA 0.773   AC 0.497   CH 0.449   HI 0.272
-# - the LA pair nearly THREE TIMES looser than HI. The cause is structural: H
-# and I are slab-sided, so their gap is exactly TRACKING at every height, while
-# above the L's foot the L is only 0.26 wide and the A's edge runs away toward
-# its apex, so that pair opens up as it climbs.
-#
-# WHICH RULE TO EQUALISE. Equalising the white AREA is the classic answer, but
-# for this alphabet it fails: rendered side by side it forced HI apart to a
-# 0.56 gap and the word read as "LA CH I". In an alphabet that is four
-# parallel-sided letters plus one A, what the eye actually judges is the
-# NEAREST APPROACH, so that is what these kerns equalise - every pair now comes
-# within exactly TRACKING of its neighbour at its closest point. Some residual
-# opening at the top of LA stays, because L followed by A does that in every
-# typeface ever cut.
-KERN = {
-    'LA': -0.075,   # L's arm is empty above the foot; A's leg meets it at the baseline
-    'AC': -0.112,   # A's right leg leans away from C's flat left side
-}
-
-
-def wordmark_width(text=APP_NAME, h=1.0):
-    """Total width of the wordmark at cap height h - needed to centre it or to
-    reserve space for it before anything is drawn. Includes the kerns, or the
-    canvas would be sized for a wider word than actually gets drawn."""
-    adv = sum(GLYPHS[c][0] for c in text if c in GLYPHS)
-    n = len([c for c in text if c in GLYPHS])
-    kern = sum(KERN.get(text[i:i + 2], 0.0) for i in range(len(text) - 1))
-    return (adv + TRACKING * max(0, n - 1) + kern) * h
-
-
-def draw_wordmark(cv, x, y, h, color, bg, text=APP_NAME):
-    """Render the wordmark on a Tk canvas with (x, y) at the BASELINE LEFT.
-
-    The chiselled look comes from three passes rather than per-stroke facet
-    geometry: a dark copy pushed down-right, then a light copy pulled up-left,
-    then the solid letters on top. Cheap, and it cannot get out of step with
-    the outline the way hand-placed facets would."""
-    lit = _lighten(color, 0.55)
-    shade = _darken(color, 0.45)
-    d = h * 0.028
-    for dx, dy, col in ((d, d, shade), (-d * 0.6, -d * 0.6, lit), (0, 0, color)):
-        cx = x + dx
-        prev = None
-        for ch in text:
-            if prev is not None:
-                cx += KERN.get(prev + ch, 0.0) * h
-            prev = ch
-            g = GLYPHS.get(ch)
-            if not g:
-                cx += 0.4 * h
-                continue
-            adv, polys = g
-            for poly in polys:
-                pts = []
-                for px, py in poly:
-                    pts += [cx + px * h, y - py * h + dy]   # y grows down in Tk
-                cv.create_polygon(*pts, fill=col, outline=col)
-            cx += (adv + TRACKING) * h
-
-
-def draw_medallion(cv, cx, cy, r, color, bg):
-    """Render the emblem onto a Tk canvas, centred at (cx, cy) with radius r.
-    Purely decorative - nothing in the control path depends on it."""
-    cv.create_oval(cx - r, cy - r, cx + r, cy + r,
-                   outline=color, width=max(1, int(r * 0.12)))
-    k = r * 0.62
-    def pts(poly):
-        out = []
-        for x, y in poly:
-            out += [cx + x * k, cy - y * k]       # minus: Tk y grows downward
-        return out
-    lit   = _lighten(color, 0.42)
-    shade = _darken(color, 0.34)
-    ridge = _lighten(color, 0.62)
-    for poly in EMBLEM_SOLID:
-        cv.create_polygon(*pts(_spline(poly)), fill=color, outline=color)
-    for poly in EMBLEM_SHADE:
-        cv.create_polygon(*pts(poly), fill=shade, outline=shade)
-    for poly in EMBLEM_LIT:
-        cv.create_polygon(*pts(poly), fill=lit, outline=lit)
-    for poly in EMBLEM_RIDGE:
-        cv.create_polygon(*pts(poly), fill=ridge, outline=ridge)
-    for poly in EMBLEM_VOID:
-        cv.create_polygon(*pts(_spline(poly, 6)), fill=bg, outline=bg)
-
-
-def section(parent, title, color=None, bg=None, pady=(14, 6)):
-    """One consistent section header for every tab: a hairline rule, a short
-    all-caps title and a thin coloured tick. Before .15 each tab invented its
-    own heading style (some bold labels, some coloured bars, some nothing at
-    all), which is most of why the panels read as a wall of controls."""
-    color = color or C['gold']
-    bg = bg or C['bg2']
-    head = tk.Frame(parent, bg=bg)
-    head.pack(fill='x', pady=pady)
-    tk.Frame(head, bg=color, width=SC(3), height=SC(11)).pack(side='left')
-    tk.Label(head, text=title, bg=bg, fg=color,
-             font=F(8, 1)).pack(side='left', padx=(SC(6), SC(8)))
-    tk.Frame(head, bg=C['border'], height=1).pack(side='left', fill='x',
-                                                  expand=True, pady=(SC(5), 0))
-    return head
-
-# ── CHART NAVIGATION: drag to zoom, wheel to zoom, right-click to reset ──
-# Replaces matplotlib's NavigationToolbar. That toolbar brought its own icon
-# set and its own light-grey chrome into a dark instrument panel, and its
-# mode-based zoom (click the magnifier first, THEN drag) is a step nobody
-# wants on a live trace. These three gestures are the whole interaction:
-#
-#   left-drag   - rubber-band a rectangle, release to zoom into it
-#   wheel       - zoom about the cursor; over the plot it scales BOTH axes,
-#                 over an axis strip it scales that axis only
-#   right-click - back to the automatic view
-#
-# The one thing this has to get right is the live chart: its redraw clears the
-# axes ~4x a second, which would throw away any manual zoom on the next frame.
-# So a zoom LOCKS the view - locked=True - and the redraw re-applies the saved
-# limits instead of autoscaling, until a right-click releases it.
-class ChartNav:
-    WHEEL_STEP = 1.18          # zoom factor per wheel notch
-
-    def __init__(self, canvas, axes, on_change=None, share_x=True):
-        self.canvas = canvas
-        self.axes = list(axes)
-        self.on_change = on_change
-        self.share_x = share_x
-        self.locked = False
-        self._lim = {}                       # axes -> (xlim, ylim)
-        self._press = None                   # (x, y, axes) while dragging
-        self._rect = None
-        c = canvas.mpl_connect
-        c('button_press_event', self._on_press)
-        c('motion_notify_event', self._on_motion)
-        c('button_release_event', self._on_release)
-        c('scroll_event', self._on_scroll)
-
-    # ── state ────────────────────────────────────────────────────────────
-    def remember(self):
-        self._lim = {ax: (ax.get_xlim(), ax.get_ylim()) for ax in self.axes}
-
-    def restore(self):
-        """Called by the redraw AFTER re-plotting: re-apply a locked view."""
-        if not self.locked:
-            return
-        for ax, (xl, yl) in self._lim.items():
-            ax.set_xlim(xl)
-            ax.set_ylim(yl)
-
-    def reset(self):
-        self.locked = False
-        self._lim = {}
-        for ax in self.axes:
-            ax.relim()
-            ax.autoscale(True)
-        if self.on_change:
-            self.on_change()
-        else:
-            self.canvas.draw_idle()
-
-    def _lock(self):
-        self.locked = True
-        self.remember()
-        self.canvas.draw_idle()
-
-    # ── rubber band ──────────────────────────────────────────────────────
-    def _on_press(self, e):
-        if e.button == 3:                    # right button - back to auto
-            self.reset()
-            return
-        if e.button == 1 and e.inaxes in self.axes:
-            self._press = (e.xdata, e.ydata, e.inaxes)
-
-    def _on_motion(self, e):
-        if not self._press or e.inaxes is not self._press[2] or e.xdata is None:
-            return
-        x0, y0, ax = self._press
-        if self._rect is not None:
-            try: self._rect.remove()
-            except Exception: pass
-        from matplotlib.patches import Rectangle
-        self._rect = Rectangle((min(x0, e.xdata), min(y0, e.ydata)),
-                               abs(e.xdata - x0), abs(e.ydata - y0),
-                               fill=True, fc=C['gold'], ec=C['gold'],
-                               alpha=0.16, lw=1.0, zorder=50)
-        ax.add_patch(self._rect)
-        self.canvas.draw_idle()
-
-    def _on_release(self, e):
-        if not self._press:
-            return
-        x0, y0, ax = self._press
-        self._press = None
-        if self._rect is not None:
-            try: self._rect.remove()
-            except Exception: pass
-            self._rect = None
-        if e.xdata is None or e.inaxes is not ax:
-            self.canvas.draw_idle()
-            return
-        # A click, not a drag - ignore, so a stray click does not zoom to a point
-        if abs(e.x - ax.transData.transform((x0, y0))[0]) < 8 and \
-           abs(e.y - ax.transData.transform((x0, y0))[1]) < 8:
-            self.canvas.draw_idle()
-            return
-        xlo, xhi = sorted((x0, e.xdata))
-        ylo, yhi = sorted((y0, e.ydata))
-        for a in self.axes:
-            if self.share_x or a is ax:
-                a.set_xlim(xlo, xhi)
-            if a is ax:
-                a.set_ylim(ylo, yhi)
-        self._lock()
-
-    # ── wheel ────────────────────────────────────────────────────────────
-    def _on_scroll(self, e):
-        ax = e.inaxes
-        if ax not in self.axes:
-            return
-        f = 1 / self.WHEEL_STEP if e.button == 'up' else self.WHEEL_STEP
-        for a in self.axes:
-            if self.share_x or a is ax:
-                lo, hi = a.get_xlim()
-                cx = e.xdata if e.xdata is not None else (lo + hi) / 2
-                a.set_xlim(cx - (cx - lo) * f, cx + (hi - cx) * f)
-            if a is ax and e.ydata is not None:
-                lo, hi = a.get_ylim()
-                a.set_ylim(e.ydata - (e.ydata - lo) * f,
-                           e.ydata + (hi - e.ydata) * f)
-        self._lock()
-
-
-def _align_inside(ax):
-    """Pull the tick labels inside the plotting area.
-
-    This has to run on every DRAW, not once at setup: matplotlib recomputes
-    tick locations lazily, so any alignment applied to the labels that existed
-    at style time is thrown away as soon as the data - and with it the tick
-    positions - change. Without this the bottom-most y label and the whole x
-    row hang outside the axes and get clipped by the canvas edge."""
-    for t in ax.get_yticklabels():
-        t.set_horizontalalignment('left')
-        t.set_verticalalignment('bottom')
-    for t in ax.get_xticklabels():
-        t.set_verticalalignment('bottom')
-        t.set_horizontalalignment('left')
-
-
-def style_axes(ax, xunit=None, yunit=None, show_x=True):
-    """Frameless axes with the scale drawn INSIDE the plot.
-
-    The old style spent a wide margin on spines, tick marks and axis titles -
-    on a panel this size that margin was a noticeable slice of the chart. Now
-    there is no frame at all, the tick labels sit just inside the plotting
-    area, and the unit is a small corner caption instead of a full axis title.
-    The captions are held off the very corners so they cannot land on top of
-    the first tick label."""
-    for sp in ax.spines.values():
-        sp.set_visible(False)
-    ax.tick_params(axis='y', direction='in', length=0, pad=-SC(4),
-                   colors=C['dim'], labelsize=8)
-    ax.tick_params(axis='x', direction='in', length=0, pad=-SC(13),
-                   colors=C['dim'], labelsize=8, labelbottom=show_x)
-    ax.set_xlabel(''); ax.set_ylabel('')
-    _align_inside(ax)
-    if not getattr(ax, '_inside_hooked', False):
-        ax.figure.canvas.mpl_connect('draw_event', lambda e, a=ax: _align_inside(a))
-        ax._inside_hooked = True
-    if yunit:
-        ax.text(0.008, 0.93, yunit, transform=ax.transAxes, ha='left', va='top',
-                color=C['dim2'], fontsize=8)
-    if xunit and show_x:
-        ax.text(0.995, 0.075, xunit, transform=ax.transAxes, ha='right',
-                va='bottom', color=C['dim2'], fontsize=8)
-
-
-# ── PRINT / EXPORT PALETTE ──────────────────────────────────────────────
-# Anything that LEAVES the app - a saved PNG, an SVG, a PDF report, a chart
-# pasted into a thesis or a mail - must be readable on white paper. The
-# on-screen theme is deliberately dark, so exporting the screen colours gave
-# a black rectangle with parchment-coloured text: fine on a monitor, useless
-# printed, and a waste of toner.
-# The keys are identical to C, so every drawing routine keeps working - only
-# the values swap for the duration of the export (see print_theme()).
-C_PRINT = {
-    'bg':       '#ffffff',
-    'bg2':      '#ffffff',
-    'panel':    '#ffffff',
-    'panel2':   '#ffffff',
-    'panel3':   '#f0f0f0',
-    'border':   '#9a9a9a',
-    'border2':  '#c0c0c0',
-    'text':     '#101010',
-    'dim':      '#2a2a2a',   # axis labels/ticks - near-black, not grey
-    'dim2':     '#666666',
-    'blue':     '#1f6fb4',   # temperature
-    'orange':   '#d2691e',   # setpoint
-    'yellow':   '#b8860b',   # rate
-    'green':    '#2e7d32',   # pwm
-    'red':      '#b3261e',
-    'cyan':     '#00796b',   # cooling / second trace
-    'purple':   '#6a3fa0',
-    'rec':      '#b3261e',
-    'grid':     '#cccccc',
-    'gold':     '#8a7326',
-}
-
-
-@contextlib.contextmanager
-def print_theme(*figures):
-    """Swap the whole app palette to the print one for the duration of a save.
-
-    Every drawing routine reads C[...] at DRAW time, so mutating C in place
-    and re-running the redraw is enough to restyle both charts completely -
-    lines, ticks, labels, legend, grid and spines - without maintaining a
-    second copy of the plotting code. The medallion watermark is hidden as
-    well: it is chrome for the screen, and it has no business on a figure
-    that ends up in a report."""
-    saved = dict(C)
-    saved_faces = [(f, f.get_facecolor()) for f in figures]
-    C.update(C_PRINT)
-    for f in figures:
-        f.set_facecolor('white')
-    try:
-        yield
-    finally:
-        C.clear(); C.update(saved)
-        for f, fc in saved_faces:
-            f.set_facecolor(fc)
-
-def decode_tc_fault(bits):
-    names = [name for mask, name in TC_FAULT_BITS if bits & mask]
-    return ", ".join(names) if names else f"bitmask 0x{bits:02X}"
-
-
-# ════════════════════════════════════════════════════════
-#  MAIN APPLICATION
-# ════════════════════════════════════════════════════════
-class PeltierControl:
-    def __init__(self, root):
-        self.root = root
-        self.root.title(f"{APP_NAME} - photocurrent & pyrocurrent bench  [APP {APP_BUILD}]")
-        self.root.configure(bg=C['bg'])
-        # The main window size is ALSO scaled by DPI and clipped to the screen -
-        # see the comment at SC()/size_win().
-        size_win(self.root, 1280, 800, 1100, 720)
-
-        # Serial
+    print("pip install pyserial")
+    sys.exit(1)
+
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from PyQt6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QListWidget,
+                             QListWidgetItem, QMainWindow, QScrollArea,
+                             QStackedWidget, QVBoxLayout, QWidget)
+
+from lachi import brand, core, icons, widgets as W
+from lachi.chart import ChartPanel, style_axes, style_legend
+from lachi.core import (APP_BUILD, APP_NAME, CSV_COLS, ERR_CODES,
+                        PING_EVERY_S, REACH_STABLE_S, REACH_TOL_C,
+                        SERIES_COOL_TIMEOUT_S, SERIES_HEAT_TIMEOUT_S,
+                        STALL_LIMIT_S, Var, csv_row, decode_tc_fault)
+from lachi.dialogs import (CalibrationDialog, CalRangeDialog, CalTableDialog,
+                           DiagnosticsDialog, PresetDialog, ProfileDialog,
+                           SaveCycleDialog, StatsDialog)
+from lachi.theme import PAD, Theme
+
+# The colour a run is drawn in on the archive chart. Eight distinguishable
+# system hues; a ninth run wraps round, which is what the eye can hold anyway.
+ARCH_COLOR_KEYS = ['blue', 'orange', 'green', 'red', 'teal', 'purple',
+                   'yellow', 'pink']
+
+
+class Lachi(QMainWindow):
+    # ────────────────────────────────────────────────────────────────────
+    #  CONSTRUCTION
+    # ────────────────────────────────────────────────────────────────────
+    # Marshals a call from the serial reader thread onto the GUI thread. The
+    # Tkinter build used root.after(0, fn) for this; a queued signal is the
+    # same idea with the same guarantee - the callable runs on the thread that
+    # owns the widgets, never on the reader.
+    sig_call = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+
+        # ── appearance ──────────────────────────────────────────────────
+        self.cfg_dir = Path.home() / "PeltierLogi"
+        self.cfg_dir.mkdir(exist_ok=True)
+        self.settings_file = self.cfg_dir / "ustawienia.json"
+        self.th = Theme(self._load_setting('appearance', 'light'),
+                        float(self._load_setting('ui_scale', 1.0) or 1.0))
+
+        # ── serial ──────────────────────────────────────────────────────
         self.ser = None
         self.port_name = None
         self.baud = 115200
         self.running = False
         self.connected = False
 
-        # Measurement data (buffers)
+        # ── measurement buffers ─────────────────────────────────────────
         self.maxlen = 3000
         self.t = []; self.temp = []; self.spt = []; self.spa = []
         self.pwm = []; self.kp = []; self.ki = []; self.kd = []; self.states = []
@@ -1129,145 +114,903 @@ class PeltierControl:
         self.data_queue = queue.Queue()
         self.last_state = 'MAN'
         self.cur_state = 'MAN'
+        self._latest_temp2 = None
 
-        # Tracking the approach to the setpoint (statistics)
-        self.reach_start_t = None    # approach start time (s)
-        self.reach_start_temp = None # temp at the start
-        self.reach_target = None     # target temp
-        self.reach_done = False      # whether it was reached
-        self.reach_in_tol_t = None   # since when we have been within tolerance
-                                     # (see REACH_TOL_C/REACH_STABLE_S)
-        self.reach_time = None       # how long the approach took [s]
-        self.reach_avg_rate = None   # average ramp [C/min]
+        # ── tracking the approach to the setpoint ───────────────────────
+        self.reach_start_t = None
+        self.reach_start_temp = None
+        self.reach_target = None
+        self.reach_done = False
+        self.reach_in_tol_t = None
+        self.reach_time = None
+        self.reach_avg_rate = None
+        self.reach_dir = None
         self.last_setpoint_target = None
+        self._last_reach_summary = None
 
-        # ── SEPARATE tracking of the RAMP PHASE (not reach_* above) ──────
-        # THE PROBLEM THIS FIXES: "AVG RATE" and "avg ...C/min" in the bar
-        # were counted from the start UP TO entering +/-0.5C of the target -
-        # that is, TOGETHER with the approach tail, which can last longer
-        # than the ramp itself. With 30 C/min commanded it showed "avg
-        # 12.16 C/min", which looks as if the ramp ran 2.5x too slow, while
-        # in reality the ramp ran at ~26 C/min and only the APPROACH over
-        # the last 0.5C took the rest. These two things must be measured
-        # SEPARATELY, because they are fixed by completely different changes
-        # (ramp rate = FF, approach tail = loss compensation + integrator).
+        # ── SEPARATE tracking of the RAMP PHASE ─────────────────────────
+        # "AVG RATE" used to be counted from the start until entering ±0.5 °C
+        # of the target - that is, TOGETHER with the approach tail, which can
+        # last longer than the ramp itself. With 30 °C/min commanded it showed
+        # "avg 12.16 °C/min", which looks as if the ramp ran 2.5x too slow,
+        # while in reality the ramp ran at ~26 and only the approach over the
+        # last 0.5 °C took the rest. These two must be measured SEPARATELY,
+        # because they are fixed by completely different changes (ramp rate =
+        # feed-forward, approach tail = loss compensation + integrator).
         # Ramp phase = as long as the ramp GENERATOR (active setpoint spA) is
-        # still travelling to the target. Once spA arrives, the ramp is over -
-        # regardless of where the real temperature is.
-        self.ramp_t0 = None          # ramp start time
-        self.ramp_temp0 = None       # temp at the start of the ramp
-        self.ramp_done = False       # whether the ramp generator arrived
-        self.ramp_secs = None        # how long the ramp itself took [s]
-        self.ramp_rate = None        # REAL rate achieved during the ramp [C/min]
-        self.ramp_cmd_rate = None    # COMMANDED rate (from the panel) [C/min]
-        self.ramp_lag = None         # how far from the target when the ramp ended [C]
+        # still travelling. Once spA arrives the ramp is over, wherever the
+        # real temperature happens to be.
+        self.ramp_t0 = None
+        self.ramp_temp0 = None
+        self.ramp_done = False
+        self.ramp_secs = None
+        self.ramp_rate = None
+        self.ramp_cmd_rate = None
+        self.ramp_lag = None
 
-        # Polarity and calibration range (from the device)
+        # ── device state ────────────────────────────────────────────────
         self.dev_pol_swapped = False
         self.dev_pol_set = False
         self.dev_cal_min = 50.0
         self.dev_cal_max = 100.0
-
-        # Firmware version number read from the board (VER command) - to
-        # verify that the board really does have the new software
         self.dev_fw_build = None
+        self.dev_cal = False
+        self.fan_on = False
+        self.is_running = False
 
-        # Live chart control
-        self.chart_paused = False      # scrolling paused (for zooming)
+        # ── live chart control ──────────────────────────────────────────
+        self.chart_paused = False
         self.chart_window = 0          # 0 = whole run, >0 = last N seconds
+        self._live_args = None
 
-        # ── WHERE THE DATA ENDS UP ───────────────────────────────────────
-        # cfg_dir  - PERMANENT app folder (calibration, presets, settings).
-        #            It does not travel with the data, so changing where
-        #            measurements are saved never "loses" the calibration.
-        # log_dir  - folder FOR MEASUREMENT DATA, chosen by the user (ARCHIVE
-        #            tab -> CHANGE / NEW). Remembered between runs in
-        #            ustawienia.json.
-        self.cfg_dir = Path.home() / "PeltierLogi"
-        self.cfg_dir.mkdir(exist_ok=True)
-        self.settings_file = self.cfg_dir / "ustawienia.json"
+        # ── where the data ends up ──────────────────────────────────────
+        # cfg_dir - PERMANENT app folder (calibration, presets, settings). It
+        #           does not travel with the data, so changing where
+        #           measurements are saved never "loses" the calibration.
+        # log_dir - folder FOR MEASUREMENT DATA, chosen by the user on the
+        #           ARCHIVE screen. Remembered between runs.
         self.log_dir = self._load_data_dir()
-        # Text scale BEFORE the UI is built: the DPI value auto-detected in
-        # main() is only the fallback, and the layout's fixed pixel geometry
-        # (SC()) is measured against whatever FS holds at build time - so the
-        # remembered value has to be in place first.
-        self._dpi_scale = FS
-        _saved_scale = self._load_ui_scale()
-        if _saved_scale:
-            set_ui_scale(_saved_scale)
-        self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
-        # Name hint for the NEXT archive save (see cyc_stop) - when set, it
-        # skips the interactive "SAVE CYCLE TO ARCHIVE" dialog (which is
-        # modal - it would block the automatic measurement SERIES).
-        self.series_name_hint = None
-
-        # ── MEASUREMENT SERIES (automatic chain of SP/RATE tests) ────────
-        # Goal: instead of running the tests one after another by hand and
-        # pasting me screenshots, the app walks the list itself (SP, RATE,
-        # hold time), archives each test under a readable name (without
-        # asking for a name), and I read the resulting files from the
-        # PeltierLogi folder (I have access to it) and prepare fixes at once.
-        self.series_steps = []       # list of dict(sp=, rate=, hold_s=)
-        self.series_idx = 0
-        self.series_running = False
-        self.series_leg = None       # 'heat' | 'cool' | None
-        self.series_phase = None     # 'ramping' | 'holding' | None
-        self.series_phase_t0 = None
-        self.series_base_sp = 25.0   # which temp to return to between tests
-        self.series_skip_archive = False  # True during the return leg - see cyc_stop
-        self._series_saved_rd = None      # COOL RATE from CONTROL, restored after the series
-        self.cyc_t0 = None; self.cyc_fn = None
-
-        # Profiles (list of stages: dict temp/ramp/time)
-        self.profile_steps = []
-
-        # Device synchronization status
-        self.dev_cal = False       # whether the device has a calibration
-        self.last_cfg_time = 0
-
-        # Calibration state
-        self.cal_plan = []         # list of (temp, ramp) for all steps
-        self.cal_total = 0         # number of steps
-        self.cal_current = 0       # current step (1-based)
-        self.cal_cur_temp = None
-        self.cal_cur_ramp = None
-        self.cal_phase = None      # phase of the current step: 'heating'/'stabil'/'relay'
-        self.cal_running = False
-        self.cal_t0 = None         # calibration start time
-        self.cal_step_times = []   # start times of consecutive steps (for the ETA)
-        self.cal_win = None        # calibration progress window
-        self.cal_warnings = []     # list of (temp, cycles, amp) for points with relay_fail in this session
-        self.cal_ramp_warnings = []  # list of (temp, ramp, err) for ramp_track_fail in this session
-
-        # Diagnostics / error log - every Serial line that is neither a known
-        # protocol message nor CSV telemetry ends up here (instead of being
-        # silently discarded), and formal ERR: lines are decoded into text.
-        self.diag_log = []        # list of (ts, level, text); level: ERR/WARN/INFO
-        self.err_active = {}      # code -> description, active (uncleared) hardware errors
-        self.diag_unseen = 0      # counter of new ERR/WARN since the window was last opened
-        self.diag_win = None      # reference to the open diagnostics window (or None)
-
-        # Calibration saved on the PC disk - in the PERMANENT cfg_dir, not the
-        # data folder (see the comment at self.cfg_dir): changing where the
-        # measurements go must not cut the app off from the device calibration.
         self.cal_file = self.cfg_dir / "kalibracja.json"
         self.presets_file = self.cfg_dir / "presety.json"
-        self._caldump_buf = []     # buffer of received profiles
+
+        self.cyc_on = False
+        self.cyc_file = None
+        self.cyc_wr = None
+        self.cyc_t0 = None
+        self.cyc_fn = None
+        self.cyc_rows = 0
+        self.series_name_hint = None
+
+        # ── measurement series ──────────────────────────────────────────
+        self.series_steps = []
+        self.series_idx = 0
+        self.series_running = False
+        self.series_leg = None          # 'heat' | 'cool' | None
+        self.series_phase = None        # 'ramping' | 'holding' | 'ending'
+        self.series_phase_t0 = None
+        self.series_base_sp = 25.0
+        self.series_skip_archive = False
+        self._series_saved_rd = None
+        self.series_mode = Var('seria')
+        self.series_cool_as_test = Var(False)
+
+        self.profile_steps = []
+
+        # ── calibration state ───────────────────────────────────────────
+        self.cal_plan = []
+        self.cal_total = 0
+        self.cal_current = 0
+        self.cal_cur_temp = None
+        self.cal_cur_ramp = None
+        self.cal_phase = None
+        self.cal_running = False
+        self.cal_t0 = None
+        self.cal_step_times = []
+        self.cal_win = None
+        self.cal_warnings = []
+        self.cal_ramp_warnings = []
+        self._caldump_buf = []
         self._caldump_active = False
-        self._caldump_purpose = None  # 'save' or None
-        self._pending_offset = None   # offset to be saved with the dump
+        self._caldump_purpose = None
+        self._pending_offset = None
 
-        # Status pulsing
-        self._pulse_state = 0
+        # ── diagnostics ─────────────────────────────────────────────────
+        self.diag_log = []
+        self.err_active = {}
+        self.diag_unseen = 0
+        self.diag_win = None
 
-        self._build_styles()
+        # ── archive state ───────────────────────────────────────────────
+        self.arch_vars = {}
+        self.arch_xmode = Var('t0')
+        self.arch_delta = Var(False)
+        self.arch_show = {k: Var(v) for k, v in
+                          (('temp', True), ('sa', True), ('st', True),
+                           ('t2', False), ('pwm', False))}
+        self.arch_tref = Var(40.0)
+        self._ax_pwm = None
+        self._last_sa = []
+        self._last_temp2 = []
+        self._last_pc = []
+
+        self._icon_btns = []            # (button, icon_name, kind, size)
+        self.sig_call.connect(lambda fn: fn())
+
         self._build_ui()
-        self._pulse()
-        self.tick()
-        # Auto-connect: try to connect to the device after startup
-        self.root.after(800, self._auto_connect)
+        self.set_status(False, "")
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(250)
+        QTimer.singleShot(800, self._auto_connect)
+
+    # -- small helpers ---------------------------------------------------
+    def after(self, ms, fn):
+        """root.after, in Qt. Kept for the ported logic's call sites."""
+        QTimer.singleShot(int(ms), fn)
+
+    def call(self, fn):
+        """Run fn on the GUI thread - safe from the serial reader."""
+        self.sig_call.emit(fn)
+
+    @staticmethod
+    def _restyle(w):
+        """Re-evaluate a widget's property selectors.
+
+        Qt resolves QSS property selectors once, when the widget is polished.
+        Changing the property afterwards - Start becoming Stop, say - does not
+        repaint it on its own; the style has to be told to look again.
+        """
+        w.style().unpolish(w)
+        w.style().polish(w)
+        w.update()
+
+    def _icon_button(self, name, tip, cb, color='blue', size=22):
+        b = W.icon_button(self.th, name, tip, cb, color, size)
+        self._icon_btns.append([b, name, color, size])
+        return b
+
+    def _button(self, text, kind='plain', icon='', cb=None):
+        b = W.button(self.th, text, kind, icon, cb)
+        if icon:
+            self._icon_btns.append([b, icon, kind, 19])
+        return b
+
+    def _tint(self, kind):
+        """The glyph colour a button of this `kind` wants."""
+        fixed = {'filled': '#FFFFFF', 'go': '#FFFFFF', 'stop': '#FFFFFF',
+                 'warn': '#FFFFFF'}.get(kind)
+        if fixed:
+            return fixed
+        key = kind if kind in self.th.p else (
+            'red' if kind == 'destructive' else 'blue')
+        val = self.th[key]
+        # The label tints are rgba() strings - QColor cannot parse those, and
+        # an unparsed colour paints the glyph flat black. Flatten against the
+        # bar it sits on instead.
+        return self.th.solid(key, 'bg') if val.startswith('rgba') else val
+
+    def _reicon(self, b, name, kind=None):
+        """Swap a registered button's glyph AND its registry entry.
+
+        Without the second half, flipping the appearance repaints every
+        button with the glyph it was BORN with: Stop would go back to
+        showing a play triangle mid-run, and Resume a pause bar.
+        """
+        for e in self._icon_btns:
+            if e[0] is b:
+                e[1] = name
+                if kind is not None:
+                    e[2] = kind
+                b.setIcon(icons.icon(name, self.th.px(e[3]),
+                                     self._tint(e[2])))
+                return
+        b.setIcon(icons.icon(name, self.th.px(19),
+                             self._tint(kind or 'plain')))
+
+    # ════════════════════════════════════════════════════════════════════
+    #  UI
+    # ════════════════════════════════════════════════════════════════════
+    def _build_ui(self):
+        self.setWindowTitle(f"{APP_NAME} — photocurrent & pyrocurrent bench")
+        self.resize(self.th.px(1180), self.th.px(880))
+        self.setMinimumSize(self.th.px(900), self.th.px(640))
+        self.setWindowIcon(QIcon(brand.medallion_pixmap(
+            64, self.th['blue'], 'transparent')))
+
+        page = QWidget()
+        page.setObjectName('page')
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── header: wordmark, status chip, diagnostics, appearance ──────
+        self.header = W.HeaderBar(self.th)
+        self._apply_wordmark()
+        self.header.appearance.clicked.connect(self.toggle_appearance)
+        self.btn_diag = self._icon_button('info', "Diagnostics",
+                                          self.open_diag_window, 'label2', 20)
+        self.header.layout().insertWidget(
+            self.header.layout().count() - 2, self.btn_diag)
+        root.addWidget(self.header)
+
+        # ── the five screens ────────────────────────────────────────────
+        self.stack = QStackedWidget()
+        root.addWidget(self.stack, 1)
+        for build in (self._page_control, self._page_series, self._page_archive,
+                      self._page_tuning, self._page_device):
+            self.stack.addWidget(build())
+
+        # ── tab bar ─────────────────────────────────────────────────────
+        self.tabs = W.TabBar(self.th, [
+            ('gauge', 'Control'), ('list', 'Series'), ('archive', 'Archive'),
+            ('sliders', 'Tuning'), ('gear', 'Device')])
+        self.tabs.changed.connect(self.stack.setCurrentIndex)
+        root.addWidget(self.tabs)
+
+        self.setCentralWidget(page)
+        self._refresh_diag_indicator()
+
+    def _apply_wordmark(self):
+        """The name is DRAWN, not typed - the same letterforms as the emblem,
+        so the mark is one object rather than a picture next to some text in
+        whatever font the machine happens to have."""
+        h = self.th.px(30)
+        px = brand.wordmark_pixmap(h, self.th['label'])
+        self.header.title.setPixmap(px)
+        self.header.title.setFixedHeight(
+            int(px.height() / px.devicePixelRatio()))
+
+    def _scroll_page(self):
+        """A screen: a scroll area over a padded column. Returns (page, column)."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName('bg')
+        col = QVBoxLayout(body)
+        col.setContentsMargins(self.th.px(PAD), self.th.px(4),
+                               self.th.px(PAD), self.th.px(18))
+        col.setSpacing(self.th.px(18))
+        scroll.setWidget(body)
+        return scroll, col
+
+    def _card_header(self, text, right_text=""):
+        row = QHBoxLayout()
+        lb = QLabel(text)
+        lb.setStyleSheet("QLabel { font-size: %dpt; font-weight: 600; }"
+                         % self.th.pt('headline'))
+        row.addWidget(lb)
+        row.addStretch(1)
+        hint = QLabel(right_text)
+        hint.setStyleSheet(f"color: {self.th['label3']}; "
+                           f"font-size: {self.th.pt('caption')}pt;")
+        row.addWidget(hint)
+        return row, lb, hint
+
+    # ────────────────────────────────────────────────────────────────────
+    #  CONTROL
+    # ────────────────────────────────────────────────────────────────────
+    def _page_control(self):
+        page, col = self._scroll_page()
+
+        # ── readouts ────────────────────────────────────────────────────
+        stats = QHBoxLayout()
+        stats.setSpacing(self.th.px(10))
+        self.cards = {}
+        for key, title, unit, colour in (
+                ('temp', 'temperature', '°C', 'blue'),
+                ('temp2', 'thermocouple 2', '°C', 'cyan'),
+                ('sp', 'setpoint', '°C', 'orange'),
+                ('rate', 'avg rate', '°C/min', 'teal'),
+                ('pwm', 'power', '%', 'green')):
+            s = W.Stat(self.th, title, unit, colour)
+            self.cards[key] = s
+            stats.addWidget(s)
+        col.addLayout(stats)
+
+        # ── live chart ──────────────────────────────────────────────────
+        card = W.Card(self.th, pad=12)
+        head, _, self.reach_lbl = self._card_header("Live", "")
+        self.reach_lbl.setStyleSheet(
+            f"color: {self.th['label2']}; font-size: {self.th.pt('footnote')}pt;")
+        card.box.addLayout(head)
+
+        self.chart = ChartPanel(self.th, nrows=2, height_ratios=[3, 1],
+                                hspace=0.05,
+                                margins=(0.045, 0.035, 0.995, 0.985))
+        self.chart.redraw = self._nav_redraw
+        self.chart.setMinimumHeight(self.th.px(330))
+        self.ax1, self.ax2 = self.chart.axes
+        card.box.addWidget(self.chart, 1)
+
+        tools = QHBoxLayout()
+        tools.setSpacing(self.th.px(8))
+        self.btn_pause = self._button("Pause", 'tinted', 'pause',
+                                      self.toggle_pause)
+        # Fixed, not hugging the text: the label flips between "Pause" and the
+        # longer "Resume", and a button that changes width under the cursor
+        # makes the whole tool row jump.
+        self.btn_pause.setFixedWidth(self.th.px(150))
+        tools.addWidget(self.btn_pause)
+        self.seg_window = W.Segmented(self.th, ["All", "5 min", "2 min", "1 min"], 0)
+        self.seg_window.changed.connect(
+            lambda i: self.set_chart_window([0, 300, 120, 60][i]))
+        self.seg_window.setMaximumWidth(self.th.px(260))
+        tools.addWidget(self.seg_window, 1)
+        hint = QLabel("drag · scroll · right-click")
+        hint.setStyleSheet(f"color: {self.th['label3']}; "
+                           f"font-size: {self.th.pt('caption')}pt;")
+        tools.addWidget(hint)
+        tools.addWidget(self._icon_button('share', "Save chart as image",
+                                          self.save_live_chart, 'blue', 20))
+        card.box.addLayout(tools)
+        col.addWidget(card)
+
+        # ── run setup ───────────────────────────────────────────────────
+        g = W.Group(self.th, "Setpoint & ramps", footer="Applied on Start.")
+        self.sl_sp = W.SliderField(g, self.th, "Target", -15, 100, 25.0, "°C", 1,
+                                   on_change=lambda v: self.send(f"SP:{v:.1f}"))
+        self.sl_ru = W.SliderField(g, self.th, "Heat rate", 0.5, 80, 2.0,
+                                   "°C/min", 1,
+                                   on_change=lambda v: self.send(f"RU:{v:.1f}"))
+        self.sl_rd = W.SliderField(g, self.th, "Cool rate", 0.5, 80, 2.0,
+                                   "°C/min", 1,
+                                   on_change=lambda v: self.send(f"RD:{v:.1f}"))
+        self.sl_tmax = W.SliderField(g, self.th, "Max temperature", 50, 115, 80,
+                                     "°C", 0,
+                                     on_change=lambda v: self.send(f"TMAX:{v:.0f}"))
+        col.addWidget(g)
+
+        # ── fans ────────────────────────────────────────────────────────
+        g2 = W.Group(self.th, "Heatsink fans",
+                     footer="The firmware forces the fans on whenever the stage "
+                            "is cooling, and keeps them running for two minutes "
+                            "after a run ends. This switch is the manual "
+                            "override on top of that.")
+        self.sw_fan = W.Switch(self.th, False)
+        self.sw_fan.toggled.connect(self.on_fan_toggle)
+        g2.add_row("Fans", self.sw_fan, sub="forced on while cooling")
+        self.sl_fan = W.SliderField(g2, self.th, "Speed", 0, 100, 100, "%", 0,
+                                    on_change=self.set_fan_speed)
+        col.addWidget(g2)
+
+        # ── stored setups ───────────────────────────────────────────────
+        g3 = W.Group(self.th, "Stored setups")
+        g3.add_row("Profiles", self._button("Open", 'plain', 'chevron',
+                                            self.open_profiles),
+                   sub="Multi-step temperature programs")
+        g3.add_row("Presets", self._button("Open", 'plain', 'chevron',
+                                           self.open_presets),
+                   sub="Complete settings, saved by name")
+        self.cal_status_row = g3.add_row(
+            "Calibration", W.value_label(self.th, "reading from device…"),
+            sub="Tap while calibrating to watch progress")
+        self.cal_status_row.mousePressEvent = lambda e: self.open_cal_window()
+        self.cal_status_row.setCursor(Qt.CursorShape.PointingHandCursor)
+        col.addWidget(g3)
+        col.addStretch(1)
+
+        # ── the run controls ────────────────────────────────────────────
+        # PINNED, not scrolled. iOS keeps a primary action on a bar above the
+        # tab bar, and on an instrument that is not a style choice: Stop has to
+        # be one click away no matter how far down the page you have scrolled.
+        barw = QWidget()
+        barw.setObjectName('bg')
+        bar = QHBoxLayout(barw)
+        bar.setContentsMargins(self.th.px(PAD), self.th.px(8),
+                               self.th.px(PAD), self.th.px(10))
+        bar.setSpacing(self.th.px(10))
+        self.btn_run = self._button("Start", 'go', 'play', self.toggle_run)
+        self.btn_run.setMinimumHeight(self.th.px(48))
+        self.btn_freeze = self._button("Freeze", 'tinted', 'snowflake',
+                                       self.do_freeze)
+        self.btn_freeze.setMinimumHeight(self.th.px(48))
+        self.btn_estop = self._button("", 'stop', 'xmark', self.do_estop)
+        self.btn_estop.setMinimumHeight(self.th.px(48))
+        self.btn_estop.setFixedWidth(self.th.px(70))
+        self.btn_estop.setToolTip("Emergency stop - cuts the drive immediately")
+        bar.addWidget(self.btn_run, 3)
+        bar.addWidget(self.btn_freeze, 2)
+        bar.addWidget(self.btn_estop, 0)
+
+        wrap = QWidget()
+        wrap.setObjectName('bg')
+        wl = QVBoxLayout(wrap)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(0)
+        wl.addWidget(page, 1)
+        wl.addWidget(barw)
+
+        self._redraw_live([], [], [], [], [])
+        return wrap
+
+    # ────────────────────────────────────────────────────────────────────
+    #  SERIES
+    # ────────────────────────────────────────────────────────────────────
+    def _page_series(self):
+        page, col = self._scroll_page()
+
+        intro = QLabel("Add tests - setpoint, rate and dwell. The app runs them "
+                       "one after another, returns to base between them and "
+                       "archives every result itself.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color: {self.th['label2']}; "
+                            f"font-size: {self.th.pt('footnote')}pt;")
+        col.addWidget(intro)
+
+        g = W.Group(self.th, "New test")
+        self.ser_sp = W.SliderField(g, self.th, "Setpoint", -15, 110, 50.0,
+                                    "°C", 1)
+        self.ser_rate = W.SliderField(g, self.th, "Heat rate", 0.5, 80, 30.0,
+                                      "°C/min", 1)
+        self.ser_hold = W.SliderField(g, self.th, "Hold after reached", 0, 900,
+                                      60, "s", 0)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(self.th.px(12), self.th.px(8), self.th.px(12),
+                              self.th.px(12))
+        rl.setSpacing(self.th.px(8))
+        rl.addWidget(self._button("Add test", 'tinted', 'plus',
+                                  self._on_series_add), 2)
+        rl.addWidget(self._button("Ramps 10…70", 'plain', '',
+                                  self._on_series_quickfill), 2)
+        g.add_widget(row)
+        col.addWidget(g)
+
+        g2 = W.Group(self.th, "Between tests",
+                     footer="The return rate is independent of Cool rate on "
+                            "Control. It defaults to the maximum on purpose: a "
+                            "slower return is slower than the stage cools by "
+                            "itself, so the controller adds heat to brake it "
+                            "and every return starts with a visible hump.")
+        self.ser_base = W.SliderField(g2, self.th, "Base temperature", -15, 100,
+                                      self.series_base_sp, "°C", 1,
+                                      on_change=self._on_series_base_change)
+        self.ser_return = W.SliderField(g2, self.th, "Return rate", 1, 80, 80.0,
+                                        "°C/min", 1)
+        self.seg_mode = W.Segmented(self.th, ["Test series", "Program"], 0)
+        self.seg_mode.changed.connect(
+            lambda i: self.series_mode.set('seria' if i == 0 else 'program'))
+        g2.add_row("Mode", self.seg_mode,
+                   sub="Series returns to base after each test; a program runs "
+                       "the steps straight on from where the last one ended")
+        self.sw_cool_test = W.Switch(self.th, False)
+        self.sw_cool_test.toggled.connect(self.series_cool_as_test.set)
+        g2.add_row("Descent is a test too", self.sw_cool_test,
+                   sub="Collects cooling data at the test's own rate")
+        col.addWidget(g2)
+
+        g3 = W.Group(self.th, "Test list")
+        self.series_list = QListWidget()
+        self.series_list.setMinimumHeight(self.th.px(180))
+        g3.add_widget(self.series_list, sep=False)
+        row2 = QWidget()
+        r2 = QHBoxLayout(row2)
+        r2.setContentsMargins(self.th.px(12), self.th.px(6), self.th.px(12),
+                              self.th.px(10))
+        r2.setSpacing(self.th.px(8))
+        r2.addWidget(self._button("Remove", 'plain', 'minus',
+                                  self._on_series_remove))
+        r2.addWidget(self._button("Clear", 'destructive', 'trash',
+                                  self._on_series_clear))
+        r2.addStretch(1)
+        r2.addWidget(self._button("Save program", 'plain', 'export',
+                                  self._series_save_prog))
+        r2.addWidget(self._button("Load", 'plain', 'folder',
+                                  self._series_load_prog))
+        g3.add_widget(row2)
+        col.addWidget(g3)
+
+        g4 = W.Group(self.th, "Status")
+        self.series_status_row = g4.add_row("Series inactive")
+        col.addWidget(g4)
+
+        self.btn_series_run = self._button("Start series", 'go', 'play',
+                                           self._on_series_toggle)
+        self.btn_series_run.setMinimumHeight(self.th.px(48))
+        col.addWidget(self.btn_series_run)
+        col.addStretch(1)
+
+        self._series_refresh_list()
+        return page
+
+    # ────────────────────────────────────────────────────────────────────
+    #  ARCHIVE
+    # ────────────────────────────────────────────────────────────────────
+    def _page_archive(self):
+        page = QWidget()
+        page.setObjectName('bg')
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(self.th.px(PAD), self.th.px(4),
+                                 self.th.px(PAD), self.th.px(12))
+        outer.setSpacing(self.th.px(12))
+
+        # ── where the measurements live ─────────────────────────────────
+        gdir = W.Group(self.th)
+        right = QWidget()
+        rl = QHBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(self.th.px(2))
+        rl.addWidget(self._icon_button('folder', "Open in file manager",
+                                       self.open_log_folder, 'label2', 19))
+        rl.addWidget(self._button("Change", 'plain', '', self.choose_data_dir))
+        rl.addWidget(self._button("New", 'plain', 'plus', self.create_data_dir))
+        self.data_dir_row = gdir.add_row("Data folder", right,
+                                         sub=str(self.log_dir))
+        outer.addWidget(gdir)
+
+        body = QHBoxLayout()
+        body.setSpacing(self.th.px(12))
+
+        # ── the list of runs ────────────────────────────────────────────
+        left = QWidget()
+        left.setFixedWidth(self.th.px(320))
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(self.th.px(6))
+        hdr = QHBoxLayout()
+        cap = QLabel("SAVED RUNS")
+        cap.setObjectName('groupHeader')
+        hdr.addWidget(cap)
+        hdr.addStretch(1)
+        hdr.addWidget(self._button("All", 'plain', '', self._arch_select_all))
+        hdr.addWidget(self._button("None", 'plain', '', self._arch_clear_sel))
+        hdr.addWidget(self._icon_button('refresh', "Rescan the folder",
+                                        self.refresh_arch, 'blue', 18))
+        ll.addLayout(hdr)
+
+        card = W.Card(self.th, pad=6)
+        self.arch_list = QListWidget()
+        self.arch_list.itemChanged.connect(self._on_arch_item)
+        self.arch_list.setSelectionMode(
+            QListWidget.SelectionMode.SingleSelection)
+        card.box.addWidget(self.arch_list)
+        ll.addWidget(card, 1)
+        self.btn_arch_del = self._button("Delete selected", 'destructive',
+                                         'trash', self._delete_selected)
+        ll.addWidget(self.btn_arch_del)
+        body.addWidget(left)
+
+        # ── the chart and its controls ──────────────────────────────────
+        rightc = QVBoxLayout()
+        rightc.setSpacing(self.th.px(10))
+        ccard = W.Card(self.th, pad=12)
+        head, _, self.arch_title = self._card_header(
+            "Comparison", "drag · scroll · right-click")
+        ccard.box.addLayout(head)
+        self.chart_a = ChartPanel(self.th, nrows=1,
+                                  margins=(0.05, 0.05, 0.995, 0.985))
+        self.chart_a.redraw = self._redraw_arch
+        self.chart_a.setMinimumHeight(self.th.px(300))
+        self.ax_a = self.chart_a.ax
+        ccard.box.addWidget(self.chart_a, 1)
+
+        self.arch_settings_lbl = QLabel("")
+        self.arch_settings_lbl.setWordWrap(True)
+        self.arch_settings_lbl.setStyleSheet(
+            f"color: {self.th['label2']}; font-size: {self.th.pt('caption')}pt;")
+        ccard.box.addWidget(self.arch_settings_lbl)
+        rightc.addWidget(ccard, 1)
+
+        ctl = QHBoxLayout()
+        ctl.setSpacing(self.th.px(10))
+        self.seg_x = W.Segmented(self.th, ["From start", "File time", "PC clock",
+                                           "Ramp start", "At temp"], 0)
+        self.seg_x.changed.connect(self._on_xmode_change)
+        ctl.addWidget(self.seg_x, 1)
+        self.sl_tref = W.Slider(0, 110, 0.5)
+        self.sl_tref.setValueF(40.0, silent=True)
+        self.sl_tref.setFixedWidth(self.th.px(120))
+        self.sl_tref.valueChangedF.connect(self._on_tref)
+        self.sl_tref.setEnabled(False)
+        self.lbl_tref = W.value_label(self.th, "40.0 °C")
+        self.lbl_tref.setFixedWidth(self.th.px(92))
+        self.lbl_tref.setEnabled(False)
+        ctl.addWidget(self.sl_tref)
+        ctl.addWidget(self.lbl_tref)
+        rightc.addLayout(ctl)
+
+        ctl2 = QHBoxLayout()
+        ctl2.setSpacing(self.th.px(9))
+        cap2 = QLabel("CURVES")
+        cap2.setObjectName('groupHeader')
+        ctl2.addWidget(cap2)
+        self.arch_switches = {}
+        for key, label in (('temp', 'temp'), ('sa', 'setpoint'),
+                           ('st', 'target'), ('t2', 'probe 2'), ('pwm', 'power')):
+            sw = W.Switch(self.th, self.arch_show[key].get())
+            sw.toggled.connect(
+                lambda on, k=key: (self.arch_show[k].set(on), self._redraw_arch()))
+            self.arch_switches[key] = sw
+            lb = QLabel(label)
+            lb.setStyleSheet(f"font-size: {self.th.pt('footnote')}pt;")
+            ctl2.addWidget(lb)
+            ctl2.addWidget(sw)
+        ctl2.addStretch(1)
+        rightc.addLayout(ctl2)
+
+        exp = QHBoxLayout()
+        exp.setSpacing(self.th.px(8))
+        # Δ vs 1st rides with the export row, not with the curve switches: five
+        # switches and their labels already fill that row at the smallest
+        # window this app allows, and a sixth one clipped the captions.
+        lbd = QLabel("Δ vs 1st")
+        lbd.setStyleSheet(f"font-size: {self.th.pt('footnote')}pt; "
+                          f"color: {self.th['orange']};")
+        self.sw_delta = W.Switch(self.th, False)
+        self.sw_delta.toggled.connect(
+            lambda on: (self.arch_delta.set(on), self._redraw_arch()))
+        exp.addWidget(lbd)
+        exp.addWidget(self.sw_delta)
+        exp.addStretch(1)
+        exp.addWidget(self._button("Statistics", 'plain', 'info',
+                                   self.show_arch_stats))
+        exp.addWidget(self._button("CSV", 'plain', 'export', self.export_arch_csv))
+        exp.addWidget(self._button("Image", 'plain', 'share', self.save_arch_chart))
+        exp.addWidget(self._button("PDF report", 'tinted', 'doc',
+                                   self.export_arch_pdf))
+        rightc.addLayout(exp)
+        body.addLayout(rightc, 1)
+        outer.addLayout(body, 1)
+
+        self.refresh_arch()
+        self._redraw_arch()
+        return page
+
+    # ────────────────────────────────────────────────────────────────────
+    #  TUNING
+    # ────────────────────────────────────────────────────────────────────
+    def _page_tuning(self):
+        page, col = self._scroll_page()
+
+        intro = QLabel(
+            "Commissioning is done: the PID grid is calibrated and living in "
+            "the board's Flash, the feed-forward model is fixed in firmware, "
+            "and the Peltier is soldered in one orientation. What is left here "
+            "is what you still need day to day.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color: {self.th['label2']}; "
+                            f"font-size: {self.th.pt('footnote')}pt;")
+        col.addWidget(intro)
+
+        g = W.Group(self.th, "Calibration",
+                    footer="Self-tune re-measures the gains for the CURRENT "
+                           "setpoint and rate only, and writes them to Flash.")
+        self.cal_summary_row = g.add_row(
+            "State", W.value_label(self.th, "reading from device…"))
+        g.add_row("Grid", self._button("View table", 'plain', 'chevron',
+                                       self.show_cal_table),
+                  sub="Kp / Ki / Kd per temperature and ramp")
+        g.add_row("Self-tune here", self._button("Run", 'tinted', 'play',
+                                                 self.do_selftune))
+        g.add_row("Full auto-calibration",
+                  self._button("Set up", 'plain', 'chevron', self.do_autocal),
+                  sub="Relay sweep across the whole range - hours, not minutes")
+        col.addWidget(g)
+
+        g2 = W.Group(self.th, "Thermocouple",
+                     footer="A per-setup measurement value, not a commissioning "
+                            "knob - it stays adjustable.")
+        self.sl_off = W.SliderField(g2, self.th, "Calibration offset", -20, 20,
+                                    0.0, "°C", 1,
+                                    on_change=lambda v: self.send(f"OFFSET:{v:.1f}"))
+        col.addWidget(g2)
+
+        g3 = W.Group(self.th, "Peltier polarity",
+                     footer="Fixed in the board's Flash and no longer detectable "
+                            "at runtime - the wiring is soldered. Changing it "
+                            "needs POL_DEFAULT in the firmware.")
+        self.pol_row = g3.add_row("Polarity", W.value_label(self.th, "unknown"))
+        col.addWidget(g3)
+
+        g4 = W.Group(self.th, "Device flash",
+                     footer="Settings held in the board's own memory.")
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(self.th.px(12), self.th.px(8), self.th.px(12),
+                              self.th.px(12))
+        rl.setSpacing(self.th.px(8))
+        rl.addWidget(self._button("Save to board", 'tinted', 'export',
+                                  lambda: self.send("SAVE")), 1)
+        rl.addWidget(self._button("Load from board", 'plain', 'folder',
+                                  lambda: self.send("LOAD")), 1)
+        g4.add_widget(row, sep=False)
+        col.addWidget(g4)
+
+        g5 = W.Group(self.th, "Calibration backup on this PC",
+                     footer="Auto-loaded onto the board on every connection.")
+        row2 = QWidget()
+        rl2 = QHBoxLayout(row2)
+        rl2.setContentsMargins(self.th.px(12), self.th.px(8), self.th.px(12),
+                               self.th.px(12))
+        rl2.setSpacing(self.th.px(8))
+        rl2.addWidget(self._button("Back up", 'tinted', 'export',
+                                   lambda: self.dump_calibration_to_pc(False)), 1)
+        rl2.addWidget(self._button("Restore", 'plain', 'folder',
+                                   self._manual_load_cal), 1)
+        g5.add_widget(row2, sep=False)
+        col.addWidget(g5)
+
+        g6 = W.Group(self.th, "Reset",
+                     footer="Clears every profile and the calibration on the "
+                            "board. The PC backup above is not touched.")
+        g6.add_row("Restore factory settings",
+                   self._button("Reset", 'destructive', 'refresh', self.do_reset))
+        col.addWidget(g6)
+        col.addStretch(1)
+        return page
+
+    # ────────────────────────────────────────────────────────────────────
+    #  DEVICE
+    # ────────────────────────────────────────────────────────────────────
+    def _page_device(self):
+        page, col = self._scroll_page()
+
+        g = W.Group(self.th, "Serial connection")
+        self.conn_list = QListWidget()
+        self.conn_list.setMinimumHeight(self.th.px(130))
+        self.conn_list.itemDoubleClicked.connect(lambda _: self.conn_from_tab())
+        g.add_widget(self.conn_list, sep=False)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(self.th.px(12), self.th.px(8), self.th.px(12),
+                              self.th.px(12))
+        rl.setSpacing(self.th.px(8))
+        rl.addWidget(self._button("Refresh", 'plain', 'refresh',
+                                  self.refresh_ports))
+        rl.addStretch(1)
+        rl.addWidget(self._button("Disconnect", 'destructive', '',
+                                  self.disconnect))
+        rl.addWidget(self._button("Connect", 'filled', 'link',
+                                  self.conn_from_tab))
+        g.add_widget(row)
+        col.addWidget(g)
+
+        g2 = W.Group(self.th, "Versions")
+        self.fw_row = g2.add_row("Firmware", W.value_label(self.th, "—"))
+        g2.add_row("Application", W.value_label(self.th, APP_BUILD))
+        self.diag_row = g2.add_row(
+            "Diagnostics", self._button("Open", 'plain', 'chevron',
+                                        self.open_diag_window),
+            sub="Everything the board reports over the link")
+        col.addWidget(g2)
+
+        g3 = W.Group(self.th, "Appearance",
+                     footer="Text size changes immediately; spacing is measured "
+                            "again the next time the app starts.")
+        self.seg_appearance = W.Segmented(
+            self.th, ["Light", "Dark"], 1 if self.th.dark else 0)
+        self.seg_appearance.changed.connect(
+            lambda i: self.set_appearance('dark' if i else 'light'))
+        g3.add_row("Theme", self.seg_appearance)
+        scales = [0.85, 1.0, 1.15, 1.3, 1.5]
+        idx = min(range(len(scales)),
+                  key=lambda i: abs(scales[i] - self.th.scale))
+        self.seg_scale = W.Segmented(self.th, ["85%", "100%", "115%", "130%",
+                                               "150%"], idx)
+        self.seg_scale.changed.connect(lambda i: self.set_ui_scale(scales[i]))
+        g3.add_row("Text size", self.seg_scale)
+        col.addWidget(g3)
+
+        g4 = W.Group(self.th, "Getting started")
+        for i, line in enumerate((
+                "Connect the ItsyBitsy (firmware v19 PC MODE or newer) over USB",
+                "Pick the port above and connect - it also happens automatically",
+                "The controls sync themselves with the board",
+                "Set the target and the rates, then press Start on Control",
+                "The chart is live and every sample is written to CSV")):
+            g4.add_row(f"{i + 1}.", W.value_label(self.th, ""), sub=line)
+        col.addWidget(g4)
+        col.addStretch(1)
+
+        self.refresh_ports()
+        return page
+
+    # ════════════════════════════════════════════════════════════════════
+    #  APPEARANCE
+    # ════════════════════════════════════════════════════════════════════
+    def toggle_appearance(self):
+        self.set_appearance('light' if self.th.dark else 'dark')
+        if hasattr(self, 'seg_appearance'):
+            self.seg_appearance.setIndex(1 if self.th.dark else 0, emit=False)
+
+    def set_appearance(self, mode):
+        """Flip light/dark without rebuilding a single widget.
+
+        Everything that can be styled declaratively reads the stylesheet, and
+        every custom-painted widget reads the palette live at paint time - so
+        re-emitting the QSS and repainting is the whole operation. The charts
+        need one extra step, because matplotlib holds its colours in the
+        artists it has already created."""
+        self.th.mode = mode
+        self._save_setting('appearance', mode)
+        icons.clear_cache()
+        QApplication.instance().setStyleSheet(self.th.qss())
+        self._apply_wordmark()
+        self.header.appearance.setIcon(
+            icons.icon('sun' if self.th.dark else 'moon', self.th.px(22),
+                       self.th['blue']))
+        self._retint_icons()
+        for ch in (self.chart, self.chart_a):
+            ch.retheme(self.th)
+        self.setWindowIcon(QIcon(brand.medallion_pixmap(
+            64, self.th['blue'], 'transparent')))
+        for w in self.findChildren(QWidget):
+            w.update()
+
+    def set_ui_scale(self, scale):
+        self.th.scale = float(scale)
+        self._save_setting('ui_scale', round(float(scale), 3))
+        QApplication.instance().setStyleSheet(self.th.qss())
+        self._apply_wordmark()
+        for w in self.findChildren(QWidget):
+            w.updateGeometry()
+            w.update()
+
+    def _retint_icons(self):
+        for b, name, kind, size in self._icon_btns:
+            b.setIcon(icons.icon(name, self.th.px(size), self._tint(kind)))
+        self._refresh_diag_indicator()
+
+    # ════════════════════════════════════════════════════════════════════
+    #  SETTINGS FILE
+    # ════════════════════════════════════════════════════════════════════
+    def _load_setting(self, key, default=None):
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    return json.load(f).get(key, default)
+        except Exception:
+            pass
+        return default
+
+    def _save_setting(self, key, value):
+        d = {}
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+        except Exception:
+            d = {}
+        d[key] = value
+        try:
+            self.cfg_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(d, f, indent=2)
+        except Exception as e:
+            print(f"settings not saved: {e}")
+
+    def _load_data_dir(self):
+        """The remembered data folder; if it is missing or unavailable, the
+        default. We do NOT force-create a remembered path - if the user
+        unplugged the drive, falling back quietly beats refusing to start."""
+        p = self._load_setting('data_dir')
+        if p:
+            q = Path(p)
+            if q.is_dir():
+                return q
+            try:
+                q.mkdir(parents=True, exist_ok=True)
+                return q
+            except Exception:
+                print(f"Data folder '{q}' unavailable - using {self.cfg_dir}")
+        self.cfg_dir.mkdir(exist_ok=True)
+        return self.cfg_dir
+
+    # ════════════════════════════════════════════════════════════════════
+    #  SERIAL
+    # ════════════════════════════════════════════════════════════════════
+    def send(self, cmd):
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.write((cmd + '\n').encode())
+            except Exception as e:
+                print(f"send err: {e}")
+
     def _auto_connect(self):
-        """Automatic connection - detect and connect to the ItsyBitsy"""
+        """Find the ItsyBitsy and connect to it without being asked."""
         if self.connected:
             return
         try:
@@ -1276,317 +1019,246 @@ class PeltierControl:
             return
         if not ports:
             return
-        # Priority: ports whose description matches ItsyBitsy/Adafruit/USB
+
         def score(p):
             d = (p.description or '').lower()
             m = (p.manufacturer or '').lower() if hasattr(p, 'manufacturer') else ''
             s = 0
-            for kw in ['itsybitsy', 'adafruit', 'usb serial', 'usb-serial', 'circuitpython']:
-                if kw in d or kw in m: s += 10
-            # ItsyBitsy M0 VID = 0x239A (Adafruit)
-            if hasattr(p, 'vid') and p.vid == 0x239A: s += 20
+            for kw in ('itsybitsy', 'adafruit', 'usb serial', 'usb-serial',
+                       'circuitpython'):
+                if kw in d or kw in m:
+                    s += 10
+            if getattr(p, 'vid', None) == 0x239A:      # Adafruit
+                s += 20
             return s
+
         best = max(ports, key=score)
-        # Connect only if something sensible (any port if there is only one)
         if score(best) > 0 or len(ports) == 1:
             self.connect(best.device)
-
-    def _build_styles(self):
-        st = ttk.Style()
-        try: st.theme_use('clam')
-        except: pass
-        st.configure('TNotebook', background=C['bg2'], borderwidth=0, tabmargins=[0,0,0,0])
-        st.configure('TNotebook.Tab', background=C['bg2'], foreground=C['dim2'],
-                     padding=[SC(18), SC(10)], font=F(10, 1),
-                     borderwidth=0)
-        # The selected tab is marked by BOTH a lighter ground and gold text -
-        # on the darker .15 background a background change alone was too
-        # subtle to spot at a glance.
-        st.map('TNotebook.Tab',
-               background=[('selected', C['bg']), ('active', C['panel3'])],
-               foreground=[('selected', C['gold']), ('active', C['text'])])
-        st.configure('Vertical.TScrollbar', background=C['panel3'],
-                     troughcolor=C['bg2'], bordercolor=C['bg2'],
-                     arrowcolor=C['dim2'], borderwidth=0)
-
-    # ────────────────────────────────────────────────────
-    #  SERIAL COMMUNICATION
-    # ────────────────────────────────────────────────────
-    def send(self, cmd):
-        """Send a command to the device"""
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write((cmd + '\n').encode())
-            except Exception as e:
-                print(f"send err: {e}")
 
     def connect(self, port):
         try:
             self.ser = serial.Serial(port, self.baud, timeout=0.5)
             self.port_name = port
             self.clear_buf()
-            self._cfg_synced = False  # allow a one-time slider synchronisation
-            self.set_status(True, f"{port} - 115200")
+            self._cfg_synced = False      # allow one slider synchronisation
+            self.set_status(True, f"{port}")
             self.running = True
             threading.Thread(target=self.reader, daemon=True).start()
-            # Fetch the startup configuration + firmware version number (VER responds
-            # to the command immediately, so it also works when the board has been
-            # powered on for a long time - unlike BUILD:, which is sent only once in
-            # setup() and which the app could miss if it connected AFTER startup).
-            self.root.after(1500, lambda: self.send("GET"))
-            self.root.after(1600, lambda: self.send("VER"))
-            # Auto-load the calibration saved on the PC (if one exists)
-            self.root.after(2200, self._auto_load_calibration)
+            # VER answers immediately, so it works even when the board has been
+            # powered for a long time - unlike BUILD:, which is sent once in
+            # setup() and which the app misses if it connects afterwards.
+            self.after(1500, lambda: self.send("GET"))
+            self.after(1600, lambda: self.send("VER"))
+            self.after(2200, self._auto_load_calibration)
         except Exception as e:
-            messagebox.showerror("Error", f"{port}:\n{e}")
+            core.error(self, "Cannot open the port", f"{port}\n\n{e}")
             self.set_status(False, "")
-
-    def _auto_load_calibration(self):
-        """On connection - automatically upload the saved calibration"""
-        if not self.connected:
-            return
-        if self.cal_file.exists():
-            ok = self.load_calibration_from_pc()
-            if ok:
-                print("Auto-loaded calibration from PC on connection")
 
     def disconnect(self):
         self.running = False
-        if self.cyc_on: self.cyc_stop("Disconnected")
+        if self.cyc_on:
+            self.cyc_stop("disconnected")
         if self.ser:
-            try: self.ser.close()
-            except: pass
+            try:
+                self.ser.close()
+            except Exception:
+                pass
             self.ser = None
         self.set_status(False, "")
         self.dev_fw_build = None
-        if hasattr(self, 'fw_build_lbl'):
-            self.fw_build_lbl.config(text="FW: —", fg=C['dim2'])
+        if hasattr(self, 'fw_row'):
+            self.fw_row.right.setText("—")
 
     def clear_buf(self):
-        for a in [self.t, self.temp, self.spt, self.spa,
-                  self.pwm, self.kp, self.ki, self.kd, self.states]:
+        for a in (self.t, self.temp, self.spt, self.spa, self.pwm,
+                  self.kp, self.ki, self.kd, self.states):
             a.clear()
         self.t0 = None
 
     def reader(self):
-        """Serial reader thread - parses CSV and CFG"""
+        """Serial reader thread - parses telemetry and every protocol line."""
         if self.ser and self.ser.is_open:
             self.ser.reset_input_buffer()
         while self.running:
             try:
-                if not self.ser or not self.ser.is_open: break
+                if not self.ser or not self.ser.is_open:
+                    break
                 raw = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                if not raw: continue
+                if not raw:
+                    continue
 
-                # Configuration line CFG:SP=...,RU=...
                 if raw.startswith("CFG:"):
                     self._parse_cfg(raw[4:])
                     continue
-
-                # Calibration plan CALPLAN:24,temps=50/60/70,ramps=2/5/10/20
                 if raw.startswith("CALPLAN:"):
                     self._parse_calplan(raw[8:])
                     continue
-
-                # Calibration dump - start
                 if raw.startswith("CALDUMP:"):
                     self._caldump_buf = []
                     self._caldump_active = True
                     continue
-                # A single profile PROF:idx,KpH,...
                 if raw.startswith("PROF:") and self._caldump_active:
                     self._caldump_buf.append(raw[5:])
                     continue
-                # End of the dump
                 if raw == "CALDUMPEND":
                     self._caldump_active = False
-                    self.root.after(0, self._finish_caldump_save)
+                    self.call(self._finish_caldump_save)
                     continue
-
-                # Calibration status CALSTAT:5/24,T=40,R=2
                 if raw.startswith("CALSTAT:"):
                     self._parse_calstat(raw[8:])
                     continue
-
-                # Warning: the relay test did not catch oscillation, base values
-                # were used CALWARN:T=90,cycles=1,relay_fail
                 if raw.startswith("CALWARN:"):
                     self._parse_calwarn(raw[8:])
                     continue
-
-                # Hardware/safety error code ERR:code=1,bits=0x01,active=1
                 if raw.startswith("ERR:"):
                     self._parse_err(raw[4:])
                     continue
-
-                # Firmware version number - sent once in setup() AND on every
-                # "VER" request (see connect()). Shown in the title bar
-                # (FW: ...) so it is immediately visible whether the board really
-                # has the new software flashed, not just whether the app is new.
                 if raw.startswith("BUILD:"):
-                    self.root.after(0, lambda b=raw[6:].strip(): self._set_fw_build(b))
+                    b = raw[6:].strip()
+                    self.call(lambda b=b: self._set_fw_build(b))
                     continue
 
-                # CSV data line (9 fields + optional temp2 as the 10th)
+                # CSV telemetry: 9 fields, plus optional extras
                 p = raw.split(',')
                 is_csv = len(p) >= 9
                 if is_csv:
-                    try: float(p[0])
-                    except ValueError: is_csv = False
+                    try:
+                        float(p[0])
+                    except ValueError:
+                        is_csv = False
                 if not is_csv:
-                    # Not CSV and not any of the known prefixes above - instead
-                    # of silently discarding it (as before), show it in the
-                    # diagnostics panel. That way the app shows EVERYTHING the
-                    # firmware sends over Serial (e.g. "Flash: zapisano.",
-                    # "AUTOCAL START", "RELAY FAIL - bazowe"), not only in
-                    # Arduino's own Serial Monitor (which cannot run in
-                    # parallel with the app on the same port anyway).
-                    if raw:
-                        low = raw.upper()
-                        lvl = 'WARN' if any(k in low for k in
-                              ('FAIL', 'ERROR', '!!!', 'BLAD', 'BŁĄD')) else 'INFO'
-                        self._log_diag(lvl, raw)
+                    # Not telemetry and not a known prefix. Instead of dropping
+                    # it silently, it goes to Diagnostics - so the app shows
+                    # EVERYTHING the firmware says, which a Serial Monitor
+                    # cannot do while the app holds the port.
+                    low = raw.upper()
+                    lvl = 'WARN' if any(k in low for k in
+                                        ('FAIL', 'ERROR', '!!!', 'BLAD', 'BŁĄD')) \
+                        else 'INFO'
+                    self._log_diag(lvl, raw)
                     continue
                 try:
                     d = dict(temp=float(p[1]), sa=float(p[2]), st=float(p[3]),
                              pwm=int(p[4]), kp=float(p[5]), ki=float(p[6]),
                              kd=float(p[7]), state=p[8].strip())
-                except: continue
-                # temp2 - the second thermocouple (10th field, if present)
+                except Exception:
+                    continue
+
                 d['temp2'] = None
                 if len(p) >= 10:
                     try:
                         v2 = float(p[9])
-                        d['temp2'] = v2 if v2 != 0 else None  # 0 = none/error
-                    except: pass
-                self._latest_temp2 = d['temp2']  # for display on the card
+                        d['temp2'] = v2 if v2 != 0 else None   # 0 = none/error
+                    except Exception:
+                        pass
+                self._latest_temp2 = d['temp2']
 
-                # Breakdown of the PID components (10th-15th extra fields, only in
-                # AUTO - see the comment next to "dbgFF" in the firmware) - FF, P, I,
-                # D, the raw PID result before clamping/slew, and the applied
-                # reactScale. It goes into the run archive (cyc_log) so that further
-                # diagnosis of oscillation/lag can rely on numbers from the file
-                # instead of guessing from the temp/PWM chart alone.
+                # The PID breakdown (fields 11-17, AUTO only): FF, P, I, D, the
+                # raw result before clamping and slew, the applied reactScale,
+                # and the estimated far-side temperature. It goes into the run
+                # archive so that diagnosing oscillation or lag can rely on
+                # numbers rather than on guessing from the temp/PWM trace.
                 d['dbg'] = None
                 if len(p) >= 16:
                     try:
-                        d['dbg'] = dict(ff=float(p[10]), p=float(p[11]),
-                                         i=float(p[12]), dd=float(p[13]),
-                                         raw=float(p[14]), react=float(p[15]),
-                                         # 17th column (since FW .29): estimated
-                                         # temperature of the other side of the Peltier.
-                                         # Older firmware does not send it -
-                                         # then it stays None and the CSV has a blank.
-                                         amb=(float(p[16]) if len(p) >= 17 else None))
-                    except: pass
+                        d['dbg'] = dict(
+                            ff=float(p[10]), p=float(p[11]), i=float(p[12]),
+                            dd=float(p[13]), raw=float(p[14]), react=float(p[15]),
+                            amb=(float(p[16]) if len(p) >= 17 else None))
+                    except Exception:
+                        pass
 
-                # Time from the FIRMWARE (p[0] = czas_s) - accurate, independent of
-                # application delays/queue buffering. The computer clock (time.time)
-                # drifted during buffering and understated AVG RATE.
+                # Time comes from the FIRMWARE, not from the PC clock: the
+                # computer's clock drifted while the queue buffered and
+                # understated the achieved rate.
                 try:
                     fw_time = float(p[0])
-                except:
+                except Exception:
                     fw_time = 0
                 if self.t0 is None:
-                    self.t0 = fw_time  # first firmware timestamp = zero point
+                    self.t0 = fw_time
                 now = fw_time - self.t0
                 state = d['state']
 
-                if self.cyc_on and state in ('AUTO', 'COOLDOWN', 'FREEZE', 'FREEZE_READY'):
+                if self.cyc_on and state in ('AUTO', 'COOLDOWN', 'FREEZE',
+                                             'FREEZE_READY'):
                     self.cyc_log(time.time() - self.cyc_t0 if self.cyc_t0 else 0,
-                                d['temp'], d['sa'], d['st'],
-                                d['pwm'], d['kp'], d['ki'], d['kd'], state,
-                                d.get('temp2'), d.get('dbg'))
+                                 d['temp'], d['sa'], d['st'], d['pwm'],
+                                 d['kp'], d['ki'], d['kd'], state,
+                                 d.get('temp2'), d.get('dbg'))
 
                 prev = self.last_state
                 self.last_state = state
                 self.cur_state = state
-                # SELF-TUNE: when the state is ST-..., self-tune changes the PID live.
-                # Copy the new Kp/Ki/Kd onto the sliders so the table stays updated.
                 if state.startswith('ST') or state.startswith('CAL'):
                     self._st_pid_update = (d['kp'], d['ki'], d['kd'])
-                # Detect the end of calibration (CAL/CAL-N -> MAN)
                 if self.cal_running and 'CAL' in prev and state == 'MAN':
                     self.cal_running = False
-                    self.cal_current = self.cal_total  # complete the bar
-                    self.root.after(0, self._cal_finished)
+                    self.cal_current = self.cal_total
+                    self.call(self._cal_finished)
                 self.data_queue.put((now, d['temp'], d['st'], d['sa'],
-                                    d['pwm']*100/255, d['kp'], d['ki'],
-                                    d['kd'], state, prev))
+                                     d['pwm'] * 100 / 255, d['kp'], d['ki'],
+                                     d['kd'], state, prev))
 
             except serial.SerialException:
                 self.running = False
-                self.root.after(0, lambda: self.set_status(False, "Connection lost"))
+                self.call(lambda: self.set_status(False, "connection lost"))
                 break
             except Exception as e:
-                if self.running: print(f"reader err: {e}")
+                if self.running:
+                    print(f"reader err: {e}")
                 time.sleep(0.3)
 
+    # ── protocol parsing ────────────────────────────────────────────────
     def _parse_cfg(self, cfg):
-        """Parses CFG:SP=25.5,RU=2.0,... and synchronises the sliders"""
         d = {}
         for part in cfg.split(','):
             if '=' in part:
                 k, v = part.split('=', 1)
                 d[k.strip()] = v.strip()
-        # Synchronise the sliders (silent - without sending back)
-        self.root.after(0, lambda: self._apply_cfg(d))
+        self.call(lambda: self._apply_cfg(d))
 
     def _apply_cfg(self, d):
         try:
-            # Synchronise the sliders ONLY on the first CFG after connecting.
-            # Afterwards the user's settings must stay (do not overwrite after STOP etc.)
+            # Sync the controls ONLY on the first CFG after connecting.
+            # Afterwards the user's own settings must stand - a CFG arriving
+            # after a STOP would otherwise quietly undo them.
             if not getattr(self, '_cfg_synced', False):
-                if 'SP' in d and hasattr(self, 'sl_sp'):    self.sl_sp.set(float(d['SP']))
-                if 'RU' in d and hasattr(self, 'sl_ru'):    self.sl_ru.set(float(d['RU']))
-                if 'RD' in d and hasattr(self, 'sl_rd'):    self.sl_rd.set(float(d['RD']))
-                if 'TMAX' in d and hasattr(self, 'sl_tmax'): self.sl_tmax.set(float(d['TMAX']))
-                if 'KP' in d and hasattr(self, 'sl_kp'):    self.sl_kp.set(float(d['KP']))
-                if 'KI' in d and hasattr(self, 'sl_ki'):    self.sl_ki.set(float(d['KI']))
-                if 'KD' in d and hasattr(self, 'sl_kd'):    self.sl_kd.set(float(d['KD']))
-                if 'OFFSET' in d and hasattr(self, 'sl_off'): self.sl_off.set(float(d['OFFSET']))
-                if 'KFFH' in d and hasattr(self, 'sl_kffh'): self.sl_kffh.set(float(d['KFFH']))
-                if 'KFFR' in d and hasattr(self, 'sl_kffr'): self.sl_kffr.set(float(d['KFFR']))
+                for key, attr in (('SP', 'sl_sp'), ('RU', 'sl_ru'),
+                                  ('RD', 'sl_rd'), ('TMAX', 'sl_tmax'),
+                                  ('OFFSET', 'sl_off')):
+                    if key in d and hasattr(self, attr):
+                        getattr(self, attr).set(float(d[key]))
                 self._cfg_synced = True
             if 'CAL' in d:
                 self.dev_cal = (d['CAL'] == '1')
                 self._update_cal_summary()
             if 'STATE' in d:
                 self.cur_state = d['STATE']
-            # Polarity
             if 'POL' in d:
                 self.dev_pol_swapped = (d['POL'] == '1')
             if 'POLSET' in d:
                 self.dev_pol_set = (d['POLSET'] == '1')
-            # Calibration range
             if 'CALMIN' in d:
                 self.dev_cal_min = float(d['CALMIN'])
             if 'CALMAX' in d:
                 self.dev_cal_max = float(d['CALMAX'])
-            # Fan state
             if 'FAN' in d:
                 fan_val = int(float(d['FAN']))
-                self.fan_on = (fan_val > 0)
-                if hasattr(self, 'sl_fan') and fan_val > 0:
-                    self.sl_fan.set(fan_val, silent=True)
-                if hasattr(self, 'btn_fan'):
-                    if fan_val > 0:
-                        self.btn_fan.config(text="● ON", fg=C['green'],
-                                           highlightbackground=C['green'])
-                    else:
-                        self.btn_fan.config(text="○ OFF", fg=C['dim2'],
-                                           highlightbackground=C['dim'])
-            # Update the polarity indicator in the UI if it exists
-            if hasattr(self, '_update_pol_indicator'):
-                self._update_pol_indicator()
+                self.fan_on = fan_val > 0
+                if fan_val > 0 and hasattr(self, 'sl_fan'):
+                    self.sl_fan.set(fan_val)
+                if hasattr(self, 'sw_fan'):
+                    self.sw_fan.setCheckedSilently(self.fan_on)
+            self._update_pol_indicator()
         except Exception as e:
             print(f"apply_cfg err: {e}")
 
     def _parse_calplan(self, txt):
-        """CALPLAN:9,temps=20/30/.../90,ramps=relay - build the step list.
-        Relay: one test per temperature (ramps=relay), not a temp x ramp grid."""
+        """CALPLAN:9,temps=20/30/…,ramps=relay - build the step list. In relay
+        mode there is one test per temperature, not a temp x ramp grid."""
         try:
-            d = {}
             parts = txt.split(',')
             total = int(parts[0])
             temps, ramps, relay_mode = [], [], False
@@ -1599,16 +1271,8 @@ class PeltierControl:
                         relay_mode = True
                     else:
                         ramps = [float(x) for x in rv.split('/') if x]
-            # Build the plan
-            plan = []
-            if relay_mode:
-                # Relay: one step per temperature
-                for t in temps:
-                    plan.append((t, 'relay'))
-            else:
-                for t in temps:
-                    for r in ramps:
-                        plan.append((t, r))
+            plan = ([(t, 'relay') for t in temps] if relay_mode
+                    else [(t, r) for t in temps for r in ramps])
             self.cal_plan = plan
             self.cal_total = total or len(plan)
             self.cal_current = 0
@@ -1618,16 +1282,14 @@ class PeltierControl:
             self.cal_step_times = []
             self.cal_warnings = []
             self.cal_ramp_warnings = []
-            self.root.after(0, self._refresh_cal_view)
+            self.call(self._refresh_cal_view)
         except Exception as e:
             print(f"calplan err: {e}")
 
     def _parse_calstat(self, txt):
-        """CALSTAT:5/24,T=40,R=2 - update the progress"""
+        """CALSTAT:5/24,T=40,R=2 - progress."""
         try:
-            d = {}
             parts = txt.split(',')
-            # parts[0] = "5/24"
             cur, tot = parts[0].split('/')
             new_current = int(cur)
             self.cal_total = int(tot)
@@ -1636,51 +1298,46 @@ class PeltierControl:
                     self.cal_cur_temp = float(part[2:])
                 elif part.startswith('R='):
                     rv = part[2:].strip()
-                    # Relay: R= is the step PHASE (heating/stabil/relay), not the ramp.
+                    # In relay mode R= carries the step PHASE, not a ramp.
                     if rv in ('heating', 'stabil', 'relay'):
                         self.cal_phase = rv
                         self.cal_cur_ramp = 'relay'
                     elif rv.startswith('rampprep:') or rv.startswith('ramptest:'):
-                        # Per-ramp ramping test AFTER relay (tunes the heating
-                        # Kp/Ki/Kd separately for every ramp from calRamps) -
-                        # R=rampprep:20 (backing off) / R=ramptest:20 (running at
-                        # that ramp, tracking ASP).
                         key, _, rate = rv.partition(':')
                         self.cal_phase = key
-                        try: self.cal_cur_ramp = float(rate)
-                        except Exception: self.cal_cur_ramp = rate
+                        try:
+                            self.cal_cur_ramp = float(rate)
+                        except Exception:
+                            self.cal_cur_ramp = rate
                     else:
                         self.cal_phase = None
-                        try: self.cal_cur_ramp = float(rv)
-                        except: self.cal_cur_ramp = rv
-            # If the step has changed - record the time (for the ETA)
+                        try:
+                            self.cal_cur_ramp = float(rv)
+                        except Exception:
+                            self.cal_cur_ramp = rv
             if new_current != self.cal_current:
                 if self.cal_t0:
                     self.cal_step_times.append(time.time())
                 self.cal_current = new_current
             self.cal_running = True
-            self.root.after(0, self._refresh_cal_view)
+            self.call(self._refresh_cal_view)
         except Exception as e:
             print(f"calstat err: {e}")
 
     def _parse_calwarn(self, txt):
-        """Two different warnings share the same CALWARN message:
+        """Two different warnings share the CALWARN message.
 
-        1) CALWARN:T=90,cycles=1,amp=140,relay_fail - the relay test for this
-        temperature did not catch oscillation (too few/too fast crossings of the
-        setpoint) and the firmware wrote base values instead of really
-        measured ones. 'amp' is the PWM amplitude at which the test gave up -
-        if that is already the max (140), even the strongest gentle excitation did
-        not push the system across the setpoint in both directions (a physical
-        limit of the range, not just a matter of time/noise).
+        1) T=90,cycles=1,amp=140,relay_fail - the relay test for that
+        temperature did not catch oscillation and the firmware wrote BASE
+        values instead of measured ones. amp is the excitation it gave up at;
+        at the maximum (140) even the strongest gentle push failed to cross the
+        setpoint both ways, which is a physical limit, not a matter of time.
 
-        2) CALWARN:T=50,R=20,err=2.34,ramp_track_fail - the RAMPING test for a
-        specific ramp (AFTER a successful relay) did not get below the ASP
-        tracking error threshold during the test - this ONE cell (temp,ramp) keeps
-        the base profile from relay (which is still a real measurement, NOT the
-        values 10.0/0.30/0.80 - unlike (1)!). This is NOT the
-        same as relay_fail and should not mark the whole temperature as
-        "base/fail" in the table - hence a separate list (cal_ramp_warnings)."""
+        2) T=50,R=20,err=2.34,ramp_track_fail - the RAMPING test for one rate
+        (after a successful relay) never got below the tracking threshold. That
+        single cell keeps the relay profile, which is still a real measurement,
+        so it must NOT mark the whole temperature as failed - hence a separate
+        list."""
         try:
             d = {}
             for part in txt.split(','):
@@ -1688,35 +1345,36 @@ class PeltierControl:
                     k, v = part.split('=', 1)
                     d[k.strip()] = v.strip()
             temp = float(d.get('T', 'nan'))
-            if temp != temp:  # reject NaN
+            if temp != temp:                      # NaN
                 return
             if 'R' in d and 'err' in d:
-                # (2) ramp_track_fail
-                try: ramp = float(d['R'])
-                except Exception: ramp = None
-                try: err = float(d['err'])
-                except Exception: err = None
+                try:
+                    ramp = float(d['R'])
+                except Exception:
+                    ramp = None
+                try:
+                    err = float(d['err'])
+                except Exception:
+                    err = None
                 self.cal_ramp_warnings.append((temp, ramp, err))
-                self._log_diag('WARN', f"Calibration: ramp test {ramp}°C/min "
-                               f"@ {temp}°C did not keep up with ASP (err={err}°C)")
+                self._log_diag('WARN', f"Calibration: ramp test {ramp} °C/min "
+                                       f"@ {temp} °C did not keep up with the "
+                                       f"active setpoint (err={err} °C)")
             else:
-                # (1) relay_fail
                 cycles = int(d.get('cycles', '0'))
                 amp = int(d['amp']) if 'amp' in d else None
                 self.cal_warnings.append((temp, cycles, amp))
-                self._log_diag('WARN', f"Calibration: relay test @ {temp}°C did not catch "
-                               f"oscillation (cycles={cycles}, amp={amp}) - base values used")
-            self.root.after(0, self._refresh_cal_view)
+                self._log_diag('WARN', f"Calibration: relay test @ {temp} °C "
+                                       f"caught no oscillation (cycles={cycles}, "
+                                       f"amp={amp}) - base values used")
+            self.call(self._refresh_cal_view)
         except Exception as e:
             print(f"calwarn err: {e}")
 
     def _parse_err(self, txt):
-        """ERR:code=N,...,active=0/1 - hardware/safety error code from the
-        firmware. The firmware sends this ONLY on an edge (once when it appears, once
-        when it clears), so here we only decode it and write it to the log - zero
-        risk of flooding Serial. code=1/2 update err_active (shown
-        as an active alarm until active=0 arrives), code=3/4 are
-        one-off events but are also kept in err_active for later reference."""
+        """ERR:code=N,…,active=0/1 - a hardware or safety code. The firmware
+        sends it only on an edge, once when it appears and once when it clears,
+        so there is no risk of flooding the link."""
         try:
             d = {}
             for part in txt.split(','):
@@ -1728,12 +1386,15 @@ class PeltierControl:
             base = ERR_CODES.get(code, f"Unknown error code ({code})")
             detail = ""
             if code == 1 and 'bits' in d:
-                try: detail = " - " + decode_tc_fault(int(d['bits'], 16))
-                except Exception: pass
+                try:
+                    detail = " - " + decode_tc_fault(int(d['bits'], 16))
+                except Exception:
+                    pass
             elif code == 2 and 'val' in d:
-                detail = f" - reading={d['val']}°C"
+                detail = f" - reading {d['val']} °C"
             elif code == 3:
-                detail = f" - temp={d.get('temp', '?')}°C, limit={d.get('limit', '?')}°C"
+                detail = (f" - temp {d.get('temp', '?')} °C, "
+                          f"limit {d.get('limit', '?')} °C")
             text = base + detail
             if active:
                 self.err_active[code] = text
@@ -1744,246 +1405,162 @@ class PeltierControl:
         except Exception as e:
             print(f"err parse err: {e}")
 
+    # ── diagnostics plumbing ────────────────────────────────────────────
     def _log_diag(self, level, text):
-        """Append an entry to the diagnostics panel (level: ERR/WARN/INFO) and
-        refresh the indicator in the title bar. Called both from the Serial thread
-        (directly) and from the GUI - list.append() is safe in
-        CPython (GIL), and the UI refresh always goes through root.after."""
         entry = (time.time(), level, text)
         self.diag_log.append(entry)
         if len(self.diag_log) > 500:
             del self.diag_log[:-500]
         if level in ('ERR', 'WARN'):
             self.diag_unseen += 1
-        self.root.after(0, self._refresh_diag_indicator)
+        self.call(self._refresh_diag_indicator)
         if self.diag_win is not None:
-            self.root.after(0, lambda e=entry: self.diag_win.append_entry(e))
+            self.call(lambda e=entry: self.diag_win.append_entry(e))
 
     def _refresh_diag_indicator(self):
-        """Updates the DIAG button in the title bar: colour/text according to
-        whether there are active hardware alarms (err_active) and the count of unread
-        entries (diag_unseen)."""
         if not hasattr(self, 'btn_diag'):
             return
         if self.err_active:
-            n = len(self.err_active)
-            self.btn_diag.config(text=f"⚠ ERROR x{n}", bg=C['red'], fg='#ffffff')
+            col, icon = 'red', 'warning'
         elif self.diag_unseen > 0:
-            self.btn_diag.config(text=f"DIAG ({self.diag_unseen})", bg=C['orange'], fg='#1a1c1f')
+            col, icon = 'orange', 'warning'
         else:
-            self.btn_diag.config(text="DIAG", bg=C['bg2'], fg=C['dim'])
+            col, icon = 'label2', 'info'
+        self._reicon(self.btn_diag, icon, col)
+        self.btn_diag.setToolTip(
+            f"Diagnostics — {len(self.err_active)} active alarm(s)"
+            if self.err_active else
+            f"Diagnostics — {self.diag_unseen} new" if self.diag_unseen
+            else "Diagnostics")
 
     def _set_fw_build(self, build):
-        """Called after receiving BUILD:<id> from the board (at firmware startup
-        OR in response to the VER command sent right after connecting).
-        Shows the number in the title bar and logs it to diagnostics, so it is
-        plain to see which firmware version is actually flashed."""
         self.dev_fw_build = build
-        if hasattr(self, 'fw_build_lbl'):
-            self.fw_build_lbl.config(text=f"FW: {build}", fg=C['green'])
+        if hasattr(self, 'fw_row'):
+            self.fw_row.right.setText(build)
+            self.fw_row.right.setStyleSheet(f"color: {self.th['green']};")
         self._log_diag('INFO', f"Connected - firmware build {build}")
 
     def open_diag_window(self):
         self.diag_unseen = 0
         self._refresh_diag_indicator()
         if self.diag_win is not None:
-            try:
-                self.diag_win.win.lift()
-                return
-            except Exception:
-                self.diag_win = None
-        self.diag_win = DiagnosticsWindow(self.root, self)
+            self.diag_win.raise_()
+            return
+        self.diag_win = DiagnosticsDialog(self, self.th, self)
+        self.diag_win.show()
 
+    # ════════════════════════════════════════════════════════════════════
+    #  CALIBRATION
+    # ════════════════════════════════════════════════════════════════════
     def _cal_step_stats(self):
-        """(avg_step_s, elapsed_in_current_step_s) based on the timestamps
-        of the starts of successive steps. avg_step=None when there is not yet
-        any completed step to average."""
+        """(avg_step_s, elapsed_in_current_step_s). avg_step is None until at
+        least one step has finished."""
         times = self.cal_step_times
         now = time.time()
+        avg_step = None
         if len(times) >= 2:
             durations = [times[i] - times[i - 1] for i in range(1, len(times))]
             avg_step = sum(durations) / len(durations)
-        else:
-            avg_step = None
         if times:
-            elapsed_in_step = now - times[-1]
+            elapsed = now - times[-1]
         elif self.cal_t0:
-            elapsed_in_step = now - self.cal_t0
+            elapsed = now - self.cal_t0
         else:
-            elapsed_in_step = 0
-        return avg_step, elapsed_in_step
+            elapsed = 0
+        return avg_step, elapsed
 
     def _cal_eta(self):
-        """Estimated remaining calibration time [s].
-        None = not enough data yet to make an estimate.
-        0 only when the calibration has REALLY finished (cal_running=False) -
-        previously cur==total (the last point had only JUST STARTED) also gave 0,
-        which looked like "done" even though the relay test could still be running
-        for another several or a dozen-odd minutes."""
+        """Seconds remaining, or None when there is not enough data yet. Zero
+        ONLY when the calibration has really finished - cur == total used to
+        give zero while the last point had merely started."""
         if not self.cal_t0 or self.cal_total < 1:
             return None
         if not self.cal_running:
             return 0
-        avg_step, elapsed_in_step = self._cal_step_stats()
+        avg_step, elapsed = self._cal_step_stats()
         if avg_step is None:
             if self.cal_current < 1:
                 return None
             avg_step = (time.time() - self.cal_t0) / self.cal_current
-        remaining_full_steps = max(0, self.cal_total - self.cal_current)
-        remaining = remaining_full_steps * avg_step + max(0, avg_step - elapsed_in_step)
+        remaining = (max(0, self.cal_total - self.cal_current) * avg_step
+                     + max(0, avg_step - elapsed))
         return max(0, remaining)
 
     def _cal_progress_fraction(self):
-        """Fill fraction of the progress bar (0..1). It grows smoothly during the
-        current step instead of jumping to 100% at the moment the LAST point
-        has only just started (cal_current already equals cal_total, but in reality
-        it may have only just begun)."""
+        """Grows smoothly through the current step instead of jumping to 100%
+        the moment the last point starts."""
         if not self.cal_total:
             return 0.0
         if not self.cal_running and self.cal_current >= self.cal_total:
             return 1.0
-        avg_step, elapsed_in_step = self._cal_step_stats()
+        avg_step, elapsed = self._cal_step_stats()
         completed = max(0, self.cal_current - 1)
-        step_frac = 0.0
-        if avg_step and avg_step > 0:
-            step_frac = min(0.95, elapsed_in_step / avg_step)
+        step_frac = min(0.95, elapsed / avg_step) if avg_step else 0.0
         return min(1.0, (completed + step_frac) / self.cal_total)
 
     def _cal_finished(self):
-        """Calibration finished"""
         self._refresh_cal_view()
-        if hasattr(self, 'cal_status'):
-            self.cal_status.config(text="✓ Calibration done - saving to PC...")
+        self.cal_status_row.right.setText("done - saving to PC…")
         self.dev_cal = True
-        # Fetch the updated settings
         self.send("GET")
-        # Automatically fetch the profiles and save them to the PC disk
-        self.root.after(800, lambda: self.dump_calibration_to_pc(silent=False))
+        self.after(800, lambda: self.dump_calibration_to_pc(silent=False))
 
-    # ────────────────────────────────────────────────────
-    #  CALIBRATION - SAVE/LOAD ON THE PC DISK
-    # ────────────────────────────────────────────────────
+    def _refresh_cal_view(self):
+        if self.cal_running and self.cal_total > 0:
+            eta = self._cal_eta()
+            eta_s = f" · ~{int(eta // 60)} min" if eta else ""
+            self.cal_status_row.right.setText(
+                f"{self.cal_current}/{self.cal_total}{eta_s}")
+        elif self.cal_total and self.cal_current >= self.cal_total:
+            self.cal_status_row.right.setText("done")
+        if self.cal_win:
+            try:
+                self.cal_win.refresh()
+            except Exception:
+                pass
+        # The firmware IGNORES SP/RU/RD while calibrating (sys == CAL), so an
+        # accidental drag cannot disturb a relay measurement. Previously the
+        # controls stayed live and silently did nothing, which looked like the
+        # target had changed. Now they are visibly dead for the duration.
+        for sl in ('sl_sp', 'sl_ru', 'sl_rd'):
+            if hasattr(self, sl):
+                getattr(self, sl).set_enabled(not self.cal_running)
+
     def _manual_load_cal(self):
-        """Manual upload of the calibration from the PC (with confirmation)"""
         if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            core.warn(self, "Not connected", "Connect to the device first.")
             return
         if not self.cal_file.exists():
-            messagebox.showinfo("No calibration",
-                "No saved calibration found on PC.\n"
-                "Run calibration first, or save it with\n"
-                "the 'SAVE CAL TO PC' button.")
+            core.info(self, "No backup",
+                      "No saved calibration on this PC. Run a calibration "
+                      "first, or back one up from the board.")
             return
-        # Show the save date
         try:
             with open(self.cal_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             saved = data.get('saved', '?')
             nvalid = sum(1 for p in data.get('profiles', []) if p.get('valid'))
-        except:
-            saved = '?'; nvalid = 0
-        if messagebox.askyesno("Load calibration from PC",
-                f"Load saved calibration to the device?\n\n"
-                f"Saved: {saved}\n"
-                f"Profiles: {nvalid}\n\n"
-                "This will overwrite the current calibration."):
+        except Exception:
+            saved, nvalid = '?', 0
+        if core.ask(self, "Restore calibration to the board?",
+                    f"Saved: {saved}\nProfiles: {nvalid}\n\n"
+                    "This overwrites what the board currently holds."):
             self.load_calibration_from_pc()
 
     def show_cal_table(self):
-        """Fetch the profiles from the device and show the Kp/Ki/Kd table"""
         if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            core.warn(self, "Not connected", "Connect to the device first.")
             return
         self._caldump_buf = []
         self._caldump_active = False
         self._caldump_purpose = 'view'
         self.send("DUMPCAL")
-        print("Fetching the calibration table...")
 
-    # Base values from the firmware (KP_BASE/KI_BASE/KD_BASE_H) - this is what
-    # the firmware writes as the profile when the relay test did NOT catch oscillation
-    # ("RELAY FAIL - bazowe"). Every calibrated cell that lands
-    # exactly on these numbers is almost certainly not a real measurement.
+    # The firmware writes these when a relay test fails, so a cell landing
+    # exactly on them is almost certainly a fallback, not a measurement.
     _CAL_BASE_KP, _CAL_BASE_KI, _CAL_BASE_KD = 10.0, 0.3, 0.8
 
-    def _show_cal_table_window(self, profiles):
-        """Window with the table of calibrated PID values (temp x ramp)"""
-        # Grid as in the firmware (PR_N=9 - must be IDENTICAL to PT[]/PR[] in the .ino,
-        # otherwise idx=ri*len(PR)+ci points at the wrong cells)
-        PT = [20, 30, 40, 50, 60, 70, 80, 90, 100]
-        PR = [5, 10, 20, 30, 40, 50, 60, 70, 80]
-        win = tk.Toplevel(self.root)
-        win.title("Calibration Table")
-        win.configure(bg=C['bg'])
-        size_win(win, 720, 520, 560, 400, parent=self.root)
-        tk.Label(win, text="CALIBRATION TABLE — heating PID (Kp / Ki / Kd)",
-                 bg=C['bg'], fg=C['purple'], font=F(12, 1)).pack(
-                 anchor='w', padx=16, pady=(14, 4))
-        n_valid = sum(1 for p in profiles if p['valid'])
-        n_fallback = sum(1 for p in profiles if p['valid'] and self._is_base_profile(p))
-        info_txt = (f"{n_valid} of {len(profiles)} grid points calibrated.  "
-                    "Empty = not calibrated (uses defaults 10/0.3/0.8).")
-        if n_fallback:
-            info_txt += (f"\n⚠ {n_fallback} of those are exactly the base defaults — "
-                         "almost certainly a failed relay test that fell back, not a real measurement "
-                         "(shown in red below).")
-        tk.Label(win, text=info_txt,
-                 bg=C['bg'], fg=(C['red'] if n_fallback else C['dim']),
-                 font=F(9), justify='left').pack(anchor='w', padx=16)
-        # Map idx -> profile
-        pmap = {p['idx']: p for p in profiles}
-        # Scrollable table
-        frame = tk.Frame(win, bg=C['bg'])
-        frame.pack(fill='both', expand=True, padx=16, pady=12)
-        canvas = tk.Canvas(frame, bg=C['bg2'], highlightthickness=0)
-        sb = tk.Scrollbar(frame, orient='vertical', command=canvas.yview)
-        inner = tk.Frame(canvas, bg=C['bg2'])
-        canvas.create_window((0, 0), window=inner, anchor='nw')
-        inner.bind('<Configure>', lambda e: canvas.config(scrollregion=canvas.bbox('all')))
-        canvas.config(yscrollcommand=sb.set)
-        canvas.pack(side='left', fill='both', expand=True)
-        sb.pack(side='right', fill='y')
-        # Header: ramps
-        tk.Label(inner, text="Temp\\Ramp", bg=C['panel'], fg=C['cyan'],
-                 font=F(9, 1), width=10, anchor='w').grid(
-                 row=0, column=0, sticky='nsew', padx=1, pady=1)
-        for ci, r in enumerate(PR):
-            tk.Label(inner, text=f"{r}°C/min", bg=C['panel'], fg=C['cyan'],
-                     font=F(9, 1), width=16).grid(
-                     row=0, column=ci+1, sticky='nsew', padx=1, pady=1)
-        # Rows: temperatures
-        for ri, t in enumerate(PT):
-            tk.Label(inner, text=f"{t}°C", bg=C['panel'], fg=C['orange'],
-                     font=F(9, 1), width=10, anchor='w').grid(
-                     row=ri+1, column=0, sticky='nsew', padx=1, pady=1)
-            for ci, r in enumerate(PR):
-                idx = ri * len(PR) + ci  # pi_(ti,ri) = ti*PR_N+ri
-                p = pmap.get(idx)
-                if p and p['valid']:
-                    txt = f"{p['KpH']:.1f} / {p['KiH']:.2f} / {p['KdH']:.2f}"
-                    if self._is_base_profile(p):
-                        txt += "  ⚠"
-                        fg = C['red']; bg = C['bg2']
-                    else:
-                        fg = C['text']; bg = C['bg2']
-                else:
-                    txt = "—"
-                    fg = C['dim2']; bg = C['panel2']
-                tk.Label(inner, text=txt, bg=bg, fg=fg,
-                         font=F(8), width=16).grid(
-                         row=ri+1, column=ci+1, sticky='nsew', padx=1, pady=1)
-        # Footer
-        tk.Label(win, text="Each cell: Kp / Ki / Kd for that temperature and ramp rate.\n"
-                 "On START, the app interpolates between the 4 nearest points automatically.\n"
-                 "⚠ = identical to the base defaults - almost certainly a failed relay test "
-                 "(no real oscillation measured), not a genuine calibration.",
-                 bg=C['bg'], fg=C['dim'], font=F(8), justify='left').pack(
-                 anchor='w', padx=16, pady=(0, 12))
-
     def _is_base_profile(self, p):
-        """True if this profile's Kp/Ki/Kd are (within rounding error)
-        exactly the base values from the firmware - that is, almost certainly a
-        fallback after a failed relay test rather than a real measurement."""
         try:
             return (abs(p['KpH'] - self._CAL_BASE_KP) < 0.05 and
                     abs(p['KiH'] - self._CAL_BASE_KI) < 0.01 and
@@ -1992,21 +1569,17 @@ class PeltierControl:
             return False
 
     def dump_calibration_to_pc(self, silent=True):
-        """Asks the device for the profiles and offset, saves them to JSON"""
         if not self.connected:
+            core.warn(self, "Not connected", "Connect to the device first.")
             return
         self._caldump_purpose = 'save'
-        # Remember the offset from the current slider
         try:
             self._pending_offset = self.sl_off.get()
-        except:
+        except Exception:
             self._pending_offset = 0.0
         self.send("DUMPCAL")
-        if not silent:
-            print("Fetching the profiles from the device...")
 
     def _finish_caldump_save(self):
-        """After receiving all the profiles - save them to a JSON file"""
         try:
             profiles = []
             for line in self._caldump_buf:
@@ -2014,666 +1587,147 @@ class PeltierControl:
                 if len(parts) >= 8:
                     profiles.append({
                         'idx': int(parts[0]),
-                        'KpH': float(parts[1]), 'KiH': float(parts[2]), 'KdH': float(parts[3]),
-                        'KpC': float(parts[4]), 'KiC': float(parts[5]), 'KdC': float(parts[6]),
-                        'valid': parts[7].strip() == '1',
-                    })
-            data = {
-                'version': 1,
-                'saved': datetime.now().isoformat(timespec='seconds'),
-                'offset': self._pending_offset if self._pending_offset is not None else 0.0,
-                'profiles': profiles,
-            }
+                        'KpH': float(parts[1]), 'KiH': float(parts[2]),
+                        'KdH': float(parts[3]), 'KpC': float(parts[4]),
+                        'KiC': float(parts[5]), 'KdC': float(parts[6]),
+                        'valid': parts[7].strip() == '1'})
+            data = {'version': 1,
+                    'saved': datetime.now().isoformat(timespec='seconds'),
+                    'offset': self._pending_offset or 0.0,
+                    'profiles': profiles}
             with open(self.cal_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
             n_valid = sum(1 for p in profiles if p['valid'])
-            print(f"Calibration saved: {self.cal_file.name} ({n_valid}/{len(profiles)} profiles)")
-            if hasattr(self, 'cal_status'):
-                self.cal_status.config(text=f"✓ Calibration saved to PC ({n_valid} profiles)")
             if self._caldump_purpose == 'save':
-                try:
-                    messagebox.showinfo("Calibration saved",
-                        f"PID profiles + offset saved to disk:\n{self.cal_file}\n\n"
-                        f"Saved {n_valid} calibrated profiles.\n"
-                        "They will be auto-loaded on next connection.")
-                except: pass
+                core.info(self, "Calibration backed up",
+                          f"{n_valid} profiles and the offset were written to\n"
+                          f"{self.cal_file}\n\n"
+                          "They are restored automatically on the next connection.")
             elif self._caldump_purpose == 'view':
-                # Show the table in a window
-                self._show_cal_table_window(profiles)
+                CalTableDialog(self, self.th, profiles,
+                               self._is_base_profile).exec()
         except Exception as e:
-            print(f"Calibration save error: {e}")
+            print(f"calibration save error: {e}")
         self._caldump_purpose = None
 
+    def _auto_load_calibration(self):
+        if self.connected and self.cal_file.exists():
+            self.load_calibration_from_pc()
+
     def load_calibration_from_pc(self):
-        """Load the calibration from the JSON file and send it to the device"""
         if not self.cal_file.exists():
             return False
         try:
             with open(self.cal_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             profiles = data.get('profiles', [])
-            offset = data.get('offset', 0.0)
             if not profiles:
                 return False
-            # Send the offset
-            self.send(f"OFFSET:{offset:.1f}")
-            # Send every profile (with a small gap so the buffer is not flooded)
+            self.send(f"OFFSET:{data.get('offset', 0.0):.1f}")
+
             def send_profiles(i=0):
                 if i >= len(profiles):
-                    # After all of them - mark the calibration as ready
                     self.send("SETCALDONE:1")
                     self.dev_cal = True
-                    if hasattr(self, 'cal_status'):
-                        self.cal_status.config(
-                            text=f"✓ Loaded calibration from PC ({len(profiles)} profiles)")
-                    print(f"Uploaded {len(profiles)} profiles from PC to the device")
+                    self._update_cal_summary()
                     return
                 p = profiles[i]
                 self.send(f"SETPROF:{p['idx']},{p['KpH']:.3f},{p['KiH']:.4f},"
-                         f"{p['KdH']:.3f},{p['KpC']:.3f},{p['KiC']:.4f},"
-                         f"{p['KdC']:.3f},{1 if p['valid'] else 0}")
-                # Next profile in 40ms
-                self.root.after(40, lambda: send_profiles(i + 1))
+                          f"{p['KdH']:.3f},{p['KpC']:.3f},{p['KiC']:.4f},"
+                          f"{p['KdC']:.3f},{1 if p['valid'] else 0}")
+                self.after(40, lambda: send_profiles(i + 1))
+
             send_profiles(0)
-            saved = data.get('saved', '?')
-            print(f"Loading calibration from PC (saved: {saved})")
             return True
         except Exception as e:
-            print(f"Calibration load error: {e}")
+            print(f"calibration load error: {e}")
             return False
 
+    def do_autocal(self):
+        if not self.connected:
+            core.warn(self, "Not connected", "Connect to the device first.")
+            return
+        CalRangeDialog(self, self.th, self).exec()
 
-    # ────────────────────────────────────────────────────
-    #  UI CONSTRUCTION
-    # ────────────────────────────────────────────────────
-    def _build_ui(self):
-        # ── TITLE BAR ───────────────────────────────────────────────────
-        # Three zones, left to right: identity (medallion + name + versions),
-        # a stretch of nothing, and live state (diagnostics + link light).
-        # Before .15 the versions and the state were crammed together on the
-        # left and the eye had to hunt for the connection light.
-        top = tk.Frame(self.root, bg=C['bg2'], height=SC(48))
-        top.pack(fill='x'); top.pack_propagate(False)
-        tk.Frame(top, bg=C['gold'], width=SC(4)).pack(side='left', fill='y')
+    def start_autocal(self, temp_min, temp_max, ramps):
+        self.send(f"CALRANGE:{temp_min:.0f},{temp_max:.0f}")
+        time.sleep(0.1)
+        # CRUCIAL - this is what defines the ramps the calibration will cover.
+        self.send("SETCALRAMPS:" + ",".join(f"{r:.0f}" for r in ramps))
+        time.sleep(0.1)
+        self.cal_running = True
+        self.cal_t0 = time.time()
+        self.cal_current = 0
+        self.send("AUTOCAL")
+        self.cal_status_row.right.setText("starting…")
+        self.after(600, self.open_cal_window)
 
-        bw = SC(30)
-        badge = tk.Canvas(top, width=bw, height=bw, bg=C['bg2'],
-                          highlightthickness=0)
-        badge.pack(side='left', padx=(SC(10), SC(8)))
-        self._img_badge = make_mark(
-            bw, bw, C['bg2'],
-            lambda c: draw_medallion(c, bw / 2, bw / 2, SC(12), C['gold'], C['bg2']))
-        if self._img_badge is not None:
-            badge.create_image(0, 0, anchor='nw', image=self._img_badge)
+    def open_cal_window(self):
+        if not self.cal_plan and not self.cal_running:
+            core.info(self, "Not calibrating",
+                      "Start a calibration from the Tuning screen.")
+            return
+        if self.cal_win:
+            self.cal_win.raise_()
+            return
+        self.cal_win = CalibrationDialog(self, self.th, self)
+        self.cal_win.show()
+
+    def _update_cal_summary(self):
+        """One line saying whether the board is calibrated. What matters day to
+        day is not the individual gains, it is whether the grid in Flash is
+        valid."""
+        if not hasattr(self, 'cal_summary_row'):
+            return
+        if self.dev_cal:
+            self.cal_summary_row.right.setText("calibrated")
+            self.cal_summary_row.right.setStyleSheet(f"color: {self.th['green']};")
+            self.cal_status_row.right.setText("calibrated")
         else:
-            draw_medallion(badge, bw / 2, bw / 2, SC(12), C['gold'], C['bg2'])
+            self.cal_summary_row.right.setText("base gains")
+            self.cal_summary_row.right.setStyleSheet(f"color: {self.th['orange']};")
+            self.cal_status_row.right.setText("not calibrated")
 
-        idbox = tk.Frame(top, bg=C['bg2'])
-        idbox.pack(side='left')
-        # The name is DRAWN, not typed: the same chiselled letterforms as the
-        # emblem (see GLYPHS), so the mark in the title bar is one object
-        # rather than a picture standing next to some text in whatever
-        # monospace font the machine happens to have.
-        nrow = tk.Frame(idbox, bg=C['bg2'])
-        nrow.pack(anchor='w')
-        wh = SC(17)                                   # cap height
-        ww = int(wordmark_width(h=wh)) + SC(4)
-        wht = wh + SC(6)
-        wm = tk.Canvas(nrow, width=ww, height=wht, bg=C['bg2'],
-                       highlightthickness=0)
-        wm.pack(side='left')
-        self._img_wm = make_mark(
-            ww, wht, C['bg2'],
-            lambda c: draw_wordmark(c, SC(2), wh + SC(1), wh, C['gold'], C['bg2']))
-        if self._img_wm is not None:
-            wm.create_image(0, 0, anchor='nw', image=self._img_wm)
+    def _update_pol_indicator(self):
+        if not hasattr(self, 'pol_row'):
+            return
+        if self.dev_pol_set:
+            txt = "swapped" if self.dev_pol_swapped else "normal"
+            col = self.th['orange'] if self.dev_pol_swapped else self.th['green']
         else:
-            draw_wordmark(wm, SC(2), wh + SC(1), wh, C['gold'], C['bg2'])
-        tk.Label(nrow, text="  photocurrent & pyrocurrent bench",
-                 bg=C['bg2'], fg=C['dim'],
-                 font=F(9)).pack(side='left', pady=(SC(5), 0))
-        vrow = tk.Frame(idbox, bg=C['bg2'])
-        vrow.pack(anchor='w')
-        tk.Label(vrow, text=f"APP {APP_BUILD}", bg=C['bg2'], fg=C['dim2'],
-                 font=F(8)).pack(side='left')
-        tk.Label(vrow, text="·", bg=C['bg2'], fg=C['dim2'],
-                 font=F(8)).pack(side='left', padx=SC(5))
-        self.fw_build_lbl = tk.Label(vrow, text="FW —", bg=C['bg2'], fg=C['dim2'],
-                                      font=F(8))
-        self.fw_build_lbl.pack(side='left')
+            txt, col = "not set", self.th['label3']
+        self.pol_row.right.setText(txt)
+        self.pol_row.right.setStyleSheet(f"color: {col};")
 
-        # Live state on the right
-        sf = tk.Frame(top, bg=C['bg2'])
-        sf.pack(side='right', padx=SC(16))
-        self.btn_diag = tk.Button(sf, text="DIAG", command=self.open_diag_window,
-                                   bg=C['bg2'], fg=C['dim'], font=F(9, 1),
-                                   relief='flat', cursor='hand2', bd=0, padx=SC(10), pady=SC(4),
-                                   activebackground=C['panel3'])
-        self.btn_diag.pack(side='left', padx=(0, SC(16)))
-        self.s_dot = tk.Canvas(sf, width=SC(14), height=SC(14), bg=C['bg2'],
-                               highlightthickness=0)
-        self.s_dot.pack(side='left', padx=(0, SC(8)))
-        self._draw_dot(C['dim2'], glow=False)
-        self.s_lbl = tk.Label(sf, text="DISCONNECTED", bg=C['bg2'], fg=C['dim'],
-                              font=F(10))
-        self.s_lbl.pack(side='left')
-
-        # ── TABS, ORDERED BY HOW OFTEN THEY ARE USED ────────────────────
-        # Was: CONTROL / ADVANCED / ARCHIVE / SERIES / CONNECTION - which put
-        # the every-day SERIES tab fourth, behind two you touch rarely, and
-        # hid PID work behind the vague word "ADVANCED". New order follows the
-        # actual workflow: run it -> automate it -> look at what came out ->
-        # tune it -> deal with the hardware.
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill='both', expand=True, padx=0, pady=0)
-        t1 = tk.Frame(nb, bg=C['bg']); nb.add(t1, text='  CONTROL  ')
-        t5 = tk.Frame(nb, bg=C['bg']); nb.add(t5, text='  SERIES  ')
-        t3 = tk.Frame(nb, bg=C['bg']); nb.add(t3, text='  ARCHIVE  ')
-        t2 = tk.Frame(nb, bg=C['bg']); nb.add(t2, text='  TUNING  ')
-        t4 = tk.Frame(nb, bg=C['bg']); nb.add(t4, text='  DEVICE  ')
-        self.build_live(t1)
-        self.build_series(t5)
-        self.build_arch(t3)
-        self.build_advanced(t2)
-        self.build_conn(t4)
-
-    def _draw_dot(self, color, glow=True):
-        self.s_dot.delete('all')
-        if glow:
-            self.s_dot.create_oval(0, 0, 14, 14, fill='', outline=color, width=1)
-        self.s_dot.create_rectangle(3, 3, 11, 11, fill=color, outline='')
-
-    def _pulse(self):
-        if self.connected:
-            self._pulse_state = (self._pulse_state + 1) % 20
-            phase = abs(self._pulse_state - 10) / 10.0
-            col = _lighten(C['green'], phase * 0.4)
-            self._draw_dot(col)
-        self.root.after(80, self._pulse)
-
+    # ════════════════════════════════════════════════════════════════════
+    #  STATUS AND RUN CONTROL
+    # ════════════════════════════════════════════════════════════════════
     def set_status(self, connected, msg):
         self.connected = connected
         if connected:
-            self._draw_dot(C['green'])
-            self.s_lbl.config(text=msg or "CONNECTED", fg=C['green'])
+            self.header.chip.set((msg or "CONNECTED").upper(), 'green')
         else:
-            self._draw_dot(C['dim2'], glow=False)
-            self.s_lbl.config(text=msg or "DISCONNECTED", fg=C['dim'])
-        # Enable/disable the panel
-        if hasattr(self, 'btn_run'):
-            self._set_panel_enabled(connected)
+            self.header.chip.set((msg or "OFFLINE").upper(), 'red')
 
-    # ────────────────────────────────────────────────────
-    #  LIVE SCREEN: chart (left) + control panel (right)
-    # ────────────────────────────────────────────────────
-    def build_live(self, parent):
-        # Top bar: compact stat cards + START/STOP buttons
-        topbar = tk.Frame(parent, bg=C['bg'])
-        topbar.pack(fill='x', padx=16, pady=(10, 6))
-
-        # Cards (left part, stretched)
-        cards = tk.Frame(topbar, bg=C['bg'])
-        cards.pack(side='left', fill='x', expand=True)
-        self.cards = {}
-        self.cards['temp'] = self._stat_card(cards, "TEMP", "°C", C['blue'])
-        self.cards['temp2'] = self._stat_card(cards, "TEMP 2", "°C", C['cyan'])
-        self.cards['sp']   = self._stat_card(cards, "SETPOINT", "°C", C['orange'])
-        self.cards['rate'] = self._stat_card(cards, "AVG RATE", "°C/min", C['yellow'])
-        self.cards['pwm']  = self._stat_card(cards, "PWM", "%", C['green'])
-
-        # START/STOP/E-STOP buttons (right part of the bar) - always visible
-        ctrl = tk.Frame(topbar, bg=C['bg'])
-        ctrl.pack(side='right', padx=(8, 0))
-        self.is_running = False  # state: is a run in progress
-        self.btn_run = tk.Button(ctrl, text="▶ START", command=self.toggle_run,
-                                 bg=C['green'], fg='#1a1c1f', font=F(12, 1),
-                                 relief='flat', cursor='hand2', bd=0, padx=16, pady=12,
-                                 activebackground=_lighten(C['green'], 0.15))
-        self.btn_run.pack(side='left', padx=(0, 4), fill='y')
-        # FREEZE - freeze the gal for a sample swap
-        self.btn_freeze = tk.Button(ctrl, text="❄ FREEZE", command=self.do_freeze,
-                                    bg=C['bg2'], fg=C['cyan'], font=F(12, 1),
-                                    relief='flat', cursor='hand2', bd=0, padx=12, pady=12,
-                                    highlightthickness=2, highlightbackground=C['cyan'],
-                                    activebackground=C['panel3'])
-        self.btn_freeze.pack(side='left', padx=(0, 4), fill='y')
-        self.btn_estop = tk.Button(ctrl, text="⛔", command=self.do_estop,
-                                   bg=C['red'], fg='#fff', font=F(14, 1),
-                                   relief='flat', cursor='hand2', bd=0, padx=12, pady=12,
-                                   activebackground=_lighten(C['red'], 0.15))
-        self.btn_estop.pack(side='left', fill='y')
-
-        # Main area: chart + panel
-        main = tk.Frame(parent, bg=C['bg'])
-        main.pack(fill='both', expand=True, padx=16, pady=(0, 12))
-
-        # RIGHT - control panel (packed FIRST!)
-        # The fixed 312px width reserves space on the right BEFORE the expanding
-        # chart claims the cavity. Otherwise the matplotlib canvas, on a redraw (zoom/
-        # home/resize), demands its full size and crushes the panel packed later -> panel vanishes.
-        self._build_panel(main)
-        # LEFT - chart (fills the remaining space)
-        self._build_chart(main)
-
-    def _stat_card(self, parent, title, unit, color):
-        """One live readout. Reworked in .15: the value is the thing you read
-        from across the room, so it got bigger (16 -> 22) and the card got
-        real breathing room; the caption and unit went quieter. The coloured
-        rule on top is the only thing tying it to its curve on the chart, so
-        it stayed - just thicker."""
-        card = tk.Frame(parent, bg=C['panel'])
-        card.pack(side='left', fill='both', expand=True, padx=(0, SC(5)))
-        tk.Frame(card, bg=color, height=SC(4)).pack(fill='x')
-        inner = tk.Frame(card, bg=C['panel'])
-        inner.pack(fill='both', expand=True, padx=SC(11), pady=(SC(7), SC(8)))
-        tk.Label(inner, text=title, bg=C['panel'], fg=C['dim2'],
-                 font=F(8), anchor='w').pack(anchor='w')
-        vrow = tk.Frame(inner, bg=C['panel'])
-        vrow.pack(anchor='w', pady=(SC(3), 0))
-        val = tk.Label(vrow, text="--", bg=C['panel'], fg=color,
-                       font=F(22, 1))
-        val.pack(side='left')
-        unit_lbl = tk.Label(vrow, text=" " + unit, bg=C['panel'], fg=C['dim2'],
-                            font=F(8))
-        unit_lbl.pack(side='left', pady=(SC(8), 0))
-        return {'val': val, 'unit': unit, 'unit_lbl': unit_lbl, 'extra': None, 'row': vrow}
-
-    def _build_chart(self, parent):
-        wrap = tk.Frame(parent, bg=C['panel'])
-        wrap.pack(side='left', fill='both', expand=True, padx=(0, 12))
-        tk.Frame(wrap, bg=C['border2'], height=3).pack(fill='x')
-
-        hd = tk.Frame(wrap, bg=C['panel'])
-        hd.pack(fill='x', padx=14, pady=(10, 4))
-        tk.Label(hd, text="LIVE CHART", bg=C['panel'], fg=C['dim'],
-                 font=F(10, 1)).pack(side='left')
-
-        # Setpoint approach statistics (right side of the header)
-        self.reach_lbl = tk.Label(hd, text="", bg=C['panel'], fg=C['green'],
-                                  font=F(9, 1))
-        self.reach_lbl.pack(side='right')
-
-        # Frameless and edge to edge: no watermark, no outer margins beyond
-        # what the inside-drawn scale needs. The old layout kept 7-8% of the
-        # canvas as blank margin for spines and axis titles.
-        self.fig = Figure(figsize=(9, 6), facecolor=C['panel'], dpi=110)
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05,
-                                   left=0.012, right=0.995, top=0.985,
-                                   bottom=0.015)
-        self.ax1 = self.fig.add_subplot(gs[0])
-        self.ax2 = self.fig.add_subplot(gs[1], sharex=self.ax1)
-        for ax in [self.ax1, self.ax2]:
-            ax.set_facecolor(C['panel'])      # same as the card - no visible box
-
-        self.cv = FigureCanvasTkAgg(self.fig, master=wrap)
-        self.nav = ChartNav(self.cv, [self.ax1, self.ax2],
-                            on_change=self._nav_redraw)
-
-        # ORDER MATTERS. The toolbar row is created and packed to the BOTTOM
-        # first, so it reserves its height before the expanding canvas claims
-        # what is left. Packed the other way round the matplotlib canvas wins
-        # the negotiation and squeezes the row - at 125% text scale that
-        # cost the PAUSE/WINDOW buttons ~20 px of height each and cut their
-        # labels in half. Same failure mode as the control rows in ARCHIVE.
-        toolbar_row = tk.Frame(wrap, bg=C['panel'])
-        toolbar_row.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
-
-        self.cv.get_tk_widget().pack(fill='both', expand=True, padx=SC(2),
-                                     pady=(0, SC(2)))
-
-        # PAUSE button - stops scrolling so you can zoom in
-        self.btn_pause = tk.Button(toolbar_row, text="⏸ PAUSE", command=self.toggle_pause,
-                                   bg=C['bg2'], fg=C['yellow'], font=F(9, 1),
-                                   relief='flat', cursor='hand2', bd=0, padx=12, pady=6,
-                                   highlightthickness=1, highlightbackground=C['yellow'],
-                                   activebackground=C['panel3'])
-        self.btn_pause.pack(side='left', padx=(0, 6))
-
-        # Time window selection (how many last seconds to show)
-        tk.Label(toolbar_row, text="WINDOW:", bg=C['panel'], fg=C['dim2'],
-                 font=F(8)).pack(side='left', padx=(8, 4))
-        for label, secs in [("ALL", 0), ("5m", 300), ("2m", 120), ("1m", 60)]:
-            b = tk.Button(toolbar_row, text=label,
-                         command=lambda s=secs: self.set_chart_window(s),
-                         bg=C['bg2'], fg=C['dim'], font=F(8),
-                         relief='flat', cursor='hand2', bd=0, padx=10, pady=5,
-                         activebackground=C['panel3'])
-            b.pack(side='left', padx=2)
-
-        # matplotlib's NavigationToolbar is gone (see ChartNav). Its save
-        # button was the one thing worth keeping, so it comes back here in the
-        # app's own style - and still goes through the print palette, so the
-        # file lands on white.
-        mk_btn_outline(toolbar_row, "⤓ PNG", self.save_live_chart,
-                       C['cyan']).pack(side='right', padx=(6, 0))
-        # Short enough to survive a 1366-wide window: the long form
-        # ("drag = zoom · wheel = zoom · right-click = reset") overflowed the
-        # row by 57 px there once the PAUSE and WINDOW buttons had their share.
-        tk.Label(toolbar_row, text="drag / wheel = zoom · right-click = reset",
-                 bg=C['panel'], fg=C['dim2'], font=F(8)).pack(side='right')
-
-    def _nav_redraw(self):
-        """Called by ChartNav after a reset - repaint from the current data so
-        the automatic limits come back."""
-        args = getattr(self, '_live_args', None)
-        if args:
-            self._redraw_live(*args)
-        else:
-            self.cv.draw_idle()
-
-    def save_live_chart(self):
-        """Save the live chart. Always on white - see print_theme()."""
-        try:
-            from tkinter import filedialog
-            dest = filedialog.asksaveasfilename(
-                title="Save chart as image", defaultextension=".png",
-                initialfile="live_chart.png",
-                filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"),
-                           ("SVG", "*.svg")])
-            if not dest:
-                return
-            args = getattr(self, '_live_args', None)
-            with print_theme(self.fig):
-                if args:
-                    self._redraw_live(*args)
-                self.fig.savefig(dest, dpi=200, facecolor='white',
-                                 edgecolor='none', bbox_inches='tight')
-            if args:
-                self._redraw_live(*args)
-            messagebox.showinfo("Saved", f"Chart saved to:\n{dest}")
-        except Exception as e:
-            messagebox.showerror("Save error", str(e))
-
-    def toggle_pause(self):
-        """Pause/resume chart scrolling (for zooming in)"""
-        self.chart_paused = not self.chart_paused
-        if not hasattr(self, 'btn_pause'):
-            return
-        if self.chart_paused:
-            self.btn_pause.config(text="▶ RESUME", fg=C['green'],
-                                 highlightbackground=C['green'])
-        else:
-            self.btn_pause.config(text="⏸ PAUSE", fg=C['yellow'],
-                                 highlightbackground=C['yellow'])
-
-    def set_chart_window(self, secs):
-        """Set the chart time window (0=all)"""
-        self.chart_window = secs
-
-    def _build_panel(self, parent):
-        """Right control panel - narrow scrollable strip"""
-        panel = tk.Frame(parent, bg=C['bg2'], width=SC(312))
-        panel.pack(side='right', fill='y')
-        panel.pack_propagate(False)
-        tk.Frame(panel, bg=C['red'], width=6).pack(side='left', fill='y')
-
-        # Scrollable area - Canvas + Scrollbar (the panel can be taller than the screen)
-        scroll_wrap = tk.Frame(panel, bg=C['bg2'])
-        scroll_wrap.pack(side='left', fill='both', expand=True)
-        pcanvas = tk.Canvas(scroll_wrap, bg=C['bg2'], highlightthickness=0,
-                            width=290)
-        psb = tk.Scrollbar(scroll_wrap, orient='vertical', command=pcanvas.yview)
-        pcanvas.configure(yscrollcommand=psb.set)
-        psb.pack(side='right', fill='y')
-        pcanvas.pack(side='left', fill='both', expand=True)
-
-        inner = tk.Frame(pcanvas, bg=C['bg2'])
-        inner_id = pcanvas.create_window((0, 0), window=inner, anchor='nw')
-
-        def _on_inner_config(e):
-            pcanvas.configure(scrollregion=pcanvas.bbox('all'))
-        inner.bind('<Configure>', _on_inner_config)
-        def _on_canvas_config(e):
-            pcanvas.itemconfig(inner_id, width=e.width)
-        pcanvas.bind('<Configure>', _on_canvas_config)
-        # Mouse wheel scrolling
-        def _on_wheel(e):
-            pcanvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
-        pcanvas.bind('<Enter>', lambda e: pcanvas.bind_all('<MouseWheel>', _on_wheel))
-        pcanvas.bind('<Leave>', lambda e: pcanvas.unbind_all('<MouseWheel>'))
-
-        inner = tk.Frame(inner, bg=C['bg2'])
-        inner.pack(fill='both', expand=True, padx=16, pady=14)
-
-        # The panel used to open with a bare "CONTROL" heading that just
-        # repeated the tab name, and its three groups were separated by
-        # anonymous hairlines. Named sections say what each group is FOR.
-        tk.Label(inner, text="RUN SETUP", bg=C['bg2'], fg=C['text'],
-                 font=F(13, 1)).pack(anchor='w')
-        tk.Label(inner, text="applied on START", bg=C['bg2'], fg=C['dim2'],
-                 font=F(8)).pack(anchor='w', pady=(1, 0))
-        section(inner, "SETPOINT & RAMPS", C['orange'], C['bg2'], pady=(12, 8))
-
-        # Setting sliders
-        self.sl_sp = SliderField(inner, "TARGET", -15, 100, 25.0,
-                                 C['orange'], "°C", 1,
-                                 on_change=lambda v: self.send(f"SP:{v:.1f}"))
-        self.sl_ru = SliderField(inner, "HEAT RATE", 0.5, 80, 2.0,
-                                 C['yellow'], "°C/min", 1,
-                                 on_change=lambda v: self.send(f"RU:{v:.1f}"))
-        self.sl_rd = SliderField(inner, "COOL RATE", 0.5, 80, 2.0,
-                                 C['cyan'], "°C/min", 1,
-                                 on_change=lambda v: self.send(f"RD:{v:.1f}"))
-        self.sl_tmax = SliderField(inner, "MAX TEMP", 50, 115, 80,
-                                   C['red'], "°C", 0,
-                                   on_change=lambda v: self.send(f"TMAX:{v:.0f}"))
-
-        section(inner, "HEATSINK FANS", C['blue'], C['bg2'])
-
-        # FANS - on/off button + speed slider
-        fan_hd = tk.Frame(inner, bg=C['bg2'])
-        fan_hd.pack(fill='x', pady=(0, 4))
-        tk.Label(fan_hd, text="STATE", bg=C['bg2'], fg=C['dim'],
-                 font=F(9, 1)).pack(side='left')
-        self.fan_on = False
-        self.btn_fan = tk.Button(fan_hd, text="○ OFF", command=self.toggle_fan,
-                                 bg=C['bg2'], fg=C['dim2'], font=F(9, 1),
-                                 relief='flat', cursor='hand2', bd=0, padx=12, pady=4,
-                                 highlightthickness=1, highlightbackground=C['dim'],
-                                 activebackground=C['panel3'])
-        self.btn_fan.pack(side='right')
-        self.sl_fan = SliderField(inner, "FAN SPEED", 0, 100, 100,
-                                  C['blue'], "%", 0,
-                                  on_change=lambda v: self.set_fan_speed(v))
-
-        section(inner, "STORED SETUPS", C['purple'], C['bg2'])
-
-        # AUTO badge - direction determined automatically
-        auto = tk.Frame(inner, bg=C['bg2'], highlightthickness=1,
-                        highlightbackground=C['green'])
-        auto.pack(fill='x', pady=(0, 10))
-        tk.Label(auto, text="● AUTO direction", bg=C['bg2'],
-                 fg=C['green'], font=F(9)).pack(padx=8, pady=6)
-
-        # Multi-step profiles
-        # Profiles + Presets
-        bf_pp = tk.Frame(inner, bg=C['bg2'])
-        bf_pp.pack(fill='x', pady=(0, 8))
-        mk_btn_outline(bf_pp, "PROFILES", self.open_profiles, C['purple']).pack(
-            side='left', fill='x', expand=True, padx=(0, 3))
-        mk_btn_outline(bf_pp, "PRESETS", self.open_presets, C['green']).pack(
-            side='left', fill='x', expand=True, padx=(3, 0))
-
-        # Calibration status - clickable (shows progress while calibration runs)
-        self.cal_status = tk.Label(inner, text="", bg=C['bg2'], fg=C['purple'],
-                                   font=F(8), anchor='w', cursor='hand2')
-        self.cal_status.pack(fill='x', pady=(0, 4))
-        self.cal_status.bind('<Button-1>', lambda e: self.open_cal_window())
-
-        tk.Label(inner, text="▶ START uses panel values",
-                 bg=C['bg2'], fg=C['green'], font=F(8)).pack(anchor='w', pady=(4, 0))
-        tk.Label(inner, text="PID tuning & calibration → TUNING tab",
-                 bg=C['bg2'], fg=C['dim2'], font=F(8),
-                 justify='left', wraplength=SC(312) - SC(44)
-                 ).pack(anchor='w', fill='x', pady=(2, 0))
-
-        self._set_panel_enabled(False)
-
-    def build_advanced(self, parent):
-        """ADVANCED tab - PID, calibration, polarity, Flash, reset"""
-        wrap = tk.Frame(parent, bg=C['bg'])
-        wrap.pack(fill='both', expand=True, padx=20, pady=16)
-
-        # Scrollable area (many options)
-        acanvas = tk.Canvas(wrap, bg=C['bg'], highlightthickness=0)
-        asb = tk.Scrollbar(wrap, orient='vertical', command=acanvas.yview)
-        acanvas.configure(yscrollcommand=asb.set)
-        asb.pack(side='right', fill='y')
-        acanvas.pack(side='left', fill='both', expand=True)
-        col = tk.Frame(acanvas, bg=C['bg'])
-        cid = acanvas.create_window((0, 0), window=col, anchor='nw')
-        col.bind('<Configure>', lambda e: acanvas.configure(scrollregion=acanvas.bbox('all')))
-        acanvas.bind('<Configure>', lambda e: acanvas.itemconfig(cid, width=e.width))
-        acanvas.bind('<Enter>', lambda e: acanvas.bind_all('<MouseWheel>',
-                     lambda ev: acanvas.yview_scroll(int(-ev.delta/120), 'units')))
-        acanvas.bind('<Leave>', lambda e: acanvas.unbind_all('<MouseWheel>'))
-
-        # Width limit for readability
-        inner = tk.Frame(col, bg=C['bg'])
-        inner.pack(fill='x', padx=4, pady=4)
-        inner.configure(width=560)
-
-        tk.Label(inner, text="TUNING & DEVICE MEMORY", bg=C['bg'], fg=C['text'],
-                 font=F(14, 1)).pack(anchor='w')
-        tk.Label(inner, text="Calibration state, thermocouple offset and Flash backups",
-                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 16))
-
-        # ── PID TUNING ──
-        # ── WHAT USED TO BE HERE, AND WHY IT IS GONE (APP .17) ──────────
-        # This tab held: manual Kp/Ki/Kd/FF sliders, the AUTO-CAL range wizard,
-        # and a "RE-DETECT" button for the Peltier polarity.
-        #
-        # All three were commissioning tools, and commissioning is done. The
-        # PID grid is calibrated and living in the board's Flash, the
-        # feed-forward model is fixed in firmware, and the Peltier is soldered
-        # in one orientation that is not going to change. Leaving them on
-        # screen meant every one of them was a way to break a working
-        # instrument with a single stray click - and the polarity button in
-        # particular would have driven the module for 4 s just to watch which
-        # way the temperature went.
-        #
-        # Nothing was deleted from the device: the calibration is still in
-        # Flash, the firmware still runs the same PID, and SELF-TUNE plus the
-        # calibration table stay available below for diagnosis. The thermocouple
-        # offset stays too - that IS a per-setup measurement value, not a
-        # commissioning knob. If a re-tune is ever needed, the sliders are one
-        # revert away in git.
-        sec1 = self._adv_section(inner, "CALIBRATION STATUS", C['cyan'])
-        self.cal_summary = tk.Label(
-            sec1, text="Reading from device...", bg=C['bg2'], fg=C['dim'],
-            font=F(9), anchor='w', justify='left')
-        self.cal_summary.pack(anchor='w', fill='x')
-        cs_row = tk.Frame(sec1, bg=C['bg2'])
-        cs_row.pack(fill='x', pady=(10, 0))
-        mk_btn_outline(cs_row, "VIEW CAL TABLE", self.show_cal_table,
-                       C['purple']).pack(side='left', fill='x', expand=True,
-                                         padx=(0, 4))
-        self.btn_st = mk_btn_outline(cs_row, "SELF-TUNE HERE", self.do_selftune,
-                                     C['cyan'])
-        self.btn_st.pack(side='left', fill='x', expand=True, padx=(4, 0))
-        tk.Label(sec1, text="SELF-TUNE re-measures the gains for the CURRENT "
-                            "setpoint and rate only, and writes them to Flash.",
-                 bg=C['bg2'], fg=C['dim2'], font=F(8), justify='left',
-                 wraplength=SC(560)).pack(anchor='w', pady=(8, 0))
-
-        # ── THERMOCOUPLE ────────────────────────────────────────────────
-        sec3 = self._adv_section(inner, "THERMOCOUPLE", C['purple'])
-        self.sl_off = SliderField(sec3, "CAL OFFSET", -20, 20, 0.0,
-                                  C['purple'], "°C", 1,
-                                  on_change=lambda v: self.send(f"OFFSET:{v:.1f}"))
-
-        # ── PELTIER POLARITY (read-only since .17 / FW .30) ─────────────
-        sec4 = self._adv_section(inner, "PELTIER POLARITY", C['orange'])
-        self.pol_indicator = tk.Label(sec4, text="POL: ?", bg=C['bg2'],
-                                      fg=C['dim'], font=F(10, 1))
-        self.pol_indicator.pack(anchor='w')
-        tk.Label(sec4, text="Fixed in the board's Flash and no longer "
-                            "detectable at runtime - the wiring is soldered. "
-                            "Changing it needs POL_DEFAULT in the firmware.",
-                 bg=C['bg2'], fg=C['dim2'], font=F(8), justify='left',
-                 wraplength=SC(560)).pack(anchor='w', pady=(6, 0))
-
-        sec5 = self._adv_section(inner, "DEVICE FLASH", C['green'])
-        bf2 = tk.Frame(sec5, bg=C['bg2'])
-        bf2.pack(fill='x')
-        mk_btn_outline(bf2, "SAVE", lambda: self.send("SAVE"), C['green']).pack(
-            side='left', fill='x', expand=True, padx=(0, 3))
-        mk_btn_outline(bf2, "LOAD", lambda: self.send("LOAD"), C['cyan']).pack(
-            side='left', fill='x', expand=True, padx=(3, 0))
-        tk.Label(sec5, text="Save/load settings to device internal memory",
-                 bg=C['bg2'], fg=C['dim2'], font=F(8)).pack(anchor='w', pady=(6, 0))
-
-        # ── PC CALIBRATION BACKUP ──
-        sec6 = self._adv_section(inner, "PC CALIBRATION BACKUP", C['purple'])
-        bf3 = tk.Frame(sec6, bg=C['bg2'])
-        bf3.pack(fill='x')
-        mk_btn_outline(bf3, "⤓ SAVE TO PC",
-                       lambda: self.dump_calibration_to_pc(silent=False),
-                       C['purple']).pack(side='left', fill='x', expand=True, padx=(0, 3))
-        mk_btn_outline(bf3, "⤒ LOAD FROM PC",
-                       self._manual_load_cal, C['cyan']).pack(
-                       side='left', fill='x', expand=True, padx=(3, 0))
-        tk.Label(sec6, text="Backup profiles to a file (auto-loaded on connect)",
-                 bg=C['bg2'], fg=C['dim2'], font=F(8)).pack(anchor='w', pady=(6, 0))
-
-        # ── RESET ──
-        sec7 = self._adv_section(inner, "RESET", C['red'])
-        mk_btn_outline(sec7, "↺ RESET ALL SETTINGS", self.do_reset, C['red']).pack(fill='x')
-
-    def _adv_section(self, parent, title, color):
-        """Section frame in the TUNING tab. Since .15 it draws the SAME header
-        as section() everywhere else - the tab used to have its own heading
-        style (a full-width coloured bar), which made the app look like two
-        different programs depending on which tab you were on."""
-        section(parent, title, color, C['bg'], pady=(16, 8))
-        box = tk.Frame(parent, bg=C['bg2'])
-        box.pack(fill='x')
-        inner = tk.Frame(box, bg=C['bg2'])
-        inner.pack(fill='x', padx=SC(12), pady=SC(10))
-        return inner
-
-    def _set_panel_enabled(self, en):
-        # Sliders always enabled (values can be set before connecting)
-        # START/STOP enabled too - they check the connection at click time
-        # (we disable only when we explicitly want to block them)
-        for sl in ['sl_sp', 'sl_ru', 'sl_rd', 'sl_tmax', 'sl_off', 'sl_fan']:
-            if hasattr(self, sl):
-                getattr(self, sl).set_enabled(True)
-        # Buttons always clickable - they respond with a message if not connected
-        for b in ['btn_run', 'btn_st', 'btn_estop', 'btn_freeze', 'btn_fan']:
-            if hasattr(self, b):
-                getattr(self, b).config(state='normal')
-
-
-    # ────────────────────────────────────────────────────
-    #  BUTTON ACTIONS
-    # ────────────────────────────────────────────────────
     def toggle_run(self):
-        """START/STOP toggle in a single button"""
-        if self.is_running:
-            self.do_stop()
-        else:
-            self.do_start()
+        self.do_stop() if self.is_running else self.do_start()
 
     def _update_run_button(self, running):
-        """Update button appearance: green START / red STOP"""
         self.is_running = running
         if not hasattr(self, 'btn_run'):
             return
-        if running:
-            self.btn_run.config(text="■ STOP", bg=C['red'], fg='#fff',
-                               activebackground=_lighten(C['red'], 0.15))
-        else:
-            self.btn_run.config(text="▶ START", bg=C['green'], fg='#1a1c1f',
-                               activebackground=_lighten(C['green'], 0.15))
+        self.btn_run.setText("Stop" if running else "Start")
+        self.btn_run.setProperty('kind', 'stop' if running else 'go')
+        self._reicon(self.btn_run, 'stop' if running else 'play',
+                     'stop' if running else 'go')
+        self._restyle(self.btn_run)
 
     def do_start(self):
-        """START - send all panel settings, then run"""
         if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            core.warn(self, "Not connected", "Connect to the device first.")
             return
-        # RESET the approach stats - every START counts a fresh average from zero.
-        # This makes it possible to run measurements back to back without stale data.
+        # Every Start counts a fresh average from zero, so runs can go back to
+        # back without stale numbers on the cards.
         self.reach_start_t = None
         self.reach_start_temp = None
         self.reach_target = self.sl_sp.get()
@@ -2684,225 +1738,109 @@ class PeltierControl:
         self.reach_dir = None
         self.last_setpoint_target = None
         self._last_reach_summary = None
-        if hasattr(self, 'reach_lbl'):
-            self.reach_lbl.config(text="→ starting...", fg=C['dim'])
-        # Send the full set of panel settings
+        self.reach_lbl.setText("starting…")
+
         self.send(f"SP:{self.sl_sp.get():.1f}")
         self.send(f"RU:{self.sl_ru.get():.1f}")
         self.send(f"RD:{self.sl_rd.get():.1f}")
         self.send(f"TMAX:{self.sl_tmax.get():.0f}")
-        # Kp/Ki/Kd are NOT pushed from here any more (APP .17). They used to be
-        # sent from the manual sliders on every START, which quietly OVERWROTE
-        # whatever the board had just interpolated from its calibration grid
-        # for this setpoint and rate. Now the board's own calibrated values
-        # stand - which is the whole point of having calibrated it.
+        # Kp/Ki/Kd are deliberately NOT pushed from here. They used to be sent
+        # from the manual sliders on every Start, which quietly overwrote what
+        # the board had just interpolated from its calibration grid for this
+        # setpoint and rate - which is the whole point of having calibrated it.
         self.send(f"OFFSET:{self.sl_off.get():.1f}")
         time.sleep(0.05)
         self.send("START")
         self._update_run_button(True)
 
     def do_stop(self):
-        # A manual STOP also aborts the automatic measurement SERIES, if one
-        # happens to be running - otherwise the app would soon "resurrect" it
-        # with the next step, which would be confusing during manual intervention.
+        # A manual stop also aborts an automatic series, otherwise the app
+        # would "resurrect" it with the next step in the middle of a manual
+        # intervention.
         if self.series_running:
-            self._series_abort("manual STOP")
+            self._series_abort("manual stop")
         self.send("STOP")
-        self.send("AUTOCALSTOP")  # also abort calibration if it is running
-        if hasattr(self, 'cal_status'):
-            self.cal_status.config(text="")
+        self.send("AUTOCALSTOP")
         self._update_run_button(False)
 
     def do_estop(self):
-        """Emergency stop - disables PWM immediately"""
         self.send("ESTOP")
         self.send("AUTOCALSTOP")
-        if hasattr(self, 'cal_status'):
-            self.cal_status.config(text="")
+        self._update_run_button(False)
 
-    def toggle_fan(self):
-        """Turn the fans on/off"""
+    def on_fan_toggle(self, on):
         if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            core.warn(self, "Not connected", "Connect to the device first.")
+            self.sw_fan.setCheckedSilently(False)
             return
-        self.fan_on = not self.fan_on
-        if self.fan_on:
-            spd = int(self.sl_fan.get()) if hasattr(self, 'sl_fan') else 100
-            if spd == 0: spd = 100; self.sl_fan.set(100, silent=True)
+        self.fan_on = on
+        if on:
+            spd = int(self.sl_fan.get()) or 100
+            if spd != self.sl_fan.get():
+                self.sl_fan.set(100)
             self.send(f"FAN:{spd}")
-            self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
         else:
             self.send("FANOFF")
-            self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
 
     def set_fan_speed(self, v):
-        """Set fan speed (slider)"""
         spd = int(v)
         self.send(f"FAN:{spd}")
-        # Slider at 0 = off, >0 = on
-        if hasattr(self, 'btn_fan'):
-            if spd > 0:
-                self.fan_on = True
-                self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
-            else:
-                self.fan_on = False
-                self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+        self.fan_on = spd > 0
+        if hasattr(self, 'sw_fan'):
+            self.sw_fan.setCheckedSilently(self.fan_on)
 
     def do_freeze(self):
-        """Freeze the gal to solid state (sample swap)"""
         if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            core.warn(self, "Not connected", "Connect to the device first.")
             return
-        if messagebox.askyesno("Freeze gal",
-                "Cool the gal to solid state for sample swap?\n\n"
-                "Gently ramps down to 20°C and HOLDS it there\n"
-                "(keeps cooling active to prevent re-melting).\n\n"
-                "You'll see 'GAL SOLID' when ready.\n"
-                "Press STOP when done swapping the sample."):
+        if core.ask(self, "Freeze the stage?",
+                    "Ramps gently down to 20 °C and HOLDS it there, keeping "
+                    "the cooling active so it cannot re-melt.\n\n"
+                    "You will see 'solid' when it is ready. Press Stop when "
+                    "the sample has been swapped."):
             self.send("FREEZE")
-            if hasattr(self, 'reach_lbl'):
-                self.reach_lbl.config(text="❄ Freezing gal...", fg=C['cyan'])
+            self.reach_lbl.setText("freezing…")
 
     def do_reset(self):
-        """Reset settings to defaults"""
         if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            core.warn(self, "Not connected", "Connect to the device first.")
             return
-        if messagebox.askyesno("Reset settings",
-                "Restore default settings?\n"
-                "This clears all profiles and calibration!"):
+        if core.ask(self, "Restore factory settings?",
+                    "This clears every profile and the calibration held on the "
+                    "board."):
             self.send("RESET")
-
-    def _update_cal_summary(self):
-        """One line on the TUNING tab saying whether the board is calibrated.
-        Replaces the sliders that used to live there - what matters day to day
-        is not the individual gains, it is whether the grid in Flash is valid."""
-        if not hasattr(self, 'cal_summary'):
-            return
-        if getattr(self, 'dev_cal', False):
-            self.cal_summary.config(
-                text="Calibrated - the board interpolates Kp/Ki/Kd from its "
-                     "Flash grid for each setpoint and rate.", fg=C['green'])
-        else:
-            self.cal_summary.config(
-                text="NOT calibrated - the board is running base gains. "
-                     "Use SELF-TUNE, or restore a backup below.", fg=C['orange'])
-
-    def _update_pol_indicator(self):
-        """Update the polarity indicator in the panel"""
-        if not hasattr(self, 'pol_indicator'):
-            return
-        if self.dev_pol_set:
-            txt = "POL: SWAPPED" if self.dev_pol_swapped else "POL: NORMAL"
-            col = C['orange'] if self.dev_pol_swapped else C['green']
-            self.pol_indicator.config(text=f"● {txt}", fg=col)
-        else:
-            self.pol_indicator.config(text="POL: not set", fg=C['dim2'])
 
     def do_selftune(self):
         if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            core.warn(self, "Not connected", "Connect to the device first.")
             return
-        if messagebox.askyesno("Self-Tune",
-                "Start PID auto-tuning?\nTakes ~2 minutes.\n"
-                "Device must be running (START)."):
+        if core.ask(self, "Start self-tune?",
+                    "Takes about two minutes and needs the device running."):
             self.send("SELFTUNE")
 
-    def do_autocal(self):
-        """Open the auto-calibration range selection window"""
-        if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
-            return
-        CalRangeDialog(self.root, self)
-
-    def start_autocal(self, temp_min, temp_max, ramps):
-        """Run auto-calibration with the selected range and ramp list"""
-        # Send the temp range
-        self.send(f"CALRANGE:{temp_min:.0f},{temp_max:.0f}")
-        time.sleep(0.1)
-        # Send the ramp list (CRUCIAL - this defines what the calibration will cover)
-        ramps_str = ",".join(f"{r:.0f}" for r in ramps)
-        self.send(f"SETCALRAMPS:{ramps_str}")
-        time.sleep(0.1)
-        self.cal_running = True
-        self.cal_t0 = time.time()
-        self.cal_current = 0
-        self.send("AUTOCAL")
-        if hasattr(self, 'cal_status'):
-            self.cal_status.config(text="Calibration starting... (click for progress)")
-        self.root.after(600, self.open_cal_window)
-
-    def open_cal_window(self):
-        """Open the calibration progress window"""
-        if not self.cal_plan and not self.cal_running:
-            messagebox.showinfo("Calibration",
-                "Calibration is not running.\n"
-                "Click AUTO-CAL to start.")
-            return
-        # If the window is already open - just raise it
-        if hasattr(self, 'cal_win') and self.cal_win and tk._default_root:
-            try:
-                self.cal_win.win.lift()
-                return
-            except: pass
-        self.cal_win = CalibrationWindow(self.root, self)
-
-    def _refresh_cal_view(self):
-        """Refresh the calibration window if open + the panel status"""
-        # Status in the main panel
-        if hasattr(self, 'cal_status'):
-            if self.cal_running and self.cal_total > 0:
-                eta = self._cal_eta()
-                eta_s = f" · ~{int(eta//60)}min" if eta else ""
-                self.cal_status.config(
-                    text=f"Calibration {self.cal_current}/{self.cal_total}{eta_s} (click=details)")
-            elif self.cal_current >= self.cal_total and self.cal_total > 0:
-                self.cal_status.config(text="✓ Calibration done")
-        # Details window
-        if hasattr(self, 'cal_win') and self.cal_win:
-            try: self.cal_win.refresh()
-            except: pass
-        # TARGET/HEAT RATE/COOL RATE: the firmware IGNORES SP/RU/RD commands while
-        # calibration is running (sys==CAL - see procCmd) - so an accidental
-        # slider move cannot disturb the relay measurement in progress. Previously
-        # the sliders were "always enabled" (see _set_panel_enabled), so the user
-        # could move them with no warning and nothing happened - they thought
-        # the target had changed while the firmware quietly ignored it. Disable them
-        # visually for the duration of calibration so it is clear they are dead.
-        for sl in ('sl_sp', 'sl_ru', 'sl_rd'):
-            if hasattr(self, sl):
-                getattr(self, sl).set_enabled(not self.cal_running)
-
-    def open_profiles(self):
-        """Multi-step profile editor window"""
-        ProfileWindow(self.root, self)
-
-    # ────────────────────────────────────────────────────
-    #  PRESETS - saveable sets of settings
-    # ────────────────────────────────────────────────────
+    # ── presets ─────────────────────────────────────────────────────────
     def _gather_settings(self):
-        """Collect all current settings from the sliders"""
         s = {}
-        for key, attr in [('sp','sl_sp'),('ru','sl_ru'),('rd','sl_rd'),
-                          ('tmax','sl_tmax'),('kp','sl_kp'),('ki','sl_ki'),
-                          ('kd','sl_kd'),('off','sl_off'),('fan','sl_fan')]:
+        for key, attr in (('sp', 'sl_sp'), ('ru', 'sl_ru'), ('rd', 'sl_rd'),
+                          ('tmax', 'sl_tmax'), ('off', 'sl_off'),
+                          ('fan', 'sl_fan')):
             if hasattr(self, attr):
-                try: s[key] = getattr(self, attr).get()
-                except: pass
+                try:
+                    s[key] = getattr(self, attr).get()
+                except Exception:
+                    pass
         return s
 
     def _load_presets(self):
-        """Load presets from the JSON file"""
         if not self.presets_file.exists():
             return {}
         try:
             with open(self.presets_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
+        except Exception:
             return {}
 
     def _save_presets(self, presets):
-        """Save presets to the JSON file"""
         try:
             with open(self.presets_file, 'w', encoding='utf-8') as f:
                 json.dump(presets, f, indent=2)
@@ -2912,1593 +1850,82 @@ class PeltierControl:
             return False
 
     def open_presets(self):
-        """Open the preset management window"""
-        PresetWindow(self.root, self)
+        PresetDialog(self, self.th, self).exec()
+
+    def open_profiles(self):
+        ProfileDialog(self, self.th, self).exec()
 
     def apply_preset(self, settings):
-        """Apply a preset - set the sliders and send to the device"""
-        mapping = [('sp','sl_sp','SP',1),('ru','sl_ru','RU',1),('rd','sl_rd','RD',1),
-                   ('tmax','sl_tmax','TMAX',0),('kp','sl_kp','KP',1),('ki','sl_ki','KI',2),
-                   ('kd','sl_kd','KD',2),('off','sl_off','OFFSET',1),('fan','sl_fan','FAN',0)]
-        for key, attr, cmd, dec in mapping:
+        for key, attr, cmd, dec in (
+                ('sp', 'sl_sp', 'SP', 1), ('ru', 'sl_ru', 'RU', 1),
+                ('rd', 'sl_rd', 'RD', 1), ('tmax', 'sl_tmax', 'TMAX', 0),
+                ('off', 'sl_off', 'OFFSET', 1), ('fan', 'sl_fan', 'FAN', 0)):
             if key in settings and hasattr(self, attr):
                 val = settings[key]
                 try:
-                    getattr(self, attr).set(val, silent=True)
+                    getattr(self, attr).set(val)
                     if self.connected:
                         self.send(f"{cmd}:{val:.{dec}f}")
                 except Exception as e:
                     print(f"apply preset {key}: {e}")
-        # Update the fan state according to fan
-        if 'fan' in settings and hasattr(self, 'btn_fan'):
-            fv = settings['fan']
-            self.fan_on = (fv > 0)
-            if fv > 0:
-                self.btn_fan.config(text="● ON", fg=C['green'], highlightbackground=C['green'])
-            else:
-                self.btn_fan.config(text="○ OFF", fg=C['dim2'], highlightbackground=C['dim'])
+        if 'fan' in settings and hasattr(self, 'sw_fan'):
+            self.fan_on = settings['fan'] > 0
+            self.sw_fan.setCheckedSilently(self.fan_on)
 
-    # ────────────────────────────────────────────────────
-    #  CONNECTION TAB
-    # ────────────────────────────────────────────────────
-    def build_conn(self, parent):
-        wrap = tk.Frame(parent, bg=C['bg'])
-        wrap.pack(fill='both', expand=True, padx=24, pady=24)
-
-        card = tk.Frame(wrap, bg=C['panel'])
-        card.pack(fill='x', pady=(0, 16))
-        tk.Frame(card, bg=C['blue'], height=3).pack(fill='x')
-        inner = tk.Frame(card, bg=C['panel'])
-        inner.pack(fill='x', padx=20, pady=16)
-
-        tk.Label(inner, text="SERIAL CONNECTION", bg=C['panel'], fg=C['text'],
-                 font=F(12, 1)).pack(anchor='w', pady=(0, 12))
-
-        tk.Label(inner, text="Available ports:", bg=C['panel'], fg=C['dim'],
-                 font=F(10)).pack(anchor='w')
-
-        lf = tk.Frame(inner, bg=C['panel'])
-        lf.pack(fill='x', pady=8)
-        sb = tk.Scrollbar(lf)
-        sb.pack(side='right', fill='y')
-        self.conn_list = tk.Listbox(lf, bg=C['bg2'], fg=C['text'],
-                                    font=F(10), height=6,
-                                    selectbackground=C['blue'], borderwidth=0,
-                                    highlightthickness=1, highlightbackground=C['border'],
-                                    yscrollcommand=sb.set, activestyle='none')
-        self.conn_list.pack(side='left', fill='both', expand=True)
-        sb.config(command=self.conn_list.yview)
-
-        br = tk.Frame(inner, bg=C['panel'])
-        br.pack(fill='x', pady=(8, 0))
-        mk_btn(br, "REFRESH", self.refresh_ports, C['cyan']).pack(side='left', padx=(0, 8))
-        self.conn_btn = mk_btn(br, "CONNECT", self.conn_from_tab, C['green'])
-        self.conn_btn.pack(side='left', padx=(0, 8))
-        mk_btn_outline(br, "DISCONNECT", self.disconnect, C['red']).pack(side='left')
-
-        # Info
-        info = tk.Frame(wrap, bg=C['panel'])
-        info.pack(fill='x')
-        tk.Frame(info, bg=C['dim2'], height=3).pack(fill='x')
-        ii = tk.Frame(info, bg=C['panel'])
-        ii.pack(fill='x', padx=20, pady=16)
-        tk.Label(ii, text="INSTRUCTIONS", bg=C['panel'], fg=C['text'],
-                 font=F(11, 1)).pack(anchor='w', pady=(0, 8))
-        for line in [
-            "1. Connect ItsyBitsy (firmware v19 PC MODE) via USB",
-            "2. Select COM port from the list and click CONNECT",
-            "3. Sliders sync automatically with the device",
-            "4. Set parameters and click START",
-            "5. Chart shows live data, samples are logged to CSV",
-        ]:
-            tk.Label(ii, text=line, bg=C['panel'], fg=C['dim'],
-                     font=F(9), anchor='w').pack(anchor='w', pady=1)
-
-        # ── INTERFACE: text size ────────────────────────────────────────
-        # Windows DPI scaling is a decent first guess and a bad final answer:
-        # on a 150% display it made every label 1.5x, which on this layout is
-        # simply too big. So the auto value is only the DEFAULT now, and this
-        # row overrides it. Takes effect immediately - see set_ui_scale().
-        ui = tk.Frame(wrap, bg=C['panel'])
-        ui.pack(fill='x', pady=(0, 16))
-        tk.Frame(ui, bg=C['gold'], height=SC(3)).pack(fill='x')
-        uii = tk.Frame(ui, bg=C['panel'])
-        uii.pack(fill='x', padx=SC(20), pady=SC(16))
-        tk.Label(uii, text="INTERFACE", bg=C['panel'], fg=C['text'],
-                 font=F(11, 1)).pack(anchor='w', pady=(0, SC(8)))
-        row = tk.Frame(uii, bg=C['panel'])
-        row.pack(anchor='w')
-        tk.Label(row, text="TEXT SIZE", bg=C['panel'], fg=C['dim'],
-                 font=F(9, 1)).pack(side='left', padx=(0, SC(12)))
-        self.scale_btns = []
-        for label, val in (("AUTO", None), ("75%", 0.75), ("85%", 0.85),
-                           ("100%", 1.0), ("115%", 1.15), ("130%", 1.30),
-                           ("150%", 1.50)):
-            b = tk.Button(row, text=label, font=F(9, 1), relief='flat',
-                          cursor='hand2', bd=0, padx=SC(11), pady=SC(5),
-                          bg=C['bg2'], fg=C['dim'],
-                          highlightthickness=1, highlightbackground=C['border2'],
-                          activebackground=C['panel3'],
-                          command=lambda v=val: self._set_ui_scale(v))
-            b.pack(side='left', padx=(0, SC(4)))
-            self.scale_btns.append((val, b))
-        self.scale_note = tk.Label(uii, text="", bg=C['panel'], fg=C['dim2'],
-                                   font=F(8), anchor='w')
-        self.scale_note.pack(anchor='w', pady=(SC(8), 0))
-        pct = int(round(FS * 100))
-        src = "auto (display DPI)" if self._load_ui_scale() is None else "manual"
-        self.scale_note.config(
-            text=f"Text at {pct}% - {src}. Spacing re-measures on restart.")
-        self._refresh_scale_buttons()
-
-        self.refresh_ports()
-
+    # ════════════════════════════════════════════════════════════════════
+    #  PORTS
+    # ════════════════════════════════════════════════════════════════════
     def refresh_ports(self):
-        self.conn_list.delete(0, 'end')
+        self.conn_list.clear()
         self._ports = list(serial.tools.list_ports.comports())
         for p in self._ports:
-            self.conn_list.insert('end', f"  {p.device}   {p.description or '?'}")
+            it = QListWidgetItem(f"{p.device}     {p.description or '?'}")
+            it.setIcon(icons.icon('link', self.th.px(18),
+                                  self.th.solid('label2', 'card')))
+            self.conn_list.addItem(it)
         if self._ports:
-            self.conn_list.selection_set(0)
+            self.conn_list.setCurrentRow(0)
 
     def conn_from_tab(self):
-        s = self.conn_list.curselection()
-        if s and self._ports:
-            port = self._ports[s[0]].device
-            self.connect(port)
-
-    # ────────────────────────────────────────────────────
-    #  ARCHIVE TAB
-    # ────────────────────────────────────────────────────
-    def build_arch(self, parent):
-        wrap = tk.Frame(parent, bg=C['bg'])
-        wrap.pack(fill='both', expand=True, padx=16, pady=16)
-
-        hd = tk.Frame(wrap, bg=C['bg'])
-        hd.pack(fill='x', pady=(0, 6))
-        tk.Label(hd, text="CYCLE ARCHIVE", bg=C['bg'], fg=C['text'],
-                 font=F(12, 1)).pack(side='left')
-        tk.Label(hd, text="  tick cycles on the left, pick curves and X axis below",
-                 bg=C['bg'], fg=C['dim2'], font=F(8)).pack(side='left', padx=(8, 0))
-        mk_btn(hd, "REFRESH", self.refresh_arch, C['cyan']).pack(side='right')
-
-        # ── MEASUREMENT DATA FOLDER ─────────────────────────────────────
-        # Shown here, because this is the place where the user browses the
-        # saved measurements - the natural place to see and change where
-        # they actually land.
-        dd = tk.Frame(wrap, bg=C['bg2'])
-        dd.pack(fill='x', pady=(0, 10))
-        tk.Frame(dd, bg=C['green'], width=SC(4)).pack(side='left', fill='y')
-        tk.Label(dd, text="DATA:", bg=C['bg2'], fg=C['dim'],
-                 font=F(9, 1)).pack(side='left', padx=(10, 6), pady=6)
-        self.data_dir_lbl = tk.Label(dd, text="", bg=C['bg2'], fg=C['text'],
-                                     font=F(9), anchor='w')
-        self.data_dir_lbl.pack(side='left', fill='x', expand=True, pady=6)
-        mk_btn_outline(dd, "📂 OPEN", self.open_log_folder, C['dim']).pack(
-            side='right', padx=(4, 8), pady=4)
-        mk_btn_outline(dd, "＋ NEW", self.create_data_dir, C['green']).pack(
-            side='right', padx=4, pady=4)
-        mk_btn_outline(dd, "CHANGE…", self.choose_data_dir, C['cyan']).pack(
-            side='right', padx=4, pady=4)
-        self._update_data_dir_label()
-        self._bind_tooltip(self.data_dir_lbl, str(self.log_dir))
-
-        body = tk.Frame(wrap, bg=C['bg'])
-        body.pack(fill='both', expand=True)
-
-        # Cycle list with checkboxes (for comparison)
-        lf = tk.Frame(body, bg=C['panel'], width=SC(340))
-        lf.pack(side='left', fill='y', padx=(0, 12))
-        lf.pack_propagate(False)
-        tk.Frame(lf, bg=C['purple'], height=3).pack(fill='x')
-        lhd = tk.Frame(lf, bg=C['panel'])
-        lhd.pack(fill='x', padx=12, pady=8)
-        tk.Label(lhd, text="SAVED CYCLES", bg=C['panel'], fg=C['dim'],
-                 font=F(10, 1)).pack(side='left')
-        mk_btn_outline(lhd, "CLEAR", self._arch_clear_sel, C['dim']).pack(side='right')
-
-        # Scrollable list of checkboxes
-        list_wrap = tk.Frame(lf, bg=C['bg2'])
-        list_wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
-        asb = tk.Scrollbar(list_wrap)
-        asb.pack(side='right', fill='y')
-        self.arch_canvas = tk.Canvas(list_wrap, bg=C['bg2'], highlightthickness=0,
-                                    yscrollcommand=asb.set)
-        self.arch_canvas.pack(side='left', fill='both', expand=True)
-        asb.config(command=self.arch_canvas.yview)
-        self.arch_items = tk.Frame(self.arch_canvas, bg=C['bg2'])
-        self._arch_win = self.arch_canvas.create_window((0, 0), window=self.arch_items, anchor='nw')
-        self.arch_items.bind('<Configure>',
-            lambda e: self.arch_canvas.config(scrollregion=self.arch_canvas.bbox('all')))
-        # KEY POINT: the inner window must have the canvas width, otherwise
-        # the rows do not stretch and the ✕ button (side='right') falls out of view
-        self.arch_canvas.bind('<Configure>',
-            lambda e: self.arch_canvas.itemconfig(self._arch_win, width=e.width))
-        self.arch_canvas.bind('<Enter>', lambda e: self.arch_canvas.bind_all(
-            '<MouseWheel>', lambda ev: self.arch_canvas.yview_scroll(int(-ev.delta/120), 'units')))
-        self.arch_canvas.bind('<Leave>', lambda e: self.arch_canvas.unbind_all('<MouseWheel>'))
-
-        self.arch_vars = {}   # {path: BooleanVar}
-
-        # Chart
-        cf = tk.Frame(body, bg=C['panel'])
-        cf.pack(side='left', fill='both', expand=True)
-        tk.Frame(cf, bg=C['border2'], height=3).pack(fill='x')
-        # THE PACKING ORDER MATTERS. The figure has its OWN requested size
-        # (figsize x dpi = approx. 880x500 px). When the canvas is packed first
-        # with expand=True, pack gives it that requested size, and the rows
-        # packed AFTER it get whatever is left - which on a shorter window is
-        # exactly 1 pixel. Symptom: the "X AXIS" and "CURVES" bars existed but
-        # were 1x1 in size and invisible (found by a geometry test at
-        # 1600x900 and 1366x768). That is why all control rows are packed
-        # FIRST, from the bottom (side='bottom'), and the canvas gets the rest.
-        self.fig_a = Figure(figsize=(8, 4.5), facecolor=C['panel'], dpi=110)
-        # Edge to edge, like the live chart: the scale is drawn inside, so the
-        # only margin left is the sliver the labels need.
-        self.ax_a = self.fig_a.add_axes([0.012, 0.02, 0.983, 0.965])
-        self.ax_a.set_facecolor(C['panel'])
-
-        # Run settings panel - the bottom row
-        self.arch_settings = tk.Frame(cf, bg=C['bg2'])
-        self.arch_settings.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
-        self.arch_settings_lbl = tk.Label(self.arch_settings, text="",
-                                         bg=C['bg2'], fg=C['dim'], font=F(9),
-                                         anchor='w', justify='left')
-        self.arch_settings_lbl.pack(fill='x', padx=10, pady=6)
-
-        crow = tk.Frame(cf, bg=C['panel'])
-        crow.pack(side='bottom', fill='x', padx=8, pady=(0, 6))
-        # X AXIS has its OWN row - sharing it with the export buttons made
-        # the last options ("PC clock", "ramp start", "rel. temperature")
-        # not fit into the width at larger fonts, so they got size 1x1,
-        # i.e. they vanished.
-        xrow = tk.Frame(cf, bg=C['panel'])
-        xrow.pack(side='bottom', fill='x', padx=8, pady=(0, 4))
-        atb = tk.Frame(cf, bg=C['panel'])
-        atb.pack(side='bottom', fill='x', padx=8, pady=(2, 6))
-        # The canvas gets ALL the remaining space
-        self.cv_a = FigureCanvasTkAgg(self.fig_a, master=cf)
-        self.cv_a.get_tk_widget().pack(fill='both', expand=True, padx=SC(2),
-                                       pady=(SC(4), SC(2)))
-        self.cv_a.draw()
-        # Same three gestures as the live chart, and no matplotlib toolbar -
-        # see ChartNav. The archive chart has one axes, so share_x is moot.
-        self.nav_a = ChartNav(self.cv_a, [self.ax_a],
-                              on_change=self._redraw_arch)
-
-        # Export buttons - in the 'atb' row created above
-        mk_btn_outline(atb, "⤓ CSV", self.export_arch_csv, C['green']).pack(
-            side='right', padx=(4, 0))
-        mk_btn_outline(atb, "⤓ PNG", self.save_arch_chart, C['cyan']).pack(
-            side='right', padx=(4, 0))
-        mk_btn_outline(atb, "📄 PDF", self.export_arch_pdf, C['orange']).pack(
-            side='right', padx=(4, 0))
-        mk_btn_outline(atb, "📊 STATS", self.show_arch_stats, C['purple']).pack(
-            side='right', padx=(4, 0))
-        mk_btn_outline(atb, "📁", self.open_log_folder, C['dim']).pack(
-            side='right', padx=(4, 0))
-        # ── X AXIS MODE ─────────────────────────────────────────────────
-        # arch_align stays for compatibility with the old code (the export
-        # uses it, among others), but it is now driven by the mode below.
-        self.arch_align = tk.BooleanVar(value=True)
-        self.arch_xmode = tk.StringVar(value='t0')
-        tk.Label(xrow, text="X AXIS:", bg=C['panel'], fg=C['dim'],
-                 font=F(8, 1)).pack(side='left', padx=(0, 6))
-        for val, txt in (('t0', 'from start'), ('abs', 'file time'),
-                         ('pc', 'PC clock'), ('ramp', 'ramp start'),
-                         ('temp', 'rel. temperature')):
-            tk.Radiobutton(xrow, text=txt, value=val, variable=self.arch_xmode,
-                           command=self._on_xmode_change, bg=C['panel'], fg=C['dim'],
-                           selectcolor=C['bg2'], activebackground=C['panel'],
-                           activeforeground=C['text'], font=F(8),
-                           bd=0, highlightthickness=0).pack(side='left')
-        # Reference temperature for the "rel. temperature" mode
-        self.arch_treflbl = tk.Label(xrow, text="T=", bg=C['panel'], fg=C['dim'],
-                                     font=F(8))
-        self.arch_treflbl.pack(side='left', padx=(8, 2))
-        self.arch_tref = tk.Entry(xrow, width=6, bg=C['bg2'], fg=C['text'],
-                                  font=F(9), relief='flat',
-                                  insertbackground=C['text'])
-        self.arch_tref.insert(0, "40.0")
-        self.arch_tref.pack(side='left')
-        self.arch_tref.bind('<Return>', lambda e: self._redraw_arch())
-        self.arch_tref.bind('<FocusOut>', lambda e: self._redraw_arch())
-
-        # ── WHICH CURVES TO DRAW ────────────────────────────────────────
-        tk.Label(crow, text="CURVES:", bg=C['panel'], fg=C['dim'],
-                 font=F(8, 1)).pack(side='left', padx=(0, 6))
-        self.arch_show = {}
-        for key, txt, dflt in (('temp', 'temperature', True),
-                               ('sa', 'setpoint', True),
-                               ('st', 'target', True),
-                               ('t2', 'temp 2', False),
-                               ('pwm', 'PWM', False)):
-            v = tk.BooleanVar(value=dflt)
-            self.arch_show[key] = v
-            tk.Checkbutton(crow, text=txt, variable=v, command=self._redraw_arch,
-                           bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
-                           activebackground=C['panel'], activeforeground=C['text'],
-                           font=F(8), bd=0, highlightthickness=0
-                           ).pack(side='left', padx=(0, 4))
-        mk_btn_outline(crow, "SELECT ALL", self._arch_select_all, C['dim']
-                       ).pack(side='right')
-        # Comparing runs AGAINST EACH OTHER: instead of temperatures we draw
-        # the DIFFERENCE of every run relative to the first one ticked
-        # (interpolated onto a common time axis). Differences are far easier
-        # to see than two nearly identical curves overlaid on each other.
-        self.arch_delta = tk.BooleanVar(value=False)
-        tk.Checkbutton(xrow, text="\u0394 1st", variable=self.arch_delta,
-                       command=self._redraw_arch, bg=C['panel'], fg=C['yellow'],
-                       selectcolor=C['bg2'], activebackground=C['panel'],
-                       activeforeground=C['text'], font=F(8),
-                       bd=0, highlightthickness=0).pack(side='right', padx=(0, 10))
-
-        # (run settings panel created above, as the bottom row)
-
-        self.refresh_arch()
-        # Draw an empty chart right away - it initializes the canvas and toolbar
-        self._redraw_arch()
-
-    def build_series(self, parent):
-        """SERIES tab - a list of tests (SP/RATE/hold) executed automatically
-        one after another, each auto-archived (without asking for a name) -
-        the files land in PeltierLogi ready for analysis."""
-        wrap = tk.Frame(parent, bg=C['bg'])
-        wrap.pack(fill='both', expand=True, padx=16, pady=16)
-
-        tk.Label(wrap, text="MEASUREMENT SERIES", bg=C['bg'], fg=C['text'],
-                 font=F(12, 1)).pack(anchor='w')
-        tk.Label(wrap,
-                 text="Add tests (SP/RATE/hold time) - the app runs them one by one, "
-                      "returns to base between tests and archives every result itself.",
-                 bg=C['bg'], fg=C['dim2'], font=F(8), justify='left',
-                 wraplength=SC(760)
-                 ).pack(anchor='w', pady=(2, SC(12)))
-
-        body = tk.Frame(wrap, bg=C['bg'])
-        body.pack(fill='both', expand=True)
-
-        # ── Left column: adding a step + base settings ───────────────
-        # WIDTH: it was hard-coded as 280 PIXELS together with
-        # pack_propagate(False), so the column NEVER grew to fit the content.
-        # A measurement with real font metrics showed that at FS=1.0 the widest
-        # caption is 342 px (and with margins 378 is needed) - so the text was
-        # clipped ALREADY WITHOUT DPI scaling, and at FS=1.5 not even the field
-        # labels themselves fit ("HOLD AFTER REACHED (s)" = 288 px).
-        # Now: the width is scaled by SC(), with headroom, and long descriptions
-        # have wraplength (they wrap instead of stretching/overflowing).
-        SER_W = SC(320)
-        SER_PAD = SC(14)
-        self._ser_wrap = SER_W - 2 * SER_PAD - SC(6)
-        left = tk.Frame(body, bg=C['panel'], width=SER_W)
-        left.pack(side='left', fill='y', padx=(0, SC(12)))
-        left.pack_propagate(False)
-        tk.Frame(left, bg=C['cyan'], height=SC(3)).pack(fill='x')
-        # The column content is SCROLLABLE: at larger fonts (FS=1.5) it is
-        # taller than the window and the lowest items (QUICK FILL, the
-        # quickfill button) were physically out of reach - cut off by the screen.
-        lin = make_scrollable(left, C['panel'], padx=SER_PAD, pady=SC(12))
-
-        def _field(label, default):
-            tk.Label(lin, text=label, bg=C['panel'], fg=C['dim'],
-                     font=F(9)).pack(anchor='w', pady=(8, 2))
-            e = tk.Entry(lin, bg=C['bg2'], fg=C['text'], font=F(11, 1),
-                         relief='flat', insertbackground=C['text'])
-            e.insert(0, default)
-            e.pack(fill='x', ipady=4)
-            return e
-
-        self.series_e_sp = _field("SP (°C)", "50.0")
-        self.series_e_rate = _field("HEAT RATE (°C/min)", "30.0")
-        self.series_e_hold = _field("HOLD AFTER REACHED (s)", "60")
-
-        mk_btn(lin, "+ ADD TEST", self._on_series_add, C['cyan']
-               ).pack(fill='x', pady=(12, 4))
-        mk_btn_outline(lin, "DELETE SELECTED", self._on_series_remove, C['dim']
-                       ).pack(fill='x', pady=(0, 4))
-        mk_btn_outline(lin, "CLEAR LIST", self._on_series_clear, C['dim']
-                       ).pack(fill='x')
-
-        tk.Frame(lin, bg=C['border2'], height=1).pack(fill='x', pady=12)
-        tk.Label(lin, text="BASE BETWEEN TESTS (°C)", bg=C['panel'], fg=C['dim'],
-                 font=F(9)).pack(anchor='w', pady=(0, 2))
-        self.series_e_base = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
-                                       font=F(11, 1), relief='flat',
-                                       insertbackground=C['text'])
-        self.series_e_base.insert(0, f"{self.series_base_sp:.1f}")
-        self.series_e_base.bind('<FocusOut>', self._on_series_base_change)
-        self.series_e_base.bind('<Return>', self._on_series_base_change)
-        self.series_e_base.pack(fill='x', ipady=4)
-
-        tk.Label(lin, text="RETURN RATE (°C/min)", bg=C['panel'], fg=C['dim'],
-                 font=F(9)).pack(anchor='w', pady=(10, 2))
-        self.series_e_return_rate = tk.Entry(lin, bg=C['bg2'], fg=C['text'],
-                                              font=F(11, 1), relief='flat',
-                                              insertbackground=C['text'])
-        # CHANGED after analysing log 20260827 145616 (step/"hump" at the start
-        # of every return): the default 25.0 was SLOWER than the natural
-        # (passive, with the fans at 100%) cooling of the object right after
-        # a hot hold - the data shows a real temp drop right after the
-        # start on the order of tens of C/min, much faster than the
-        # commanded 25. Result: the ramp (spA) immediately fell BEHIND
-        # THE REAL drop (temp<spA), the PID read that as
-        # "too cold too early" and added heat in order to BRAKE the cooling to
-        # the commanded rate - hence the visible rebound "hump" (temp briefly
-        # RISES) right after the start of every return. The firmware already has
-        # exactly the same pattern ("full retreat speed") for other returns
-        # to base (see rU=rD=RAMP_MAX in the .ino) - here we do the same: a very
-        # large value, which the firmware safely clamps anyway to its own
-        # RAMP_MAX (constrain(fv,RAMP_MIN,RAMP_MAX) on the RD command) - so the
-        # ramp is NEVER slower than the natural cooling and there is nothing
-        # to "brake" with extra heating. Still editable by hand in the field
-        # (e.g. if someone DELIBERATELY wants a slower, controlled return).
-        self.series_e_return_rate.insert(0, "80.0")
-        self.series_e_return_rate.pack(fill='x', ipady=4)
-        tk.Label(lin,
-                 text="Independent of COOL RATE on CONTROL. Max by default - "
-                      "a slower return gives a 'hump' at the start.",
-                 bg=C['panel'], fg=C['dim2'], font=F(8), justify='left',
-                 wraplength=self._ser_wrap
-                 ).pack(anchor='w', fill='x', pady=(3, 0))
-
-        # The descent as a FULL-FLEDGED TEST, not just a trip back to the start.
-        # WHY: the whole power model (FF_GAIN/FF_TEMP_GAIN in the firmware) is
-        # calibrated from HEATING data - for cooling we have no
-        # reliable calibration, because so far the descents were run at a fixed,
-        # fast return rate (and earlier were not archived at all).
-        # Ticking this box makes the descent after every test run at
-        # THE SAME rate as the test - so an R10..R70 series gives a full set of
-        # 7 heating runs AND 7 cooling runs at different rates,
-        # exactly what is needed to calibrate the cooling branch
-        # with the same method as the heating one.
-        # MODE: "test series" (return to base after every test - for
-        # comparing single ramps) or "program" (the steps run one after
-        # another from the point where the previous one ended - for defining
-        # profiles such as: go to 50, hold, drop to 30, hold).
-        # Every step is saved as a SEPARATE, normal measurement in the
-        # archive anyway, so it is compared exactly like a manual one.
-        self.series_mode = tk.StringVar(value='seria')
-        tk.Label(lin, text="MODE", bg=C['panel'], fg=C['dim'],
-                 font=F(9)).pack(anchor='w', pady=(SC(10), 2))
-        for val, txt in (('seria', 'test series (return to base)'),
-                         ('program', 'program (step by step)')):
-            tk.Radiobutton(lin, text=txt, value=val, variable=self.series_mode,
-                           bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
-                           activebackground=C['panel'], activeforeground=C['text'],
-                           font=F(8), bd=0, highlightthickness=0,
-                           anchor='w', wraplength=self._ser_wrap,
-                           justify='left').pack(anchor='w', fill='x')
-        pf = tk.Frame(lin, bg=C['panel'])
-        pf.pack(fill='x', pady=(SC(6), 0))
-        mk_btn_outline(pf, "SAVE PROGRAM", self._series_save_prog, C['dim']).pack(
-            side='left', fill='x', expand=True, padx=(0, 2))
-        mk_btn_outline(pf, "LOAD", self._series_load_prog, C['dim']).pack(
-            side='left', fill='x', expand=True, padx=(2, 0))
-
-        self.series_cool_as_test = tk.BooleanVar(value=False)
-        tk.Checkbutton(lin, text="descent also as TEST",
-                       variable=self.series_cool_as_test,
-                       bg=C['panel'], fg=C['dim'], selectcolor=C['bg2'],
-                       activebackground=C['panel'], activeforeground=C['text'],
-                       font=F(9), bd=0, highlightthickness=0,
-                       anchor='w').pack(anchor='w', fill='x', pady=(SC(10), 0))
-        tk.Label(lin,
-                 text="Collects data for cooling calibration. Otherwise the descent "
-                      "runs at max rate (return only).",
-                 bg=C['panel'], fg=C['dim2'], font=F(8), justify='left',
-                 wraplength=self._ser_wrap
-                 ).pack(anchor='w', fill='x', pady=(3, 0))
-
-        tk.Label(lin, text="QUICK FILL", bg=C['panel'], fg=C['dim'],
-                 font=F(9)).pack(anchor='w', pady=(16, 2))
-        # Shorter caption - the full one ("SP from field x ramps 10/20/30/40/50/60/70")
-        # did not fit in the column at larger fonts, and a button does not
-        # wrap text, so the ends were cut off.
-        mk_btn_outline(lin, "SP × ramps 10…70",
-                       self._on_series_quickfill, C['purple']).pack(fill='x')
-        tk.Label(lin, text="adds 7 tests: 10/20/30/40/50/60/70 °C/min",
-                 bg=C['panel'], fg=C['dim2'], font=F(8), justify='left',
-                 wraplength=self._ser_wrap).pack(anchor='w', fill='x', pady=(3, 0))
-
-        # ── Right column: list + status + start/stop ────────────
-        right = tk.Frame(body, bg=C['panel'])
-        right.pack(side='left', fill='both', expand=True)
-        tk.Frame(right, bg=C['border2'], height=3).pack(fill='x')
-
-        rhd = tk.Frame(right, bg=C['panel'])
-        rhd.pack(fill='x', padx=14, pady=(10, 4))
-        tk.Label(rhd, text="TEST LIST", bg=C['panel'], fg=C['dim'],
-                 font=F(10, 1)).pack(side='left')
-
-        self.series_listbox = tk.Listbox(right, bg=C['bg2'], fg=C['text'],
-                                          font=F(10), relief='flat',
-                                          selectbackground=C['cyan'], height=14,
-                                          highlightthickness=0, bd=0)
-        self.series_listbox.pack(fill='both', expand=True, padx=14, pady=(0, 8))
-
-        stf = tk.Frame(right, bg=C['panel'])
-        stf.pack(fill='x', padx=14, pady=(0, 10))
-        self.series_status_lbl = tk.Label(stf, text="Series inactive",
-                                           bg=C['bg2'], fg=C['dim'], font=F(9),
-                                           anchor='w', justify='left')
-        self.series_status_lbl.pack(fill='x', ipady=8, padx=2)
-
-        btnf = tk.Frame(right, bg=C['panel'])
-        btnf.pack(fill='x', padx=14, pady=(0, 14))
-        self.btn_series_run = mk_btn(btnf, "▶ START SERIES", self._on_series_toggle, C['green'])
-        self.btn_series_run.pack(fill='x')
-
-        self._series_refresh_list()
-
-    def _on_series_add(self):
-        try:
-            sp = float(self.series_e_sp.get().replace(',', '.'))
-            rate = float(self.series_e_rate.get().replace(',', '.'))
-            hold = float(self.series_e_hold.get().replace(',', '.'))
-        except ValueError:
-            messagebox.showwarning("Invalid value", "SP/RATE/hold must be numbers.")
-            return
-        self.series_add_step(sp, rate, hold)
-
-    def _on_series_remove(self):
-        sel = self.series_listbox.curselection()
-        if sel:
-            self.series_remove_step(sel[0])
-
-    def _on_series_clear(self):
-        self.series_steps = []
-        self._series_refresh_list()
-
-    def _on_series_base_change(self, evt=None):
-        try:
-            self.series_base_sp = float(self.series_e_base.get().replace(',', '.'))
-        except ValueError:
-            self.series_e_base.delete(0, 'end')
-            self.series_e_base.insert(0, f"{self.series_base_sp:.1f}")
-
-    def _on_series_quickfill(self):
-        try:
-            sp = float(self.series_e_sp.get().replace(',', '.'))
-        except ValueError:
-            messagebox.showwarning("Invalid value", "Enter SP first.")
-            return
-        for rate in (10, 20, 30, 40, 50, 60, 70):
-            self.series_add_step(sp, rate, 60)
-
-    def _on_series_toggle(self):
-        if self.series_running:
-            self._series_abort("manual STOP SERIES")
-            self.send("STOP")
-            self._update_run_button(False)
-        else:
-            self.series_start()
-
-    def _cycle_display_name(self, path):
-        """Readable cycle name: strips the c_/cykl_ prefix and turns _ into spaces"""
-        from pathlib import Path as _P
-        s = _P(path).stem
-        if s.startswith('cykl_'): s = s[5:]
-        elif s.startswith('c_'): s = s[2:]
-        return s.replace('_', ' ')
-
-    def _bind_tooltip(self, widget, text):
-        """Simple tooltip showing the full text on hover"""
-        tip = {'win': None}
-        def show(e):
-            if tip['win']: return
-            tw = tk.Toplevel(widget)
-            tw.wm_overrideredirect(True)
-            tw.wm_geometry(f"+{e.x_root+10}+{e.y_root+10}")
-            tk.Label(tw, text=text, bg='#1a1c1f', fg='#e8e8e8',
-                     font=F(8), padx=6, pady=3,
-                     relief='solid', bd=1).pack()
-            tip['win'] = tw
-        def hide(e):
-            if tip['win']:
-                tip['win'].destroy(); tip['win'] = None
-        widget.bind('<Enter>', show)
-        widget.bind('<Leave>', hide)
-
-    def refresh_arch(self):
-        # Clear the checkbox list
-        for w in self.arch_items.winfo_children():
-            w.destroy()
-        self.arch_vars = {}
-        files = sorted([f for f in self.log_dir.glob("*.csv") if (f.name.startswith("cykl_") or f.name.startswith("c_")) and not f.name.startswith("_tmp")],
-                       key=lambda f: f.stat().st_mtime, reverse=True)
-        # Color palette for the comparison
-        self._arch_colors = [C['blue'], C['orange'], C['green'], C['red'],
-                            C['cyan'], C['purple'], C['yellow'], '#ff8fab']
-        if not files:
-            tk.Label(self.arch_items, text="No saved cycles yet.\nRun a cycle and give it a name.",
-                     bg=C['bg2'], fg=C['dim2'], font=F(9), justify='left').pack(
-                     anchor='w', padx=12, pady=12)
-            return
-
-        # Grouping by date (file modification day)
-        from datetime import datetime as _dt
-        import time as _time
-        groups = {}
-        for f in files:
-            day = _dt.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d")
-            groups.setdefault(day, []).append(f)
-
-        today = _dt.now().strftime("%Y-%m-%d")
-        i = 0
-        for day, day_files in groups.items():
-            # Group header (date)
-            day_label = "Today" if day == today else day
-            hdr = tk.Frame(self.arch_items, bg=C['panel'])
-            hdr.pack(fill='x', pady=(6, 1))
-            tk.Label(hdr, text=f"▸ {day_label}  ({len(day_files)})", bg=C['panel'],
-                     fg=C['cyan'], font=F(8, 1), anchor='w').pack(
-                     side='left', padx=8, pady=3)
-            # Files in the group
-            for f in day_files:
-                row = tk.Frame(self.arch_items, bg=C['bg2'])
-                row.pack(fill='x', pady=1)
-                var = tk.BooleanVar(value=False)
-                self.arch_vars[str(f)] = var
-                col = self._arch_colors[i % len(self._arch_colors)]
-                i += 1
-                # PACK ORDER: the bin FIRST (side=right) = always visible,
-                # then the dot (left), and finally the checkbox fills the middle.
-                # This way a long name does not cover the bin.
-                delb = tk.Button(row, text="🗑", command=lambda p=f: self._delete_cycle(p),
-                                bg=C['bg2'], fg=C['red'], font=F(11, 1),
-                                relief='flat', cursor='hand2', bd=0, padx=10, pady=2,
-                                activebackground=C['red'], activeforeground='#fff')
-                delb.pack(side='right', padx=(2, 6))
-                dot = tk.Frame(row, bg=col, width=10, height=10)
-                dot.pack(side='left', padx=(8, 4))
-                dot.pack_propagate(False)
-                # Name shortened if too long (so it does not stretch the row)
-                full_name = self._cycle_display_name(f)
-                disp_name = full_name if len(full_name) <= 22 else full_name[:20] + "…"
-                cb = tk.Checkbutton(row, text=disp_name,
-                                   variable=var, command=self._redraw_arch,
-                                   bg=C['bg2'], fg=C['text'], selectcolor=C['panel'],
-                                   activebackground=C['bg2'], activeforeground=col,
-                                   font=F(9), bd=0, highlightthickness=0,
-                                   anchor='w')
-                # Full name in the tooltip (on hover)
-                if len(full_name) > 22:
-                    self._bind_tooltip(cb, full_name)
-                cb.pack(side='left', fill='x', expand=True)
-
-    def _delete_cycle(self, path):
-        """Delete a cycle file from the archive (with confirmation)"""
-        from pathlib import Path as _P
-        name = self._cycle_display_name(_P(path))
-        if messagebox.askyesno("Delete cycle",
-                f"Permanently delete this cycle?\n\n{name}\n\nThis cannot be undone."):
-            try:
-                _P(path).unlink()
-                self.refresh_arch()
-                self._redraw_arch()
-            except Exception as e:
-                messagebox.showerror("Delete error", str(e))
-
-    def _cycle_settings(self, path):
-        """Read the run settings from the CSV: target SP, ramps, PID. Returns a dict or None"""
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                rows = [_csv_row(r) for r in csv.DictReader(f)]
-        except Exception:
-            return None
-        # Find the first valid data row
-        valid = [r for r in rows if r.get('czas_s', '').replace('.','').replace('-','').isdigit()]
-        if not valid:
-            return None
-        s = {}
-        # Target setpoint - the most frequent setpoint_cel value (final target)
-        try:
-            sps = [float(r['setpoint_cel']) for r in valid if r.get('setpoint_cel')]
-            s['target'] = max(set(sps), key=sps.count) if sps else None
-        except: s['target'] = None
-        # PID - from the first row (constant over the run or from calibration)
-        try:
-            s['kp'] = float(valid[0].get('Kp', 0))
-            s['ki'] = float(valid[0].get('Ki', 0))
-            s['kd'] = float(valid[0].get('Kd', 0))
-        except: s['kp'] = s['ki'] = s['kd'] = None
-        # Estimate the ramp from the setpoint_aktywny slope at the beginning
-        try:
-            t0 = float(valid[0]['czas_s'])
-            sa0 = float(valid[0]['setpoint_aktywny'])
-            # find a point ~10s later
-            ramp = None
-            for r in valid:
-                tt = float(r['czas_s'])
-                if tt - t0 >= 5:
-                    sa = float(r['setpoint_aktywny'])
-                    dt_min = (tt - t0) / 60.0
-                    if dt_min > 0:
-                        ramp = abs(sa - sa0) / dt_min
-                    break
-            s['ramp'] = ramp
-        except: s['ramp'] = None
-        return s
-
-    def _arch_clear_sel(self):
-        """Deselect all cycles"""
-        for v in self.arch_vars.values():
-            v.set(False)
-        self._redraw_arch()
-
-    def _load_cycle_data(self, path):
-        """Load cycle data from the CSV (comment-tolerant). Returns (t,temp,spt,pwm) or None"""
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = [_csv_row(r) for r in csv.DictReader(f)]
-        except Exception:
-            return None
-        t, temp, spt, pwm = [], [], [], []
-        temp2 = []
-        sa_list = []
-        pc_raw = []
-        for r in data:
-            cz = r.get('czas_s', '')
-            if not cz or cz.startswith('#'):
-                continue
-            try:
-                tt = float(cz)
-                tm = float(r.get('temperatura_C', 'nan'))
-                sp = float(r.get('setpoint_cel', 'nan'))
-            except (ValueError, TypeError):
-                continue
-            t.append(tt); temp.append(tm); spt.append(sp)
-            # active setpoint (ramp) - separately for the chart
-            try:
-                sa_list.append(float(r.get('setpoint_aktywny', 'nan')))
-            except:
-                sa_list.append(None)
-            try:
-                pwm.append(float(r.get('PWM_%', r.get('PWM', 0))))
-            except:
-                pwm.append(0)
-            # temp2 - the second thermocouple (optional column)
-            try:
-                t2v = r.get('temperatura2_C', '')
-                temp2.append(float(t2v) if t2v else None)
-            except:
-                temp2.append(None)
-            # PC time (column added later - old files do not have it)
-            pc_raw.append(r.get('czas_pc', '') or '')
-        if not t:
-            return None
-        # Attach temp2 and the active setpoint as attributes (compatibly - we return 4)
-        self._last_temp2 = temp2
-        self._last_sa = sa_list
-        self._last_pc = self._pc_seconds(pc_raw, t, path)
-        return t, temp, spt, pwm
-
-    def _pc_seconds(self, pc_raw, t, path):
-        """Convert the czas_pc column into epoch seconds. For old files (without
-        that column) it rebuilds the time axis from the file modification date:
-        mtime is the moment of CLOSING, so start = mtime - run length."""
-        out = []
-        ok = False
-        for sraw in pc_raw:
-            v = None
-            if sraw:
-                try:
-                    dt = datetime.strptime(sraw[:23], "%Y-%m-%d %H:%M:%S.%f")
-                    v = dt.timestamp(); ok = True
-                except Exception:
-                    try:
-                        dt = datetime.strptime(sraw[:19], "%Y-%m-%d %H:%M:%S")
-                        v = dt.timestamp(); ok = True
-                    except Exception:
-                        v = None
-            out.append(v)
-        if ok:
-            # fill any gaps linearly relative to czas_s
-            base = next((i for i, v in enumerate(out) if v is not None), None)
-            if base is not None:
-                t0 = out[base] - t[base]
-                out = [v if v is not None else t0 + t[i] for i, v in enumerate(out)]
-            return out
-        # fallback: from the file mtime
-        try:
-            end = Path(path).stat().st_mtime
-            t0 = end - (t[-1] - t[0])
-            return [t0 + (x - t[0]) for x in t]
-        except Exception:
-            return [None] * len(t)
-
-    def _compute_stats(self, data):
-        """Compute the full run statistics. data=(t,temp,spt,pwm). Returns a dict."""
-        import statistics
-        t, temp, spt, pwm = data
-        st = {}
-        st['tmin'] = min(temp)
-        st['tmax'] = max(temp)
-        st['duration'] = t[-1] - t[0] if len(t) > 1 else 0
-        st['target'] = spt[-1] if spt else 0
-
-        # Average rise rate (start -> max)
-        idx_max = temp.index(st['tmax'])
-        rise_time = t[idx_max] - t[0] if idx_max > 0 else 0
-        st['avg_rise'] = (st['tmax'] - temp[0]) / (rise_time/60.0) if rise_time > 5 else 0
-
-        # Overshoot - how far temp exceeded the target (in the settled phase)
-        target = st['target']
-        st['overshoot'] = max(0, st['tmax'] - target) if target else 0
-
-        # Settling time - when temp entered and stayed within +/-1C of the target
-        st['settle_time'] = None
-        if target:
-            band = 1.0
-            for i, tm in enumerate(temp):
-                if abs(tm - target) <= band:
-                    # check whether it stayed in the band to the end (or for 80% of the rest)
-                    rest = temp[i:]
-                    in_band = sum(1 for x in rest if abs(x-target) <= band)
-                    if in_band >= len(rest)*0.8:
-                        st['settle_time'] = t[i] - t[0]
-                        break
-
-        # Steady-state error - mean deviation over the last 20% of samples
-        n = len(temp)
-        tail = temp[int(n*0.8):] if n > 5 else temp
-        if target and tail:
-            st['steady_error'] = statistics.mean(abs(x - target) for x in tail)
-        else:
-            st['steady_error'] = 0
-
-        # Max deviation from the setpoint (ramp) - how well it tracked
-        devs = [abs(temp[i] - spt[i]) for i in range(len(temp))]
-        st['max_dev'] = max(devs) if devs else 0
-
-        # Standard deviation of the noise - in the settled phase (last 20%)
-        # This is a measure of measurement quality (thermocouple noise)
-        if len(tail) > 2:
-            st['noise_std'] = statistics.stdev(tail)
-        else:
-            st['noise_std'] = 0
-
-        return st
-
-    def _on_xmode_change(self):
-        """X axis radiobutton -> sync the old arch_align and redraw."""
-        self.arch_align.set(self.arch_xmode.get() != 'abs')
-        self._redraw_arch()
-
-    def _arch_select_all(self):
-        """Select all cycles (and when all are already selected - deselect)."""
-        if not self.arch_vars:
-            return
-        target = not all(v.get() for v in self.arch_vars.values())
-        for v in self.arch_vars.values():
-            v.set(target)
-        self._redraw_arch()
-
-    def _arch_t_offset(self, t, temp, mode, tref):
-        """X axis offset for a single run, according to the selected mode."""
-        if mode == 'abs':
-            return 0.0
-        if mode == 'temp':
-            # Find the FIRST crossing of tref (with linear interpolation
-            # between samples) and take that moment as zero. This way
-            # runs with different starting temperatures overlay
-            # at exactly the same thermal point, not the same time point.
-            for i in range(1, len(temp)):
-                a, b = temp[i-1], temp[i]
-                if (a - tref) * (b - tref) <= 0 and a != b:
-                    f = (tref - a) / (b - a)
-                    return t[i-1] + f * (t[i] - t[i-1])
-                if a == tref:
-                    return t[i-1]
-            return t[0]      # tref not reached - align from the start
-        if mode == 'ramp':
-            # Zero = the moment the ramp REALLY starts. We detect it from
-            # the active setpoint (spA): while it stands still, we are pre-start.
-            # This aligns runs with a different "run-up" length before
-            # the actual ramp (e.g. when one started from a cold device).
-            sa = self._last_sa or []
-            for i in range(1, min(len(sa), len(t))):
-                if sa[i] is not None and sa[0] is not None and abs(sa[i]-sa[0]) > 0.05:
-                    return t[i]
-            # no spA (old file) - fallback: the first clear temp change
-            for i in range(1, len(temp)):
-                if abs(temp[i]-temp[0]) > 0.3:
-                    return t[i]
-            return t[0]
-        return t[0]          # 't0'
-    def _redraw_arch(self):
-        """Draw all selected runs (comparison)"""
-        selected = [(p, v) for p, v in self.arch_vars.items() if v.get()]
-        self.ax_a.clear()
-        # The second axis (PWM) is created on demand - we delete the old one on
-        # every redraw, otherwise more and more axes would pile up.
-        if getattr(self, '_ax_pwm', None) is not None:
-            try: self._ax_pwm.remove()
-            except Exception: pass
-            self._ax_pwm = None
-        self.ax_a.set_facecolor(C['panel'])
-
-        mode = self.arch_xmode.get() if hasattr(self, 'arch_xmode') else 't0'
-        show = {k: v.get() for k, v in getattr(self, 'arch_show', {}).items()} or \
-               {'temp': True, 'sa': True, 'st': True, 't2': False, 'pwm': False}
-        try:
-            tref = float(self.arch_tref.get().replace(',', '.'))
-        except Exception:
-            tref = 40.0
-        # The T= field only makes sense in "rel. to temperature" mode
-        if hasattr(self, 'arch_tref'):
-            st_ = 'normal' if mode == 'temp' else 'disabled'
-            try:
-                self.arch_tref.config(state=st_)
-                self.arch_treflbl.config(fg=C['cyan'] if mode == 'temp' else C['dim2'])
-            except Exception:
-                pass
-
-        if not selected:
-            self.ax_a.text(0.5, 0.5, "Select one or more runs on the left",
-                          ha='center', va='center', color=C['dim2'],
-                          fontsize=11, transform=self.ax_a.transAxes)
-            if hasattr(self, 'nav_a'): self.nav_a.restore()
-            self.cv_a.draw()
-            if hasattr(self, 'arch_settings_lbl'):
-                self.arch_settings_lbl.config(text="")
-            return
-
-        files = sorted([f for f in self.log_dir.glob("*.csv") if (f.name.startswith("cykl_") or f.name.startswith("c_")) and not f.name.startswith("_tmp")], reverse=True)
-        file_order = {str(f): i for i, f in enumerate(files)}
-
-        multi = len(selected) > 1
-
-        # ── Collect the data of everything selected, compute the offsets ──
-        series = []
-        for path, _ in selected:
-            d = self._load_cycle_data(path)
-            if not d: continue
-            t, temp, spt, pwm = d
-            series.append(dict(path=path, t=t, temp=temp, spt=spt, pwm=pwm,
-                               sa=list(self._last_sa or []),
-                               t2=list(self._last_temp2 or []),
-                               pc=list(self._last_pc or [])))
-        if not series:
-            if hasattr(self, 'nav_a'): self.nav_a.restore()
-            self.cv_a.draw()
-            return
-        # Order = the same as in the list on the left. Important for the
-        # "difference rel. to 1st" mode - the reference must be the trace the
-        # user sees first, not an arbitrary ordering of the selection dict.
-        series.sort(key=lambda z: file_order.get(z['path'], 10**6))
-
-        if mode == 'pc':
-            # Common axis = PC clock. We take zero from the EARLIEST
-            # run, so that the numbers on the axis stay small, while the
-            # labels still show the real time of day (formatter below).
-            starts = [s['pc'][0] for s in series if s['pc'] and s['pc'][0] is not None]
-            self._pc_zero = min(starts) if starts else 0.0
-            for s in series:
-                s['off'] = 0.0
-        else:
-            for s in series:
-                s['off'] = self._arch_t_offset(s['t'], s['temp'], mode, tref)
-
-        # Axis unit: seconds or minutes
-        spans = []
-        for s in series:
-            if mode == 'pc' and s['pc'] and s['pc'][0] is not None:
-                spans.append(s['pc'][-1] - s['pc'][0])
-            else:
-                spans.append(s['t'][-1] - s['t'][0])
-        max_t = max(spans) if spans else 0
-        use_min = max_t > 180
-        tdiv = 60.0 if use_min else 1.0
-
-        # ── COMPARISON AGAINST EACH OTHER ───────────────────────────────
-        delta_mode = bool(getattr(self, 'arch_delta', None) and self.arch_delta.get()
-                          and len(series) > 1)
-        ref = series[0] if delta_mode else None
-        ref_x, ref_name = None, ""
-        if delta_mode:
-            from pathlib import Path as _P
-            ref_name = self._cycle_display_name(_P(ref['path']))
-            if mode == 'pc' and ref['pc'] and ref['pc'][0] is not None:
-                ref_x = [((v if v is not None else 0) - self._pc_zero) / tdiv for v in ref['pc']]
-            else:
-                ref_x = [(x - ref['off']) / tdiv for x in ref['t']]
-            # In difference mode the setpoints only clutter the picture
-            show = dict(show); show['sa'] = False; show['st'] = False
-
-        def _interp(xs, ys, x):
-            """Linear interpolation of ys(xs) at point x (outside the range - edge value)."""
-            if not xs: return 0.0
-            if x <= xs[0]: return ys[0]
-            if x >= xs[-1]: return ys[-1]
-            lo, hi = 0, len(xs) - 1
-            while lo < hi - 1:
-                mid = (lo + hi) // 2
-                if xs[mid] <= x: lo = mid
-                else: hi = mid
-            dx = xs[hi] - xs[lo]
-            if dx == 0: return ys[lo]
-            f = (x - xs[lo]) / dx
-            return ys[lo] + f * (ys[hi] - ys[lo])
-
-        ax2 = None
-        for s in series:
-            path = s['path']
-            ci = file_order.get(path, 0) % len(self._arch_colors)
-            col = self._arch_colors[ci]
-            if mode == 'pc' and s['pc'] and s['pc'][0] is not None:
-                tx = [((v if v is not None else 0) - self._pc_zero) / tdiv for v in s['pc']]
-            else:
-                tx = [(x - s['off']) / tdiv for x in s['t']]
-            from pathlib import Path as _P
-            name = self._cycle_display_name(_P(path))
-            base = f"{name} · " if multi else ""
-            if show.get('st'):
-                self.ax_a.plot(tx, s['spt'], color=C['orange'], lw=1.2, ls='--',
-                              label=(base + 'target') if not multi else None, alpha=0.5)
-            if show.get('sa') and s['sa'] and any(v is not None for v in s['sa']):
-                xs = [tx[i] for i in range(min(len(s['sa']), len(tx))) if s['sa'][i] is not None]
-                ys = [v for v in s['sa'][:len(tx)] if v is not None]
-                if ys:
-                    self.ax_a.plot(xs, ys, color=(C['cyan'] if not multi else col),
-                                  lw=1.1, ls=':', alpha=0.75,
-                                  label=(base + 'setpoint (ramp)') if not multi else None)
-            if show.get('temp'):
-                if delta_mode and ref is not None:
-                    if s is ref:
-                        self.ax_a.axhline(0, color=C['dim2'], lw=1.0, ls='--', alpha=0.7)
-                        continue
-                    dy = [s['temp'][i] - _interp(ref_x, ref['temp'], tx[i])
-                          for i in range(len(tx))]
-                    self.ax_a.plot(tx, dy, color=col, lw=1.8,
-                                  label=f"{name} − {ref_name}")
-                else:
-                    self.ax_a.plot(tx, s['temp'], color=col, lw=(2 if not multi else 1.8),
-                                  label=(name if multi else 'temperature'))
-            if show.get('t2') and s['t2'] and any(v is not None for v in s['t2']):
-                xs = [tx[i] for i in range(min(len(s['t2']), len(tx))) if s['t2'][i] is not None]
-                ys = [v for v in s['t2'][:len(tx)] if v is not None]
-                if ys:
-                    self.ax_a.plot(xs, ys, color=C['purple'], lw=1.5, alpha=0.8,
-                                  label=(base + 'thermocouple 2'))
-            if show.get('pwm'):
-                if ax2 is None:
-                    ax2 = self.ax_a.twinx(); self._ax_pwm = ax2
-                    ax2.set_ylabel('PWM [%]', color=C['dim'], fontsize=9)
-                    ax2.tick_params(colors=C['dim'], labelsize=8)
-                    for sp in ax2.spines.values(): sp.set_visible(False)
-                ax2.plot(tx, s['pwm'], color=col, lw=0.9, ls='-.', alpha=0.5)
-
-        # Reference line in "rel. to temperature" mode
-        if mode == 'temp':
-            self.ax_a.axhline(tref, color=C['dim2'], lw=0.8, ls='--', alpha=0.6)
-            self.ax_a.axvline(0, color=C['dim2'], lw=0.8, ls='--', alpha=0.6)
-
-        # X axis labels as wall-clock time in PC mode
-        if mode == 'pc':
-            import matplotlib.ticker as _mt
-            z = getattr(self, '_pc_zero', 0.0)
-            def _fmt(v, pos):
-                try: return datetime.fromtimestamp(z + v * tdiv).strftime("%H:%M:%S")
-                except Exception: return ""
-            self.ax_a.xaxis.set_major_formatter(_mt.FuncFormatter(_fmt))
-
-        # Time axis caption - unit + information about the reference point
-        unit_txt = 'min' if use_min else 's'
-        if mode == 'pc':
-            xlabel = 'PC clock [h:min:s]'
-        else:
-            xlabel = f'time [{unit_txt}]'
-            xlabel += {'t0':   '  ·  0 = start of the run',
-                       'abs':  '  ·  file own time',
-                       'ramp': '  ·  0 = start of the ramp',
-                       'temp': f'  ·  0 = crossing {tref:.1f}°C',
-                       }.get(mode, '')
-        # The caption goes in the corner INSIDE the plot now, so it has to be
-        # short - the full "time [s] · 0 = start of the run" ran straight over
-        # the last x tick labels. The reference-point explanation moves to the
-        # top-left, under the y caption, where there is room for it.
-        style_axes(self.ax_a, xunit=xlabel.split('  ·  ')[0],
-                   yunit=(f'\u0394T vs {ref_name} [°C]' if delta_mode
-                          else 'temperature [°C]'))
-        if '  ·  ' in xlabel:
-            self.ax_a.text(0.008, 0.875, xlabel.split('  ·  ')[1],
-                           transform=self.ax_a.transAxes, ha='left', va='top',
-                           color=C['dim2'], fontsize=8)
-        self.ax_a.legend(facecolor=C['panel'], edgecolor=C['border'],
-                        labelcolor=C['dim'], fontsize=8, loc='best',
-                        framealpha=0.85)
-        self.ax_a.grid(True, alpha=0.3, color=C['grid'])
-
-        # Title: statistics (single run) or the number being compared
-        if not multi:
-            d = self._load_cycle_data(selected[0][0])
-            if d:
-                t, temp, spt, pwm = d
-                tmin, tmax = min(temp), max(temp)
-                dur = t[-1] - t[0] if len(t) > 1 else 0
-                idx_max = temp.index(tmax)
-                rise_time = t[idx_max] - t[0] if idx_max > 0 else 0
-                avg_rise = (tmax - temp[0]) / (rise_time / 60.0) if rise_time > 5 else 0
-                m = int(dur // 60); s2 = int(dur % 60)
-                self.ax_a.set_title(
-                    f"{tmin:.1f}-{tmax:.1f}°C · {m}m{s2}s · avg rise {avg_rise:.2f}°C/min",
-                    color=C['dim'], fontsize=9, loc='left')
-        else:
-            self.ax_a.set_title(f"Comparing {len(selected)} cycles",
-                              color=C['dim'], fontsize=9, loc='left')
-        self.fig_a.tight_layout()
-        if hasattr(self, 'nav_a'): self.nav_a.restore()
-        self.cv_a.draw()
-
-        # Run settings panel (only when a single run is selected)
-        if hasattr(self, 'arch_settings_lbl'):
-            if not multi:
-                cs = self._cycle_settings(selected[0][0])
-                if cs:
-                    def fmt(v, suf=''):
-                        return f"{v:.1f}{suf}" if v is not None else "?"
-                    txt = (f"SETTINGS:   target {fmt(cs['target'],'°C')}   ·   "
-                           f"ramp ~{fmt(cs['ramp'],'°C/min')}   ·   "
-                           f"PID  Kp {fmt(cs['kp'])}  Ki {fmt(cs['ki'])}  Kd {fmt(cs['kd'])}")
-                    self.arch_settings_lbl.config(text=txt)
-                else:
-                    self.arch_settings_lbl.config(text="")
-            else:
-                self.arch_settings_lbl.config(text=f"({len(selected)} cycles selected — settings shown for single selection)")
-
-    def _selected_arch_path(self):
-        """First selected run (for export)"""
-        for p, v in self.arch_vars.items():
-            if v.get():
-                from pathlib import Path as _P
-                return _P(p)
-        return None
-
-    def export_arch_csv(self):
-        """Download the CSV of the selected measurements.
-
-        One selected -> an ordinary "save as". More than one -> we ask
-        for a folder and copy them all there under their original names (without
-        this you had to export them one at a time).
-        """
-        from pathlib import Path as _P
-        sel = [_P(p) for p, v in self.arch_vars.items() if v.get()]
-        if not sel:
-            messagebox.showinfo("No selection", "Select a measurement in the list on the left.")
-            return
-        from tkinter import filedialog
-        import shutil
-        try:
-            if len(sel) == 1:
-                dest = filedialog.asksaveasfilename(
-                    title="Download measurement CSV", defaultextension=".csv",
-                    initialfile=sel[0].name,
-                    filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-                if not dest:
-                    return
-                shutil.copy(sel[0], dest)
-                messagebox.showinfo("Downloaded", f"Saved:\n{dest}")
-            else:
-                folder = filedialog.askdirectory(title=f"Where to save {len(sel)} CSV files?")
-                if not folder:
-                    return
-                done, failed = 0, []
-                for f in sel:
-                    try:
-                        shutil.copy(f, _P(folder) / f.name); done += 1
-                    except Exception as e:
-                        failed.append(f"{f.name}: {e}")
-                msg = f"Saved {done} of {len(sel)} files in:\n{folder}"
-                if failed:
-                    msg += "\n\nFailed:\n" + "\n".join(failed[:5])
-                messagebox.showinfo("Downloaded", msg)
-        except Exception as e:
-            messagebox.showerror("Export error", str(e))
-
-    def save_arch_chart(self):
-        """Save the current chart (with the comparison) as an image"""
-        if not any(v.get() for v in self.arch_vars.values()):
-            messagebox.showinfo("No selection", "Tick at least one cycle first.")
-            return
-        try:
-            from tkinter import filedialog
-            dest = filedialog.asksaveasfilename(
-                title="Save chart as image", defaultextension=".png",
-                initialfile="comparison.png",
-                filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
-            if dest:
-                # ALWAYS export on white - see print_theme(). The chart is
-                # rebuilt once in the print palette, saved, then rebuilt again
-                # in the screen palette, so what you see on screen is
-                # untouched and what lands in the file is printable.
-                with print_theme(self.fig_a):
-                    self._redraw_arch()
-                    self.fig_a.savefig(dest, dpi=200, facecolor='white',
-                                       edgecolor='none', bbox_inches='tight')
-                self._redraw_arch()
-                messagebox.showinfo("Saved", f"Chart saved to:\n{dest}")
-        except Exception as e:
-            messagebox.showerror("Save error", str(e))
-
-    # ════════════════════════════════════════════════════════
-    #  FOLDER FOR MEASUREMENT DATA (chosen by the user)
-    # ════════════════════════════════════════════════════════
-    def _load_data_dir(self):
-        """Read the remembered data folder; if missing/unavailable - the default."""
-        default = self.cfg_dir
-        try:
-            if self.settings_file.exists():
-                with open(self.settings_file, 'r', encoding='utf-8') as f:
-                    d = json.load(f)
-                p = d.get('data_dir')
-                if p:
-                    q = Path(p)
-                    # We do not force-create it here - if the user unplugged the
-                    # drive or deleted the folder, we quietly fall back to the
-                    # default instead of crashing the application at startup.
-                    if q.is_dir():
-                        return q
-                    try:
-                        q.mkdir(parents=True, exist_ok=True)
-                        return q
-                    except Exception:
-                        print(f"Data folder '{q}' unavailable - using {default}")
-        except Exception as e:
-            print(f"ustawienia.json: {e}")
-        default.mkdir(exist_ok=True)
-        return default
-
-    def _load_ui_scale(self):
-        """The remembered text scale, or None when the user has not chosen one
-        (then the Windows DPI value picked at startup stands)."""
-        try:
-            if self.settings_file.exists():
-                with open(self.settings_file, 'r', encoding='utf-8') as f:
-                    v = json.load(f).get('ui_scale')
-                if v: return float(v)
-        except Exception:
-            pass
-        return None
-
-    def _save_ui_scale(self, value):
-        """Remember the text scale (merged into the other settings). None
-        clears it and hands the decision back to the DPI auto-detection."""
-        d = {}
-        try:
-            if self.settings_file.exists():
-                with open(self.settings_file, 'r', encoding='utf-8') as f:
-                    d = json.load(f)
-        except Exception:
-            d = {}
-        if value is None:
-            d.pop('ui_scale', None)
-        else:
-            d['ui_scale'] = round(float(value), 3)
-        try:
-            self.cfg_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(d, f, indent=2)
-        except Exception as e:
-            print(f"ui_scale not saved: {e}")
-
-    def _set_ui_scale(self, value):
-        """Apply a text scale and remember it. value=None = back to auto (DPI)."""
-        target = self._dpi_scale if value is None else value
-        set_ui_scale(target)
-        self._save_ui_scale(value)
-        self._refresh_scale_buttons()
-        if hasattr(self, 'scale_note'):
-            pct = int(round(FS * 100))
-            src = "auto (display DPI)" if value is None else "manual"
-            self.scale_note.config(
-                text=f"Text at {pct}% - {src}. Spacing re-measures on restart.")
-
-    def _refresh_scale_buttons(self):
-        cur = self._load_ui_scale()
-        for val, btn in getattr(self, 'scale_btns', []):
-            on = (val is None and cur is None) or (
-                 val is not None and cur is not None and abs(val - cur) < 1e-6)
-            btn.config(fg=(C['bg2'] if on else C['dim']),
-                       bg=(C['gold'] if on else C['bg2']))
-
-    def _save_data_dir(self):
-        """Remember the chosen data folder (merging it with the other settings)."""
-        d = {}
-        try:
-            if self.settings_file.exists():
-                with open(self.settings_file, 'r', encoding='utf-8') as f:
-                    d = json.load(f)
-        except Exception:
-            d = {}
-        d['data_dir'] = str(self.log_dir)
-        try:
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(d, f, indent=2)
-        except Exception as e:
-            messagebox.showwarning("Settings", f"Folder choice not saved:\n{e}")
-
-    def _set_data_dir(self, newdir):
-        """Switch the data folder to `newdir` (Path) and refresh the archive."""
-        newdir = Path(newdir)
-        if newdir == self.log_dir:
-            return
-        # We do not switch while a run is being saved - the temporary file is
-        # already open in the old folder and archiving would go nowhere.
-        if self.cyc_on:
-            messagebox.showwarning(
-                "Measurement in progress",
-                "I will not change the folder while a run is being saved.\n"
-                "Stop the measurement (STOP) and try again.")
-            return
-        try:
-            newdir.mkdir(parents=True, exist_ok=True)
-            probe = newdir / ".peltier_zapis_test"
-            probe.write_text("ok", encoding='utf-8')
-            probe.unlink()
-        except Exception as e:
-            messagebox.showerror("Data folder", f"I cannot write to:\n{newdir}\n\n{e}")
-            return
-        self.log_dir = newdir
-        self._save_data_dir()
-        self._update_data_dir_label()
-        try:
-            self.refresh_arch()
-            self._redraw_arch()
-        except Exception:
-            pass
-        self._series_status(f"Data is now saved in: {self.log_dir}")
-
-    def choose_data_dir(self):
-        """Point to an EXISTING folder for measurement data."""
-        from tkinter import filedialog
-        p = filedialog.askdirectory(title="Select a folder for measurement data",
-                                    initialdir=str(self.log_dir))
-        if p:
-            self._set_data_dir(p)
-
-    def create_data_dir(self):
-        """Create a NEW data folder (we ask for the parent and the name)."""
-        from tkinter import filedialog, simpledialog
-        parent = filedialog.askdirectory(title="Where to create the new data folder?",
-                                         initialdir=str(self.log_dir))
-        if not parent:
-            return
-        name = simpledialog.askstring("New folder", "Folder name:",
-                                      initialvalue=datetime.now().strftime("Pomiary_%Y-%m-%d"),
-                                      parent=self.root)
-        if not name:
-            return
-        import re as _re
-        safe = _re.sub(r'[<>:"/\\|?*]', '_', name).strip().strip('.')
-        if not safe:
-            messagebox.showwarning("New folder", "Empty name.")
-            return
-        self._set_data_dir(Path(parent) / safe)
-
-    def _update_data_dir_label(self):
-        if hasattr(self, 'data_dir_lbl'):
-            p = str(self.log_dir)
-            # We shorten the middle of a long path - the end (the folder name)
-            # matters most, and the full path is in the tooltip anyway.
-            show = p if len(p) <= 52 else p[:20] + " … " + p[-29:]
-            self.data_dir_lbl.config(text=show)
-
-    def open_log_folder(self):
-        """Open the folder with the logs"""
-        try:
-            import subprocess
-            p = str(self.log_dir)
-            if sys.platform == 'win32':
-                os.startfile(p)
-            elif sys.platform == 'darwin':
-                subprocess.run(['open', p])
-            else:
-                subprocess.run(['xdg-open', p])
-        except Exception:
-            messagebox.showinfo("Folder", f"Logs are in:\n{self.log_dir}")
-
-    def load_arch(self, evt=None):
-        """Kept for compatibility - redirects to redraw"""
-        self._redraw_arch()
-
-    def show_arch_stats(self):
-        """Show a window with the statistics of the selected run"""
-        path = self._selected_arch_path()
-        if not path:
-            messagebox.showinfo("No selection", "Tick a cycle in the list first.")
-            return
-        data = self._load_cycle_data(path)
-        if not data:
-            messagebox.showerror("Error", "Could not load cycle data.")
-            return
-        st = self._compute_stats(data)
-
-        win = tk.Toplevel(self.root)
-        win.title("Cycle statistics")
-        win.configure(bg=C['bg'])
-        size_win(win, 440, 520, 380, 380, parent=self.root)
-        win.transient(self.root)
-        tk.Frame(win, bg=C['purple'], height=4).pack(fill='x')
-        inner = tk.Frame(win, bg=C['bg'])
-        inner.pack(fill='both', expand=True, padx=24, pady=20)
-
-        from pathlib import Path as _P
-        tk.Label(inner, text="CYCLE STATISTICS", bg=C['bg'], fg=C['text'],
-                 font=F(14, 1)).pack(anchor='w')
-        tk.Label(inner, text=self._cycle_display_name(_P(path)), bg=C['bg'], fg=C['dim'],
-                 font=F(9)).pack(anchor='w', pady=(2, 16))
-
-        def settle_str():
-            return f"{st['settle_time']:.0f} s" if st['settle_time'] is not None else "not reached"
-
-        rows = [
-            ("Temperature range", f"{st['tmin']:.1f} – {st['tmax']:.1f} °C", C['blue']),
-            ("Target", f"{st['target']:.1f} °C", C['orange']),
-            ("Duration", f"{int(st['duration']//60)}m {int(st['duration']%60)}s", C['text']),
-            ("Avg rise rate", f"{st['avg_rise']:.2f} °C/min", C['cyan']),
-            ("─", "", None),
-            ("Overshoot", f"{st['overshoot']:.2f} °C", C['red'] if st['overshoot']>1 else C['green']),
-            ("Settling time (±1°C)", settle_str(), C['text']),
-            ("Steady-state error", f"{st['steady_error']:.3f} °C", C['text']),
-            ("Max deviation from ramp", f"{st['max_dev']:.2f} °C", C['text']),
-            ("─", "", None),
-            ("Noise σ (measurement quality)", f"±{st['noise_std']:.3f} °C",
-             C['green'] if st['noise_std']<0.2 else C['yellow'] if st['noise_std']<0.5 else C['red']),
-        ]
-        for label, val, col in rows:
-            if label == "─":
-                tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=8)
-                continue
-            r = tk.Frame(inner, bg=C['bg2'])
-            r.pack(fill='x', pady=2)
-            tk.Label(r, text=label, bg=C['bg2'], fg=C['dim'],
-                     font=F(9), anchor='w').pack(side='left', padx=10, pady=6)
-            tk.Label(r, text=val, bg=C['bg2'], fg=col or C['text'],
-                     font=F(10, 1), anchor='e').pack(side='right', padx=10)
-
-        # Noise interpretation
-        noise = st['noise_std']
-        interp = ("Excellent - low noise" if noise < 0.2 else
-                  "Moderate noise" if noise < 0.5 else
-                  "High noise - check shielding/grounding")
-        tk.Label(inner, text=f"Noise: {interp}", bg=C['bg'],
-                 fg=C['dim2'], font=F(8), wraplength=380,
-                 justify='left').pack(anchor='w', pady=(12, 0))
-
-    def export_arch_pdf(self):
-        """Generate a PDF report: chart + statistics + settings + date"""
-        path = self._selected_arch_path()
-        if not path:
-            messagebox.showinfo("No selection", "Tick a cycle in the list first.")
-            return
-        data = self._load_cycle_data(path)
-        if not data:
-            messagebox.showerror("Error", "Could not load cycle data.")
-            return
-
-        try:
-            from tkinter import filedialog
-            from pathlib import Path as _P
-            dest = filedialog.asksaveasfilename(
-                title="Save PDF report", defaultextension=".pdf",
-                initialfile=f"{_P(path).stem}_report.pdf",
-                filetypes=[("PDF report", "*.pdf")])
-            if not dest:
-                return
-            self._build_pdf_report(path, data, dest)
-            messagebox.showinfo("Report saved", f"PDF report saved to:\n{dest}")
-        except Exception as e:
-            messagebox.showerror("PDF error", f"Could not create report:\n{e}")
-
-    def _build_pdf_report(self, path, data, dest):
-        """Build the PDF report using matplotlib (no extra libraries)"""
-        from matplotlib.backends.backend_pdf import PdfPages
-        from matplotlib.figure import Figure
-        from pathlib import Path as _P
-        import datetime
-
-        t, temp, spt, pwm = data
-        st = self._compute_stats(data)
-        # Time axis starting from zero
-        t0 = t[0]
-        tx = [x - t0 for x in t]
-
-        with PdfPages(dest) as pdf:
-            fig = Figure(figsize=(8.27, 11.69))  # A4 portrait
-            fig.patch.set_facecolor('white')
-
-            # Header
-            fig.text(0.5, 0.96, f"{APP_NAME} - Run Report", ha='center',
-                     fontsize=16, fontweight='bold')
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            fig.text(0.5, 0.935, f"{self._cycle_display_name(_P(path))}  ·  generated {ts}",
-                     ha='center', fontsize=9, color='gray')
-
-            # Temperature chart (upper half)
-            ax1 = fig.add_axes([0.1, 0.55, 0.82, 0.32])
-            ax1.plot(tx, spt, color='#e8833a', lw=1.2, ls='--', label='target', alpha=0.7)
-            ax1.plot(tx, temp, color='#2b7fd4', lw=1.8, label='temperature')
-            ax1.set_xlabel('time [s]', fontsize=9)
-            ax1.set_ylabel('temperature [°C]', fontsize=9)
-            ax1.legend(fontsize=9, loc='best')
-            ax1.grid(True, alpha=0.3)
-            ax1.set_title('Temperature profile', fontsize=11, loc='left')
-
-            # PWM chart (underneath)
-            ax2 = fig.add_axes([0.1, 0.40, 0.82, 0.10])
-            ax2.fill_between(tx, pwm, color='#3ea662', alpha=0.5)
-            ax2.set_xlabel('time [s]', fontsize=8)
-            ax2.set_ylabel('PWM [%]', fontsize=8)
-            ax2.grid(True, alpha=0.3)
-
-            # Statistics table (bottom)
-            def settle_str():
-                return f"{st['settle_time']:.0f} s" if st['settle_time'] is not None else "not reached"
-            stats_lines = [
-                ("STATISTICS", ""),
-                ("Temperature range", f"{st['tmin']:.1f} - {st['tmax']:.1f} °C"),
-                ("Target", f"{st['target']:.1f} °C"),
-                ("Duration", f"{int(st['duration']//60)}m {int(st['duration']%60)}s"),
-                ("Average rise rate", f"{st['avg_rise']:.2f} °C/min"),
-                ("Overshoot", f"{st['overshoot']:.2f} °C"),
-                ("Settling time (±1°C)", settle_str()),
-                ("Steady-state error", f"{st['steady_error']:.3f} °C"),
-                ("Max deviation from ramp", f"{st['max_dev']:.2f} °C"),
-                ("Noise σ (quality)", f"±{st['noise_std']:.3f} °C"),
-            ]
-            y = 0.32
-            for label, val in stats_lines:
-                if label == "STATISTICS":
-                    fig.text(0.1, y, label, fontsize=11, fontweight='bold')
-                else:
-                    fig.text(0.12, y, label, fontsize=9, color='#333')
-                    fig.text(0.55, y, val, fontsize=9, fontweight='bold')
-                y -= 0.025
-
-            pdf.savefig(fig)
-
-
-    # ────────────────────────────────────────────────────
-    #  TICK + CHART
-    # ────────────────────────────────────────────────────
+        row = self.conn_list.currentRow()
+        if 0 <= row < len(getattr(self, '_ports', [])):
+            self.connect(self._ports[row].device)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  TICK - the heartbeat of the whole app
+    # ════════════════════════════════════════════════════════════════════
     # ── SLEEP / STALL GUARD + HEARTBEAT ─────────────────────────────────
     # Two halves of the same safety story, one on each side of the USB cable.
     #
-    # PC SIDE (here): tick() runs every ~250 ms. If the wall clock jumps by
-    # much more than that, this process was NOT running - the machine slept,
-    # hibernated, or was frozen hard enough that a measurement was no longer
-    # being supervised or logged. In that case the safe thing is to end the
-    # run, not to silently carry on with a hole in the data.
+    # PC SIDE (here): tick() runs every ~250 ms. If the wall clock jumps by far
+    # more than that, this process was NOT running - the machine slept,
+    # hibernated, or froze hard enough that a measurement was no longer being
+    # supervised or logged. The safe thing is to end the run, not to carry on
+    # with a hole in the data.
     #
-    # BOARD SIDE: the app arms the firmware watchdog (PCWD:1) when a run
-    # starts and pings it every second. If the PC vanishes, the board stops
-    # itself after PC_TIMEOUT_MS - which is the case this half cannot cover,
-    # because a sleeping PC runs no code at all.
-    STALL_LIMIT_S = 6.0      # tick period is ~0.25 s; 6 s is unambiguous
-    PING_EVERY_S  = 1.0
-
+    # BOARD SIDE: the app arms the firmware watchdog (PCWD:1) when a run starts
+    # and pings it every second. If the PC vanishes, the board stops itself
+    # after PC_TIMEOUT_MS - the case this half cannot cover, because a sleeping
+    # PC runs no code at all.
     def _guard_tick(self):
         now = time.time()
         last = getattr(self, '_last_tick_wall', None)
         self._last_tick_wall = now
-        # heartbeat for the firmware watchdog
-        if self.connected and now - getattr(self, '_last_ping', 0) >= self.PING_EVERY_S:
+        if self.connected and now - getattr(self, '_last_ping', 0) >= PING_EVERY_S:
             self._last_ping = now
             self.send("PING:1")
         if last is None:
             return
         gap = now - last
-        if gap < self.STALL_LIMIT_S:
+        if gap < STALL_LIMIT_S:
             return
-        # We were away. If nothing was running, just note it and carry on.
         if not (self.cyc_on or self.series_running):
             print(f"Tick gap {gap:.1f}s (idle) - ignored")
             return
         print(f"!!! Tick gap {gap:.1f}s during a run - safe stop")
         try:
             if self.series_running:
-                self._series_abort(f"PC was asleep for {gap:.0f}s")
+                self._series_abort(f"PC asleep for {gap:.0f}s")
         except Exception:
             pass
         try:
@@ -4510,27 +1937,16 @@ class PeltierControl:
             self.cyc_stop(f"interrupted - PC asleep {gap:.0f}s")
         except Exception:
             pass
-        self.set_status(f"RUN STOPPED - the PC was asleep for {gap:.0f} s", C['red'])
-        messagebox.showwarning(
-            "Measurement interrupted",
-            f"The computer stopped running this program for {gap:.0f} s "
-            f"(sleep, hibernation or a hard freeze).\n\n"
-            "The run was ended safely: the Peltier is off and the fans are "
-            "running on their cool-down.\n\n"
-            "Data collected up to that moment has been saved.")
+        core.warn(self, "Measurement interrupted",
+                  f"The computer stopped running this program for {gap:.0f} s "
+                  "(sleep, hibernation or a hard freeze).\n\n"
+                  "The run was ended safely: the Peltier is off and the fans "
+                  "are on their cool-down. Everything collected up to that "
+                  "moment has been saved.")
 
     def tick(self):
         try:
             self._guard_tick()
-            # SELF-TUNE/calibration changed the PID - update the sliders (tables)
-            stp = getattr(self, '_st_pid_update', None)
-            if stp is not None:
-                self._st_pid_update = None
-                try:
-                    if hasattr(self, 'sl_kp'): self.sl_kp.set(stp[0], silent=True)
-                    if hasattr(self, 'sl_ki'): self.sl_ki.set(stp[1], silent=True)
-                    if hasattr(self, 'sl_kd'): self.sl_kd.set(stp[2], silent=True)
-                except: pass
             rows = []
             while not self.data_queue.empty():
                 rows.append(self.data_queue.get_nowait())
@@ -4541,15 +1957,14 @@ class PeltierControl:
                 self.pwm.append(pwm); self.kp.append(kp)
                 self.ki.append(ki); self.kd.append(kd)
                 self.states.append(state)
-                # Limit the buffer length
                 if len(self.t) > self.maxlen:
-                    for a in [self.t, self.temp, self.spt, self.spa,
-                              self.pwm, self.kp, self.ki, self.kd, self.states]:
+                    for a in (self.t, self.temp, self.spt, self.spa, self.pwm,
+                              self.kp, self.ki, self.kd, self.states):
                         del a[0]
+
                 # Run start
                 if state == 'AUTO' and prev != 'AUTO' and not self.cyc_on:
                     self._cyc_start(temp)
-                    # Start tracking the approach to the setpoint
                     self.reach_start_t = now2
                     self.reach_start_temp = temp
                     self.reach_target = st
@@ -4559,15 +1974,13 @@ class PeltierControl:
                     self.reach_avg_rate = None
                     self.last_setpoint_target = st
                     self._ramp_reset(now2, temp, st)
-                elif self.cyc_on and state == 'MAN' and prev in ('AUTO', 'COOLDOWN', 'FREEZE', 'FREEZE_READY'):
-                    # End of the run - transition from operation to MAN (STOP).
-                    # Without cooldown it now goes straight AUTO->MAN.
+                elif self.cyc_on and state == 'MAN' and prev in (
+                        'AUTO', 'COOLDOWN', 'FREEZE', 'FREEZE_READY'):
                     self.cyc_stop("done")
 
-                # Detect a change of the target setpoint while running (new approach)
+                # A target change while running starts a new approach
                 if state == 'AUTO' and self.last_setpoint_target is not None:
                     if abs(st - self.last_setpoint_target) > 0.5:
-                        # Setpoint changed - start counting from scratch
                         self.reach_start_t = now2
                         self.reach_start_temp = temp
                         self.reach_target = st
@@ -4576,25 +1989,24 @@ class PeltierControl:
                         self.last_setpoint_target = st
                         self._ramp_reset(now2, temp, st)
 
-                # End of the RAMP PHASE = the ramp generator (spA) reached the target.
-                # We compute this BEFORE checking the temperature approach, so that
-                # both measures stay independent (see the comment at self.ramp_t0).
+                # End of the RAMP PHASE = the generator (spA) reached target.
+                # Computed BEFORE the approach check, so the two stay
+                # independent - see the comment at self.ramp_t0.
                 if (state == 'AUTO' and not self.ramp_done
                         and self.ramp_t0 is not None and abs(sa - st) <= 0.05):
                     self.ramp_done = True
                     self.ramp_secs = now2 - self.ramp_t0
                     if self.ramp_secs > 1.0 and self.ramp_temp0 is not None:
-                        self.ramp_rate = (temp - self.ramp_temp0) / (self.ramp_secs / 60.0)
+                        self.ramp_rate = ((temp - self.ramp_temp0) /
+                                          (self.ramp_secs / 60.0))
                     self.ramp_lag = st - temp
 
-                # Check whether the setpoint was reached: |error| <= REACH_TOL_C
-                # held continuously for REACH_STABLE_S (see the comment
-                # at those constants at the top of the file).
+                # Reached = |error| <= REACH_TOL_C held for REACH_STABLE_S.
                 if (state == 'AUTO' and not self.reach_done
                         and self.reach_target is not None
                         and self.reach_start_t is not None):
                     if abs(temp - self.reach_target) > REACH_TOL_C:
-                        self.reach_in_tol_t = None   # we fell out - count from scratch
+                        self.reach_in_tol_t = None      # fell out - start over
                     elif self.reach_in_tol_t is None:
                         self.reach_in_tol_t = now2
                     if (self.reach_in_tol_t is not None
@@ -4602,43 +2014,38 @@ class PeltierControl:
                         self.reach_done = True
                         self.reach_time = now2 - self.reach_start_t
                         delta = self.reach_target - self.reach_start_temp
-                        dT = abs(delta)
                         if self.reach_time > 0:
-                            self.reach_avg_rate = dT / (self.reach_time / 60.0)
-                        # Direction of the transition: heating or cooling
+                            self.reach_avg_rate = abs(delta) / (self.reach_time / 60.0)
                         self.reach_dir = "HEAT" if delta > 0 else "COOL"
-                        # Remember the approach statistics for this run
                         self._last_reach_summary = {
                             'target': self.reach_target,
                             'time_s': self.reach_time,
                             'avg_rate': self.reach_avg_rate,
-                            'dir': self.reach_dir,
-                        }
+                            'dir': self.reach_dir}
         except Exception as e:
             print(f"tick err: {e}")
 
         if self.t:
-            try: self.update_cards()
-            except Exception as e: print(f"cards err: {e}")
-            try: self.draw_chart()
-            except Exception as e: print(f"chart err: {e}")
+            try:
+                self.update_cards()
+            except Exception as e:
+                print(f"cards err: {e}")
 
         if self.series_running:
-            try: self._series_tick()
-            except Exception as e: print(f"series err: {e}")
-
-        self.root.after(250, self.tick)
+            try:
+                self._series_tick()
+            except Exception as e:
+                print(f"series err: {e}")
 
     def _ramp_reset(self, t0, temp0, target):
-        """Start counting a NEW ramp phase (see the comment at self.ramp_t0)."""
+        """Start counting a NEW ramp phase - see the comment at self.ramp_t0."""
         self.ramp_t0 = t0
         self.ramp_temp0 = temp0
         self.ramp_done = False
         self.ramp_secs = None
         self.ramp_rate = None
         self.ramp_lag = None
-        # We take the COMMANDED rate from whichever slider matches the direction
-        # of the transition - upwards HEAT RATE, downwards COOL RATE.
+        # The COMMANDED rate comes from whichever control matches the direction.
         try:
             if target is not None and temp0 is not None and target < temp0:
                 self.ramp_cmd_rate = self.sl_rd.get()
@@ -4646,322 +2053,375 @@ class PeltierControl:
                 self.ramp_cmd_rate = self.sl_ru.get()
         except Exception:
             self.ramp_cmd_rate = None
+
+    # ── the readouts ────────────────────────────────────────────────────
     def update_cards(self):
-        if not self.t: return
+        if not self.t:
+            return
         temp = self.temp[-1]; spt = self.spt[-1]; pwm = self.pwm[-1]
-        self.cards['temp']['val'].config(text=f"{temp:.2f}")
-        # Second thermocouple card
-        t2 = getattr(self, '_latest_temp2', None)
-        if 'temp2' in self.cards:
-            self.cards['temp2']['val'].config(text=f"{t2:.2f}" if t2 is not None else "--")
-        self.cards['sp']['val'].config(text=f"{spt:.1f}")
-        # AVG RATE - the rate of the RAMP ITSELF (not counting the approach tail).
-        # Previously it was counted until entering +/-0.5C of the target, so the
-        # approach tail dragged the result down by as much as 2.5x (see the
-        # comment at self.ramp_t0) and the card showed 12.2 for a commanded 30.
-        # Now: during the ramp the rate is counted from its start, and once it
-        # finishes it is FROZEN at the value reached in the ramp - that way you
-        # can see directly whether the ramp keeps up with the commanded RATE.
+        self.cards['temp'].set(f"{temp:.2f}")
+        t2 = self._latest_temp2
+        self.cards['temp2'].set(f"{t2:.2f}" if t2 is not None else "--")
+        self.cards['sp'].set(f"{spt:.1f}")
+
+        # AVG RATE is the rate of the RAMP ITSELF, not of the approach tail.
+        # During the ramp it counts from the ramp's start; once the ramp
+        # finishes it FREEZES at what the ramp achieved, so you can read
+        # straight off whether the ramp kept up with the commanded rate.
         avg_rate = 0.0
         if self.ramp_done and self.ramp_rate is not None:
             avg_rate = self.ramp_rate
         elif (self.ramp_t0 is not None and self.ramp_temp0 is not None
-                and self.t and self.cur_state == 'AUTO'):
+                and self.cur_state == 'AUTO'):
             elapsed = self.t[-1] - self.ramp_t0
-            if elapsed > 2:  # min 2s to avoid dividing by small numbers
+            if elapsed > 2:
                 avg_rate = (temp - self.ramp_temp0) / (elapsed / 60.0)
-        self.cards['rate']['val'].config(text=f"{avg_rate:+.1f}")
-        # Card color = how close to the COMMANDED rate (green >=95%, yellow >=85%)
-        try:
-            cmd = self.ramp_cmd_rate
-            if cmd and abs(cmd) > 0.1 and abs(avg_rate) > 0.1:
-                frac = abs(avg_rate) / abs(cmd)
-                rcol = (C['green'] if frac >= 0.95 else
-                        (C['yellow'] if frac >= 0.85 else C['red']))
-                self.cards['rate']['unit_lbl'].config(
-                    text=f"°C/min  {frac*100:.0f}% of cmd", fg=rcol)
-            else:
-                self.cards['rate']['unit_lbl'].config(text="°C/min", fg=C['dim2'])
-        except Exception:
-            pass
-        # PWM + direction (HEAT/COOL/HOLD shown in the unit)
-        diff = spt - temp
-        arrow = "% ▲HEAT" if diff > 0.3 else ("% ▼COOL" if diff < -0.3 else "% ●HOLD")
-        self.cards['pwm']['val'].config(text=f"{pwm:.0f}")
-        # Direction color
-        acol = C['red'] if diff > 0.3 else (C['cyan'] if diff < -0.3 else C['dim2'])
-        self.cards['pwm']['unit_lbl'].config(text=" " + arrow, fg=acol)
+        self.cards['rate'].set(f"{avg_rate:+.1f}")
+        cmd = self.ramp_cmd_rate
+        if cmd and abs(cmd) > 0.1 and abs(avg_rate) > 0.1:
+            frac = abs(avg_rate) / abs(cmd)
+            col = ('green' if frac >= 0.95 else
+                   'yellow' if frac >= 0.85 else 'red')
+            self.cards['rate'].unit.setText(f"°C/min · {frac * 100:.0f}% of cmd")
+            self.cards['rate'].unit.setStyleSheet(
+                "QLabel { color: %s; font-size: %dpt; }"
+                % (self.th[col], self.th.pt('footnote')))
+        else:
+            self.cards['rate'].unit.setText("°C/min")
+            self.cards['rate'].unit.setStyleSheet("")
 
-        # Approach statistics / FREEZE status
-        if hasattr(self, 'reach_lbl'):
-            # FREEZE - priority (the most important message for the user)
-            if self.cur_state == 'FREEZE_READY':
-                self.reach_lbl.config(text="❄ GAL SOLID — ready to swap sample", fg=C['cyan'])
-            elif self.cur_state == 'FREEZE':
-                self.reach_lbl.config(text=f"❄ Freezing gal → hold 20°C", fg=C['cyan'])
-            elif self.reach_done and self.reach_time is not None:
-                m = int(self.reach_time // 60); s = int(self.reach_time % 60)
-                tstr = f"{m}m {s}s" if m > 0 else f"{s}s"
-                d = getattr(self, 'reach_dir', '')
-                dcol = C['red'] if d == 'HEAT' else C['cyan']
-                # SPLIT into two separate numbers instead of one misleading
-                # average (see the comment at self.ramp_t0): how long the RAMP
-                # itself ran and at what rate vs commanded, and separately how
-                # long the APPROACH (tail) took after the ramp finished. These
-                # are two different problems and they are fixed differently.
-                if self.ramp_rate is not None and self.ramp_secs is not None:
-                    cmd = self.ramp_cmd_rate
-                    pct = (f" ({abs(self.ramp_rate)/abs(cmd)*100:.0f}% of {abs(cmd):.0f})"
-                           if cmd and abs(cmd) > 0.1 else "")
-                    tail = max(0.0, self.reach_time - self.ramp_secs)
-                    lag = f" · remaining {self.ramp_lag:+.2f}°C" if self.ramp_lag is not None else ""
-                    self.reach_lbl.config(
-                        text=(f"✓ {d} · ramp {abs(self.ramp_rate):.1f}°C/min{pct}"
-                              f" in {self.ramp_secs:.0f}s{lag} · approach +{tail:.0f}s"),
-                        fg=dcol)
-                else:
-                    rate_str = f"{self.reach_avg_rate:.2f}" if self.reach_avg_rate else "?"
-                    self.reach_lbl.config(
-                        text=f"✓ {d} REACHED in {tstr} · avg {rate_str}°C/min", fg=dcol)
-            elif (self.cur_state == 'AUTO' and self.reach_start_t is not None
-                  and not self.reach_done):
-                # While approaching - show the elapsed time
-                if self.t:
-                    elapsed = self.t[-1] - self.reach_start_t
-                    m = int(elapsed // 60); s = int(elapsed % 60)
-                    tstr = f"{m}m {s}s" if m > 0 else f"{s}s"
-                    self.reach_lbl.config(
-                        text=f"→ reaching {self.reach_target:.1f}°C · {tstr}", fg=C['yellow'])
-            else:
-                self.reach_lbl.config(text="")
-        if not self.t: return
-        # Paused - do not refresh (lets you zoom in on / inspect the frozen chart)
+        diff = spt - temp
+        self.cards['pwm'].set(f"{pwm:.0f}")
+        label = "% · heating" if diff > 0.3 else (
+            "% · cooling" if diff < -0.3 else "% · holding")
+        colr = 'red' if diff > 0.3 else ('cyan' if diff < -0.3 else 'label3')
+        self.cards['pwm'].unit.setText(label)
+        self.cards['pwm'].unit.setStyleSheet(
+            "QLabel { color: %s; font-size: %dpt; }"
+            % (self.th[colr], self.th.pt('footnote')))
+
+        self._update_reach_label()
+
+        # Paused - do not refresh, so a frozen chart can be inspected.
         if self.chart_paused:
             return
-        t = self.t; temp = self.temp; spt = self.spt; spa = self.spa; pwm = self.pwm
-
-        # Time window - show only the last N seconds if set
+        t, tm, st, sa, pw = self.t, self.temp, self.spt, self.spa, self.pwm
         if self.chart_window > 0 and len(t) > 1:
-            t_now = t[-1]
-            cutoff = t_now - self.chart_window
-            # Find the index to start showing from
+            cutoff = t[-1] - self.chart_window
             i0 = 0
             for i in range(len(t) - 1, -1, -1):
                 if t[i] < cutoff:
                     i0 = i
                     break
-            t = t[i0:]; temp = temp[i0:]; spt = spt[i0:]
-            spa = spa[i0:]; pwm = pwm[i0:]
+            t, tm, st, sa, pw = (t[i0:], tm[i0:], st[i0:], sa[i0:], pw[i0:])
+        self._live_args = (t, tm, st, sa, pw)
+        self._redraw_live(t, tm, st, sa, pw)
 
-        self._live_args = (t, temp, spt, spa, pwm)
-        self._redraw_live(t, temp, spt, spa, pwm)
+    def _update_reach_label(self):
+        if self.cur_state == 'FREEZE_READY':
+            self.reach_lbl.setText("stage solid — ready to swap the sample")
+            return
+        if self.cur_state == 'FREEZE':
+            self.reach_lbl.setText("freezing → hold 20 °C")
+            return
+        if self.reach_done and self.reach_time is not None:
+            d = (self.reach_dir or '').lower()
+            # SPLIT into two numbers instead of one misleading average: how long
+            # the RAMP itself ran and at what rate against the command, and
+            # separately how long the APPROACH tail took after it. Two different
+            # problems, fixed in two different places.
+            if self.ramp_rate is not None and self.ramp_secs is not None:
+                cmd = self.ramp_cmd_rate
+                pct = (f" ({abs(self.ramp_rate) / abs(cmd) * 100:.0f}% of "
+                       f"{abs(cmd):.0f})" if cmd and abs(cmd) > 0.1 else "")
+                tail = max(0.0, self.reach_time - self.ramp_secs)
+                lag = (f" · {self.ramp_lag:+.2f} °C left"
+                       if self.ramp_lag is not None else "")
+                self.reach_lbl.setText(
+                    f"{d} · ramp {abs(self.ramp_rate):.1f} °C/min{pct} in "
+                    f"{self.ramp_secs:.0f}s{lag} · approach +{tail:.0f}s")
+            else:
+                rate = (f"{self.reach_avg_rate:.2f}"
+                        if self.reach_avg_rate else "?")
+                self.reach_lbl.setText(
+                    f"{d} reached in {core.fmt_hms(self.reach_time)} · "
+                    f"avg {rate} °C/min")
+            return
+        if (self.cur_state == 'AUTO' and self.reach_start_t is not None
+                and not self.reach_done and self.t):
+            el = self.t[-1] - self.reach_start_t
+            self.reach_lbl.setText(
+                f"reaching {self.reach_target:.1f} °C · {core.fmt_hms(el)}")
+            return
+        self.reach_lbl.setText("")
 
+    # ── the live chart ──────────────────────────────────────────────────
     def _redraw_live(self, t, temp, spt, spa, pwm):
-        """The live chart drawing, split out of update_cards() in .15.
-
-        It used to be inline, which meant the only way to re-render the chart
-        was to run the whole card-update routine - including its Tk widget
-        writes. Exporting on a white background needs exactly this part and
-        nothing else (see print_theme), so it now stands on its own."""
+        cs = self.chart.cs
         self.ax1.clear()
-        self.ax1.set_facecolor(C['panel'])
-        # target final (dashed orange)
-        self.ax1.plot(t, spt, color=C['orange'], lw=1.3, ls='--', label='target', alpha=0.7)
-        # actual setpoint - ramp (dotted cyan) - shows how the setpoint creeps
-        self.ax1.plot(t, spa, color=C['cyan'], lw=1.5, ls=':', label='setpoint (ramp)')
-        # actual temperature (thick blue)
-        self.ax1.plot(t, temp, color=C['blue'], lw=2.2, label='temp')
-        style_axes(self.ax1, yunit='°C', show_x=False)
-        self.ax1.grid(True, axis='y', alpha=0.35, color=C['grid'])
-        leg = self.ax1.legend(facecolor=C['panel'], edgecolor=C['border'],
-                             labelcolor=C['dim'], fontsize=8, loc='upper right')
-
         self.ax2.clear()
-        self.ax2.set_facecolor(C['panel'])
-        self.ax2.fill_between(t, 0, pwm, color=C['green'], alpha=0.3)
-        self.ax2.plot(t, pwm, color=C['green'], lw=1.5)
-        style_axes(self.ax2, xunit='time [s]', yunit='PWM %')
+        if t:
+            self.ax1.plot(t, spt, color=cs['orange'], lw=1.3, ls='--',
+                          label='target', alpha=0.8)
+            # The ACTIVE setpoint is the ramp generator's output - watching it
+            # against the temperature is how you see tracking, which is the
+            # whole point of a ramped measurement.
+            self.ax1.plot(t, spa, color=cs['cyan'], lw=1.5, ls=':',
+                          label='setpoint')
+            self.ax1.plot(t, temp, color=cs['blue'], lw=2.2, label='temperature')
+        style_axes(self.ax1, cs, yunit='°C', show_x=False)
+        if t:
+            # 'best' rather than a fixed corner: a heating run fills the top
+            # left by the end and a descent fills the bottom right, so any
+            # fixed placement collides with the trace half the time.
+            style_legend(self.ax1, cs, loc='best', ncol=3)
+
+        if t:
+            self.ax2.fill_between(t, 0, pwm, color=cs['green'], alpha=0.28)
+            self.ax2.plot(t, pwm, color=cs['green'], lw=1.5)
+        style_axes(self.ax2, cs, xunit='s', yunit='power %')
         self.ax2.set_ylim(-105, 105)
         self.ax2.set_yticks([-100, 0, 100])
-        self.ax2.grid(True, axis='y', alpha=0.35, color=C['grid'])
+
+        if not t:
+            # Empty axes default to a 0..1 grid, which reads as data that is
+            # simply flat. Better to say plainly that nothing has arrived yet.
+            for ax in (self.ax1, self.ax2):
+                ax.set_xticks([]); ax.set_yticks([])
+                ax.grid(False)
+            self.ax1.text(0.5, 0.5, "waiting for the first sample",
+                          ha='center', va='center', color=cs['dim2'],
+                          fontsize=11, transform=self.ax1.transAxes)
 
         # A manual zoom must survive the ~4 Hz redraw - see ChartNav.
-        if hasattr(self, 'nav'): self.nav.restore()
-        self.cv.draw_idle()
+        self.chart.nav.restore()
+        self.chart.draw()
 
-    # ────────────────────────────────────────────────────
-    #  RUN CSV
-    # ────────────────────────────────────────────────────
-    # ────────────────────────────────────────────────────
-    #  SLEEP INHIBIT FOR THE DURATION OF A MEASUREMENT
-    # ────────────────────────────────────────────────────
-    # IMPORTANT DISTINCTION: SCREEN BLANKING breaks nothing - the process keeps
-    # running, the serial port keeps reading, the CSV keeps being appended (every
-    # row is flushed immediately, see cyc_log). What does break things is
-    # SUSPENDING THE WHOLE SYSTEM (S3/hibernation): USB is then re-enumerated
-    # from scratch, the COM port can disappear, and the SERIES state machine
-    # (which runs HERE, in the app, not in the firmware) stops switching legs -
-    # the board stays at the last commanded setpoint in AUTO and holds it,
-    # but the series is stalled and there is a hole in the log.
+    def _nav_redraw(self):
+        if self._live_args:
+            self._redraw_live(*self._live_args)
+        else:
+            self._redraw_live([], [], [], [], [])
+
+    def toggle_pause(self):
+        self.chart_paused = not self.chart_paused
+        self.btn_pause.setText("Resume" if self.chart_paused else "Pause")
+        self._reicon(self.btn_pause,
+                     'play' if self.chart_paused else 'pause')
+
+    def set_chart_window(self, secs):
+        self.chart_window = secs
+
+    def save_live_chart(self):
+        dest = core.save_path(self, "Save chart", "live_chart.png",
+                              "PNG image (*.png);;PDF (*.pdf);;SVG (*.svg)",
+                              self.log_dir)
+        if not dest:
+            return
+        try:
+            self.chart.export(dest, size=(9.5, 5.4))
+            core.info(self, "Saved", dest)
+        except Exception as e:
+            core.error(self, "Save error", str(e))
+
+    # ════════════════════════════════════════════════════════════════════
+    #  RUN FILES
+    # ════════════════════════════════════════════════════════════════════
+    # IMPORTANT DISTINCTION: screen blanking breaks nothing - the process keeps
+    # running, the port keeps reading, every CSV row is flushed immediately.
+    # What breaks things is SUSPENDING THE WHOLE SYSTEM: USB is re-enumerated
+    # from scratch, the port can disappear, and the SERIES state machine (which
+    # runs here, in the app, not in the firmware) stops switching legs - the
+    # board holds the last commanded setpoint while the series stalls and the
+    # log gains a hole.
     #
-    # That is why, for the duration of a measurement, we ask the system NOT TO
-    # SLEEP. This is an ordinary per-process API - it does NOT change any system
-    # settings, does not require administrator rights and stops working the
-    # moment the lock is released or the program is closed. Since .17 it also
-    # keeps the SCREEN awake (see ES_DISPLAY_REQUIRED below).
+    # So for the duration of a measurement we ask the system not to sleep. This
+    # is an ordinary per-process API: it changes no system settings, needs no
+    # administrator rights, and stops the moment the lock is released.
     def _wake_lock(self, on):
         try:
             if sys.platform.startswith('win'):
                 import ctypes
-                ES_CONTINUOUS       = 0x80000000
-                ES_SYSTEM_REQUIRED  = 0x00000001
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
                 ES_DISPLAY_REQUIRED = 0x00000002
-                # ES_DISPLAY_REQUIRED added in .17: the screen saver and
-                # display blanking are blocked too, not just system sleep.
-                # Blanking on its own is harmless, but on most machines it is
-                # the step right before sleep - and the whole point is that a
-                # measurement in progress is never interrupted by idle policy.
-                # ES_CONTINUOUS alone = release the lock (back to normal).
-                flags = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
-                         ES_DISPLAY_REQUIRED) if on else ES_CONTINUOUS
+                # ES_DISPLAY_REQUIRED keeps the screen awake too. Blanking on
+                # its own is harmless, but on most machines it is the step right
+                # before sleep - and the point is that a measurement in progress
+                # is never interrupted by idle policy.
+                flags = ((ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+                         if on else ES_CONTINUOUS)
                 ok = ctypes.windll.kernel32.SetThreadExecutionState(flags)
                 if on and not ok:
-                    print("WARNING: failed to block system sleep")
+                    print("WARNING: could not block system sleep")
                     return
             elif sys.platform == 'darwin':
                 import subprocess
                 if on:
                     if getattr(self, '_wl_proc', None) is None:
                         self._wl_proc = subprocess.Popen(
-                            ['caffeinate', '-d', '-i', '-s', '-w', str(os.getpid())])
+                            ['caffeinate', '-d', '-i', '-s', '-w',
+                             str(os.getpid())])
                 else:
                     p = getattr(self, '_wl_proc', None)
                     if p is not None:
-                        try: p.terminate()
-                        except Exception: pass
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
                         self._wl_proc = None
             else:
                 import subprocess
                 if on:
                     if getattr(self, '_wl_proc', None) is None:
                         self._wl_proc = subprocess.Popen(
-                            ['systemd-inhibit', '--what=sleep:idle:handle-lid-switch',
-                             '--who=PeltierControl', '--why=measurement in progress',
+                            ['systemd-inhibit',
+                             '--what=sleep:idle:handle-lid-switch',
+                             '--who=LACHI', '--why=measurement in progress',
                              'sleep', 'infinity'])
                 else:
                     p = getattr(self, '_wl_proc', None)
                     if p is not None:
-                        try: p.terminate()
-                        except Exception: pass
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
                         self._wl_proc = None
-            print("WAKE LOCK: %s" % ("enabled (no sleep, no screen blanking during the measurement)"
-                                     if on else "released"))
+            print("WAKE LOCK: %s" % ("held" if on else "released"))
         except Exception as e:
-            # No caffeinate/systemd-inhibit, or an exotic system - the
-            # measurement should happen anyway, so we only inform.
-            print("WAKE LOCK unavailable (%s) - make sure the laptop does not fall asleep" % e)
+            # No caffeinate or systemd-inhibit, or an exotic system. The
+            # measurement should happen anyway, so we only report it.
+            print(f"WAKE LOCK unavailable ({e}) - make sure the machine does "
+                  "not fall asleep")
 
     def _cyc_start(self, temp0):
         self.cyc_on = True
         self._wake_lock(True)
         # Arm the board-side watchdog: from now on the firmware expects a PING
         # at least every PC_TIMEOUT_MS and stops itself if the PC goes quiet.
-        # See _guard_tick() and the PC_TIMEOUT_MS comment in the firmware.
         self.send("PCWD:1")
         self._last_ping = 0.0
         self.cyc_t0 = time.time()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Temporary file - the user names it after STOP
         self.cyc_ts = ts
         self.cyc_fn = self.log_dir / f"_tmp_cykl_{ts}.csv"
         self.cyc_file = open(self.cyc_fn, 'w', newline='', encoding='utf-8')
         self.cyc_wr = csv.writer(self.cyc_file)
-        # czas_pc = the COMPUTER clock (YYYY-MM-DD HH:MM:SS.mmm). czas_s is
-        # counted from the start of the run, so on its own it does not let you
-        # line the trace up with anything but itself - the PC time makes it
-        # possible to put several runs on one real time axis and correlate them
-        # with events outside the application. The column is appended AT THE END
-        # so that old files and existing parsers (reading by index) keep working.
         self.cyc_wr.writerow(CSV_COLS)
         self.cyc_rows = 0
         print(f"CYC START T={temp0:.1f}")
 
-    def cyc_log(self, t, temp, sa, st, pwm, kp, ki, kd, state, temp2=None, dbg=None):
-        if self.cyc_wr:
-            try:
-                t2str = f"{temp2:.2f}" if temp2 is not None else ""
-                if dbg:
-                    dbgvals = [f"{dbg['ff']:.2f}", f"{dbg['p']:.2f}", f"{dbg['i']:.2f}",
-                               f"{dbg['dd']:.2f}", f"{dbg['raw']:.2f}", f"{dbg['react']:.2f}",
-                               ("" if dbg.get('amb') is None else f"{dbg['amb']:.2f}")]
-                else:
-                    dbgvals = ["", "", "", "", "", "", ""]
-                _n = datetime.now()   # ONE call - two would give inconsistent ms
-                pcnow = _n.strftime("%Y-%m-%d %H:%M:%S.") + f"{_n.microsecond//1000:03d}"
-                self.cyc_wr.writerow([f"{t:.2f}", f"{temp:.2f}", f"{sa:.2f}",
-                                     f"{st:.2f}", pwm, f"{pwm*100/255:.1f}",
-                                     f"{kp:.3f}", f"{ki:.4f}", f"{kd:.3f}", state, t2str,
-                                     *dbgvals, pcnow])
-                self.cyc_file.flush()
-                self.cyc_rows += 1
-            except: pass
+    def cyc_log(self, t, temp, sa, st, pwm, kp, ki, kd, state, temp2=None,
+                dbg=None):
+        if not self.cyc_wr:
+            return
+        try:
+            t2str = f"{temp2:.2f}" if temp2 is not None else ""
+            if dbg:
+                dbgvals = [f"{dbg['ff']:.2f}", f"{dbg['p']:.2f}",
+                           f"{dbg['i']:.2f}", f"{dbg['dd']:.2f}",
+                           f"{dbg['raw']:.2f}", f"{dbg['react']:.2f}",
+                           ("" if dbg.get('amb') is None else f"{dbg['amb']:.2f}")]
+            else:
+                dbgvals = [""] * 7
+            # ONE call to now() - two would give inconsistent milliseconds.
+            n = datetime.now()
+            pcnow = n.strftime("%Y-%m-%d %H:%M:%S.") + f"{n.microsecond // 1000:03d}"
+            self.cyc_wr.writerow([f"{t:.2f}", f"{temp:.2f}", f"{sa:.2f}",
+                                  f"{st:.2f}", pwm, f"{pwm * 100 / 255:.1f}",
+                                  f"{kp:.3f}", f"{ki:.4f}", f"{kd:.3f}", state,
+                                  t2str, *dbgvals, pcnow])
+            self.cyc_file.flush()
+            self.cyc_rows += 1
+        except Exception:
+            pass
 
     def cyc_stop(self, reason=""):
         if self.cyc_file:
-            try: self.cyc_file.close()
-            except: pass
-        had_data = self.cyc_on and getattr(self, 'cyc_rows', 0) > 0
+            try:
+                self.cyc_file.close()
+            except Exception:
+                pass
+        had_data = self.cyc_on and self.cyc_rows > 0
         tmp_path = self.cyc_fn
-        self.cyc_on = False; self.cyc_file = None; self.cyc_wr = None
-        # We release the sleep lock ONLY when we are not in the middle of a
-        # series - between series legs cyc_stop/_cyc_start fire one right after
-        # the other (see _series_roll_cycle) and it would be a shame to let the
-        # system sleep in that gap.
-        if not getattr(self, 'series_running', False):
+        self.cyc_on = False
+        self.cyc_file = None
+        self.cyc_wr = None
+        # The sleep lock is released only when a series is NOT in flight -
+        # between legs cyc_stop and _cyc_start fire back to back, and it would
+        # be a shame to let the machine sleep in that gap.
+        if not self.series_running:
             self._wake_lock(False)
-            self.send("PCWD:0")     # disarm - nothing is running to protect
-        print(f"CYC STOP: {reason} ({getattr(self,'cyc_rows',0)} samples)")
-        if getattr(self, 'series_skip_archive', False):
-            # The "return to base" leg in a SERIES - not a test, just an approach
-            # to the starting position, so there is nothing to archive (see the
-            # comment in _series_launch_cool). We delete the temp file right away.
+            self.send("PCWD:0")
+        print(f"CYC STOP: {reason} ({self.cyc_rows} samples)")
+
+        if self.series_skip_archive:
+            # The "return to base" leg of a series - an approach to the starting
+            # position, not a test, so there is nothing to archive.
             self.series_skip_archive = False
             if tmp_path and tmp_path.exists():
-                try: tmp_path.unlink()
-                except: pass
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
             return
         if had_data and tmp_path and tmp_path.exists():
             hint = self.series_name_hint
             self.series_name_hint = None
             if hint:
-                # SERIES: save it right away under a readable name, WITHOUT a
-                # modal window (which would block the following automatic steps -
-                # nobody is standing at the computer to close it).
-                self.root.after(0, lambda: self.save_cycle_as(tmp_path, hint))
+                # SERIES: save straight away under a readable name, with no
+                # modal window - nobody is standing at the computer to close it.
+                self.call(lambda: self.save_cycle_as(tmp_path, hint))
             else:
-                # Ask for a name and save to the archive (in the GUI thread)
-                self.root.after(0, lambda: self._ask_save_name(tmp_path))
+                self.call(lambda: self._ask_save_name(tmp_path))
         elif tmp_path and tmp_path.exists():
-            # No data - delete the temporary file
-            try: tmp_path.unlink()
-            except: pass
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
     def _ask_save_name(self, tmp_path):
-        """Window asking for the run name for the archive"""
-        SaveCycleDialog(self.root, self, tmp_path)
+        SaveCycleDialog(self, self.th, self, tmp_path).exec()
 
-    # ════════════════════════════════════════════════════════
-    #  MEASUREMENT SERIES - an automatic sequence of SP/RATE tests with no
-    #  hand on the keyboard between consecutive tests. Each test is:
-    #    1) heating to SP with the given ramp (HEAT RATE) - until "reached"
-    #       (uses the same reach_done logic as the cards on CONTROL)
-    #    2) holding at SP for hold_s seconds (oscillation/lag is visible there)
-    #    3) STOP -> archiving under a readable name (without asking)
-    #    4) return to the base temperature (COOL RATE from the panel) before
-    #       the next test, so that every start is from the same point
-    # ════════════════════════════════════════════════════════
+    def save_cycle_as(self, tmp_path, name):
+        """Save under the user's description; a timestamp is added only when
+        that would overwrite an existing file."""
+        clean = re.sub(r'[^\w\-\s]', '', name.strip()).strip()
+        safe = re.sub(r'\s+', '_', clean) or "cykl"
+        dest = self.log_dir / f"c_{safe}.csv"
+        if dest.exists():
+            dest = self.log_dir / f"c_{safe}_{datetime.now():%m%d_%H%M}.csv"
+        try:
+            Path(tmp_path).rename(dest)
+            print(f"Run saved: {dest.name}")
+        except Exception as e:
+            print(f"Save error: {e}")
+        try:
+            self.refresh_arch()
+        except Exception:
+            pass
+
+    def discard_cycle(self, tmp_path):
+        try:
+            if Path(tmp_path).exists():
+                Path(tmp_path).unlink()
+        except Exception:
+            pass
+
+    # ════════════════════════════════════════════════════════════════════
+    #  MEASUREMENT SERIES
+    # ════════════════════════════════════════════════════════════════════
+    # An automatic sequence of setpoint/rate tests with no hand on the keyboard
+    # between them. Each test is:
+    #   1) ramp to the setpoint at the given rate, until "reached" (the same
+    #      criterion the Control cards use)
+    #   2) hold there for hold_s seconds, where oscillation and lag show up
+    #   3) archive under a readable name, without asking
+    #   4) return to base before the next test, so every start is from the same
+    #      point
     def series_add_step(self, sp, rate, hold_s):
-        self.series_steps.append({'sp': float(sp), 'rate': float(rate), 'hold_s': float(hold_s)})
+        self.series_steps.append({'sp': float(sp), 'rate': float(rate),
+                                  'hold_s': float(hold_s)})
         self._series_refresh_list()
 
     def series_remove_step(self, idx):
@@ -4970,39 +2430,73 @@ class PeltierControl:
             self._series_refresh_list()
 
     def _series_refresh_list(self):
-        if hasattr(self, 'series_listbox'):
-            self.series_listbox.delete(0, 'end')
-            for i, s in enumerate(self.series_steps):
-                self.series_listbox.insert('end',
-                    f"{i+1}. SP={s['sp']:.1f}°C  RATE={s['rate']:.1f}°C/min  hold={s['hold_s']:.0f}s")
+        if not hasattr(self, 'series_list'):
+            return
+        self.series_list.clear()
+        for i, s in enumerate(self.series_steps):
+            self.series_list.addItem(
+                f"{i + 1}.   {s['sp']:.1f} °C    {s['rate']:.1f} °C/min    "
+                f"hold {s['hold_s']:.0f} s")
+
+    def _on_series_add(self):
+        self.series_add_step(self.ser_sp.get(), self.ser_rate.get(),
+                             self.ser_hold.get())
+
+    def _on_series_remove(self):
+        row = self.series_list.currentRow()
+        if row >= 0:
+            self.series_remove_step(row)
+
+    def _on_series_clear(self):
+        self.series_steps = []
+        self._series_refresh_list()
+
+    def _on_series_base_change(self, v):
+        self.series_base_sp = float(v)
+
+    def _on_series_quickfill(self):
+        sp = self.ser_sp.get()
+        for rate in (10, 20, 30, 40, 50, 60, 70):
+            self.series_add_step(sp, rate, 60)
+
+    def _on_series_toggle(self):
+        if self.series_running:
+            self._series_abort("manual stop")
+            self.send("STOP")
+            self._update_run_button(False)
+        else:
+            self.series_start()
 
     def series_start(self):
         if not self.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            core.warn(self, "Not connected", "Connect to the device first.")
             return
         if not self.series_steps:
-            messagebox.showwarning("Empty series", "Add at least one test to the list.")
+            core.warn(self, "Empty series", "Add at least one test.")
             return
         if self.series_running:
             return
         self.series_running = True
         self.series_idx = 0
-        # Remember the COOL RATE from the CONTROL panel - the return between
-        # tests uses ITS OWN fast rate (see _series_launch_cool), regardless of
-        # what the user has set for the real tests.
-        # We restore the original after the series finishes/is aborted.
+        # The return between tests uses its OWN fast rate regardless of what
+        # Cool rate on Control says; the original is restored afterwards.
         self._series_saved_rd = self.sl_rd.get()
         self._series_status(f"Series start: {len(self.series_steps)} tests")
         self._series_launch_heat(self.series_idx)
-        if hasattr(self, 'btn_series_run'):
-            self.btn_series_run.config(text="■ STOP SERIES", bg=C['red'])
+        self._series_button(True)
+
+    def _series_button(self, running):
+        self.btn_series_run.setText("Stop series" if running else "Start series")
+        self.btn_series_run.setProperty('kind', 'stop' if running else 'go')
+        self._reicon(self.btn_series_run, 'stop' if running else 'play',
+                     'stop' if running else 'go')
+        self._restyle(self.btn_series_run)
 
     def _series_restore_rd(self):
-        saved = getattr(self, '_series_saved_rd', None)
-        if saved is not None:
-            self.sl_rd.set(saved)
+        if self._series_saved_rd is not None:
+            self.sl_rd.set(self._series_saved_rd)
             if self.connected:
-                self.send(f"RD:{saved:.1f}")
+                self.send(f"RD:{self._series_saved_rd:.1f}")
             self._series_saved_rd = None
 
     def _series_abort(self, reason=""):
@@ -5014,39 +2508,33 @@ class PeltierControl:
         if not self.cyc_on:
             self._wake_lock(False)
         self._series_restore_rd()
-        self._series_status(f"Series aborted ({reason})" if reason else "Series aborted")
-        if hasattr(self, 'btn_series_run'):
-            self.btn_series_run.config(text="▶ START SERIES", bg=C['green'])
+        self._series_status(f"Series aborted ({reason})" if reason
+                            else "Series aborted")
+        self._series_button(False)
 
     def _series_finish(self):
         self.series_running = False
         self.series_leg = None
         self.series_phase = None
-        # Series finished - if no single run is in progress any more, we can
-        # give the system back the right to sleep (see _wake_lock).
         if not self.cyc_on:
             self._wake_lock(False)
         self._series_restore_rd()
-        self._series_status(f"Series finished - {len(self.series_steps)} tests, files in PeltierLogi")
-        if hasattr(self, 'btn_series_run'):
-            self.btn_series_run.config(text="▶ START SERIES", bg=C['green'])
+        self._series_status(f"Series finished - {len(self.series_steps)} tests, "
+                            f"files in {self.log_dir.name}")
+        self._series_button(False)
 
     def _series_status(self, text):
         print(f"SERIES: {text}")
-        if hasattr(self, 'series_status_lbl'):
-            self.series_status_lbl.config(text=text)
+        if hasattr(self, 'series_status_row'):
+            self.series_status_row.title.setText(text)
 
     def _series_save_prog(self):
-        """Save the step list to a JSON file (run program)."""
         if not self.series_steps:
-            messagebox.showinfo("Empty program", "Add steps first.")
+            core.info(self, "Empty program", "Add steps first.")
             return
-        from tkinter import filedialog
-        dest = filedialog.asksaveasfilename(
-            title="Save program", defaultextension=".json",
-            initialdir=str(self.log_dir),
-            initialfile=datetime.now().strftime("program_%Y-%m-%d.json"),
-            filetypes=[("Program (JSON)", "*.json"), ("All files", "*.*")])
+        dest = core.save_path(self, "Save program",
+                              datetime.now().strftime("program_%Y-%m-%d.json"),
+                              "Program (*.json)", self.log_dir)
         if not dest:
             return
         try:
@@ -5054,87 +2542,73 @@ class PeltierControl:
                 json.dump({'tryb': self.series_mode.get(),
                            'baza': self.series_base_sp,
                            'kroki': self.series_steps}, f, indent=2)
-            self._series_status(f"Program saved: {dest}")
+            self._series_status(f"Program saved: {Path(dest).name}")
         except Exception as e:
-            messagebox.showerror("Save program", str(e))
+            core.error(self, "Save program", str(e))
 
     def _series_load_prog(self):
-        """Load the step list from a JSON file."""
-        from tkinter import filedialog
-        src = filedialog.askopenfilename(
-            title="Load program", initialdir=str(self.log_dir),
-            filetypes=[("Program (JSON)", "*.json"), ("All files", "*.*")])
+        src = core.open_path(self, "Load program", "Program (*.json)",
+                             self.log_dir)
         if not src:
             return
         try:
             with open(src, 'r', encoding='utf-8') as f:
                 d = json.load(f)
-            steps = d.get('kroki') or []
-            clean = []
-            for st in steps:
-                clean.append(dict(sp=float(st['sp']), rate=float(st['rate']),
-                                  hold_s=float(st.get('hold_s', 60))))
+            clean = [dict(sp=float(s['sp']), rate=float(s['rate']),
+                          hold_s=float(s.get('hold_s', 60)))
+                     for s in (d.get('kroki') or [])]
             if not clean:
-                messagebox.showwarning("Program", "The file contains no steps.")
+                core.warn(self, "Program", "The file contains no steps.")
                 return
             self.series_steps = clean
             if d.get('tryb') in ('seria', 'program'):
                 self.series_mode.set(d['tryb'])
+                self.seg_mode.setIndex(0 if d['tryb'] == 'seria' else 1,
+                                       emit=False)
             if d.get('baza') is not None:
                 self.series_base_sp = float(d['baza'])
-                if hasattr(self, 'series_e_base'):
-                    self.series_e_base.delete(0, 'end')
-                    self.series_e_base.insert(0, f"{self.series_base_sp:.1f}")
+                self.ser_base.set(self.series_base_sp)
             self._series_refresh_list()
             self._series_status(f"Program loaded: {len(clean)} steps")
         except Exception as e:
-            messagebox.showerror("Load program", str(e))
+            core.error(self, "Load program", str(e))
 
     def _series_roll_cycle(self, hint):
-        """Close the CURRENT run file under the name `hint` and immediately open
-        a new one - WITHOUT stopping the controller.
-
-        Previously every series leg was closed with STOP, because only an
-        AUTO->MAN transition closed the run file. That forced a break in control -
-        see the comment at _series_switch_leg.
-        """
+        """Close the CURRENT run file under `hint` and immediately open a new
+        one, WITHOUT stopping the controller. Previously every leg was closed
+        with STOP, because only an AUTO->MAN transition closed the file - and
+        that forced a break in control (see _series_switch_leg)."""
         self.series_name_hint = hint
         self.cyc_stop("end of series leg")
-        temp0 = self.temp[-1] if self.temp else 0.0
-        self._cyc_start(temp0)
+        self._cyc_start(self.temp[-1] if self.temp else 0.0)
 
     def _series_switch_leg(self, sp, ru=None, rd=None):
-        """Switch the series to a new target WITHOUT STOP/START - the controller stays in AUTO.
+        """Move to a new target WITHOUT STOP/START - the controller stays in AUTO.
 
-        WHY (report: "the cooling ramp starts later than the end of the heating
-        ramp, and the SP line is much lower"):
-        Previously, between legs it went STOP -> 600 ms -> START. On STOP the
-        firmware goes to MAN and ZEROES the power, and on START it does spA=lT,
-        i.e. it sets the active setpoint to the CURRENT reading. In that time the
-        reading had already dropped, because the heater/Peltier surface has low
-        inertia and after cutting ~60 PWM units it cools down instantly.
-        Measured on real logs (5 transitions, end of heating -> start of the
-        descent): a gap of 1.4-1.7 s, during which the temperature fell by
-        5.6-7.0 C (50.1-50.6 -> 43.1-44.6). That is why the descent ramp started
-        from ~44-47 C instead of from 50 C - exactly the "SP line much lower" and
-        the visible hole between the end of heating and the start of cooling.
+        WHY: previously the app went STOP -> 600 ms -> START between legs. On
+        STOP the firmware drops to MAN and zeroes the power; on START it sets
+        the active setpoint to the CURRENT reading. In that gap the reading had
+        already fallen, because the stage has low thermal inertia and cools the
+        instant ~60 PWM units are removed. Measured on real logs across five
+        transitions: a 1.4-1.7 s gap during which the temperature fell 5.6-7.0
+        °C, so the descent ramp began from ~44-47 °C instead of 50 - exactly the
+        "setpoint line much lower" and the visible hole between legs.
 
-        The firmware handles SP/RU/RD during AUTO (they only change the target and
-        the rates), and START does anything ONLY when sys==MAN. So it is enough not
-        to leave AUTO: spA transitions smoothly from 50 downwards, without zeroing
-        the power, without a break and without a setpoint jump.
+        The firmware accepts SP/RU/RD during AUTO (they only change the target
+        and the rates) and START does anything only when sys == MAN. So it is
+        enough not to leave AUTO: spA transitions smoothly, with no zeroed
+        power, no break and no setpoint jump.
         """
         if ru is not None:
             self.send(f"RU:{ru:.1f}")
         if rd is not None:
             self.send(f"RD:{rd:.1f}")
         self.send(f"SP:{sp:.1f}")
-        # The approach statistics are counted from scratch for every leg. NOTE:
-        # do_start ZEROES reach_start_t, because a MAN->AUTO transition follows
-        # right there, which sets it. Here there will be NO such transition (we
-        # stay in AUTO), so it has to be set MANUALLY - otherwise the approach
-        # detection condition in tick() (which requires reach_start_t is not None)
-        # would never fire and the leg would hang until the timeout.
+        # The approach statistics restart for every leg. NOTE: do_start zeroes
+        # reach_start_t because a MAN->AUTO transition follows and sets it. Here
+        # there will be NO such transition, so it has to be set by hand -
+        # otherwise the detection in tick() (which needs reach_start_t) would
+        # never fire and the leg would hang until its timeout.
         now = self.t[-1] if self.t else time.time()
         cur = self.temp[-1] if self.temp else None
         self.reach_start_t = now
@@ -5146,10 +2620,10 @@ class PeltierControl:
         self.reach_avg_rate = None
         self.reach_dir = None
         # None DELIBERATELY: the automatic setpoint-change detection in tick()
-        # compares the telemetry 'st' against this value, and for a moment after
-        # sending SP the telemetry still carries the OLD setpoint - writing the
-        # new target here would trigger a false "setpoint changed" and reset the
-        # counters we have just set. The series steers the setpoint itself anyway.
+        # compares telemetry against this value, and for a moment after sending
+        # SP the telemetry still carries the OLD setpoint. Writing the new
+        # target here would trigger a false "setpoint changed" and reset the
+        # counters we just set. The series steers the setpoint itself anyway.
         self.last_setpoint_target = None
         self._last_reach_summary = None
         self._ramp_reset(now, cur, sp)
@@ -5157,10 +2631,9 @@ class PeltierControl:
 
     def _series_launch_heat(self, idx):
         if not self.connected:
-            # The automatic series runs UNATTENDED - we do not leave a modal
-            # "not connected" window hanging in mid-air, we simply abort with a
-            # readable status.
-            self._series_abort("lost connection to the device")
+            # The series runs UNATTENDED - no modal "not connected" box left
+            # hanging in mid-air, just a readable status and a clean abort.
+            self._series_abort("lost the connection")
             return
         step = self.series_steps[idx]
         self.sl_sp.set(step['sp'])
@@ -5170,58 +2643,40 @@ class PeltierControl:
         self.series_phase = 'ramping'
         self.series_phase_t0 = time.time()
         self._series_status(
-            f"Test {idx+1}/{len(self.series_steps)}: SP={step['sp']:.1f}°C "
-            f"RATE={step['rate']:.1f}°C/min - heating...")
+            f"Test {idx + 1}/{len(self.series_steps)}: {step['sp']:.1f} °C at "
+            f"{step['rate']:.1f} °C/min — heating")
 
     def _series_launch_cool(self):
         if not self.connected:
-            self._series_abort("lost connection to the device")
+            self._series_abort("lost the connection")
             return
-        try:
-            return_rate = float(self.series_e_return_rate.get().replace(',', '.'))
-        except (ValueError, AttributeError):
-            return_rate = 80.0  # safe fallback = the default "max" (see build_series)
-        # The "descent also as a TEST" mode - we descend at the rate of the same
-        # series step as the heating, in order to collect data for cooling
-        # calibration (see the comment at self.series_cool_as_test in build_series).
-        cool_is_test = False
-        try:
-            cool_is_test = bool(self.series_cool_as_test.get())
-        except AttributeError:
-            pass
+        return_rate = self.ser_return.get()
+        cool_is_test = bool(self.series_cool_as_test.get())
         if cool_is_test and self.series_idx < len(self.series_steps):
+            # The descent as a FULL TEST: the power model was calibrated from
+            # HEATING data only, because the descents used to run at a fixed
+            # fast return rate. Running them at the test's own rate gives a
+            # matching set of cooling runs to calibrate that branch the same way.
             return_rate = self.series_steps[self.series_idx]['rate']
-        # Its own FAST return rate, INDEPENDENT of the COOL RATE on CONTROL -
-        # the return between tests is only an "approach to the starting position",
-        # not the test itself, so there is no reason to do it at the experiment rate.
         self.sl_rd.set(return_rate)
         self.sl_sp.set(self.series_base_sp)
-        # SMOOTH heating -> cooling transition: WITHOUT STOP/START (see
-        # _series_switch_leg). The descent starts exactly where the heating
-        # finished.
         self._series_switch_leg(self.series_base_sp, rd=return_rate)
         self.series_leg = 'cool'
         self.series_phase = 'ramping'
         self.series_phase_t0 = time.time()
-        # PREVIOUSLY: the return was treated as "not data for analysis" and
-        # skipped (series_skip_archive=True), so as not to clutter PeltierLogi.
-        # After the user's remark about the poor look of COOLING ("I would prefer
-        # it to descend evenly with the active setpoint") - and this leg is
-        # precisely our only downward ramp - we NOW archive it just like the
-        # heating, so that we have real data to analyse instead of guessing.
+        # The return used to be discarded as "not data". It is our ONLY downward
+        # ramp, so it is archived exactly like the heating - real data beats a
+        # tidy folder.
         self.series_skip_archive = False
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # A TEST vs RETURN prefix in the file name, so that at a single glance
-        # (and with a single filter during analysis) one can tell a descent done
-        # as a full-blown test from an ordinary approach to the base.
         kind = "cooltest" if cool_is_test else "cool"
-        self.series_name_hint = (
-            f"seria_{kind}_toSP{self.series_base_sp:.0f}_R{return_rate:.0f}_{ts}")
-        lbl = "DESCENT-TEST" if cool_is_test else "Return"
-        self._series_status(f"{lbl} to {self.series_base_sp:.1f}°C (rate {return_rate:.0f}°C/min)...")
+        self.series_name_hint = (f"seria_{kind}_toSP{self.series_base_sp:.0f}"
+                                 f"_R{return_rate:.0f}_{ts}")
+        lbl = "Descent test" if cool_is_test else "Return"
+        self._series_status(f"{lbl} to {self.series_base_sp:.1f} °C at "
+                            f"{return_rate:.0f} °C/min")
 
     def _series_tick(self):
-        """Called from the main tick() (about every 250ms) when a series is active."""
         if not self.series_running or self.series_idx >= len(self.series_steps):
             return
         now = time.time()
@@ -5232,79 +2687,71 @@ class PeltierControl:
                 self.series_phase = 'holding'
                 self.series_phase_t0 = now
                 self._series_status(
-                    f"Test {self.series_idx+1}/{len(self.series_steps)}: "
-                    f"reached SP={step['sp']:.1f} - hold {step['hold_s']:.0f}s")
+                    f"Test {self.series_idx + 1}/{len(self.series_steps)}: "
+                    f"reached {step['sp']:.1f} °C — holding {step['hold_s']:.0f}s")
             elif now - self.series_phase_t0 > SERIES_HEAT_TIMEOUT_S:
-                self._series_status(f"Test {self.series_idx+1}: approach TIMEOUT - ending this test")
+                self._series_status(f"Test {self.series_idx + 1}: approach "
+                                    "timed out — ending this test")
                 self._series_end_heat_leg(tag="TIMEOUT")
 
         elif self.series_leg == 'heat' and self.series_phase == 'holding':
             elapsed = now - self.series_phase_t0
-            remaining = max(0, step['hold_s'] - elapsed)
             self._series_status(
-                f"Test {self.series_idx+1}/{len(self.series_steps)}: "
-                f"holding SP={step['sp']:.1f} - {remaining:.0f}s left")
+                f"Test {self.series_idx + 1}/{len(self.series_steps)}: holding "
+                f"{step['sp']:.1f} °C — {max(0, step['hold_s'] - elapsed):.0f}s left")
             if elapsed >= step['hold_s']:
                 self._series_end_heat_leg(tag="OK")
 
         elif self.series_leg == 'cool' and self.series_phase == 'ramping':
-            # Up to .13 the descent ended EXACTLY here - at the moment of
-            # reaching, without a single hold sample (see the comment at
-            # REACH_TOL_C). Now it gets a hold phase just like the heating, so
-            # that the tail is visible in the log: whether the temperature
-            # actually settles on the target and whether it crosses it.
+            # The descent used to END here, at the moment of reaching, without a
+            # single hold sample. Now it gets a hold like the heating, so the
+            # tail is visible in the log: whether the temperature settles on the
+            # target and whether it crosses it.
             if self.reach_done:
                 self.series_phase = 'holding'
                 self.series_phase_t0 = now
                 self._series_status(
-                    f"Descent {self.series_idx+1}/{len(self.series_steps)}: "
-                    f"reached {self.series_base_sp:.1f} - hold "
+                    f"Descent {self.series_idx + 1}/{len(self.series_steps)}: "
+                    f"reached {self.series_base_sp:.1f} °C — holding "
                     f"{step['hold_s']:.0f}s")
             elif now - self.series_phase_t0 > SERIES_COOL_TIMEOUT_S:
-                self._series_status(f"Descent {self.series_idx+1}: approach TIMEOUT - ending")
+                self._series_status(f"Descent {self.series_idx + 1}: approach "
+                                    "timed out — ending")
                 self._series_end_cool_leg()
 
         elif self.series_leg == 'cool' and self.series_phase == 'holding':
             elapsed = now - self.series_phase_t0
-            remaining = max(0, step['hold_s'] - elapsed)
             self._series_status(
-                f"Descent {self.series_idx+1}/{len(self.series_steps)}: "
-                f"holding {self.series_base_sp:.1f} - {remaining:.0f}s left")
+                f"Descent {self.series_idx + 1}/{len(self.series_steps)}: "
+                f"holding {self.series_base_sp:.1f} °C — "
+                f"{max(0, step['hold_s'] - elapsed):.0f}s left")
             if elapsed >= step['hold_s']:
                 self._series_end_cool_leg()
 
     def _series_end_heat_leg(self, tag="OK"):
-        # THE BUG that caused this (found after the report "10/40/70 instead of
-        # the whole list"): tick() runs every 250ms, but the next step was
-        # scheduled with a 600ms delay (root.after) - and the condition that
-        # leads here (reach_done / hold_s elapsed) stayed TRUE for that whole
-        # 600ms. Effect: tick() called this function 2-3 times before the phase
-        # actually changed, and each call scheduled its OWN _series_advance -
-        # series_idx jumped by 2-3 instead of by 1 (which is why out of the list
-        # 10/20/30/40/50/60/70 only 10, 40, 70 actually ran - a jump of 3 every
-        # time). Fix: we set the 'ending' sentinel IMMEDIATELY (synchronously),
-        # so that the condition in tick() stops matching at once rather than
-        # only after 600ms.
+        # THE BUG THIS GUARD FIXES (reported as "10/40/70 instead of the whole
+        # list"): tick() runs every 250 ms, but the next step was scheduled with
+        # a 600 ms delay - and the condition that leads here stayed TRUE for
+        # that whole window. So tick() called this two or three times before the
+        # phase actually changed, each call scheduling its own advance, and
+        # series_idx jumped by 2-3 instead of 1. Setting the 'ending' sentinel
+        # synchronously makes the condition stop matching at once.
         self.series_phase = 'ending'
         step = self.series_steps[self.series_idx]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # In PROGRAM mode the name carries the step number - otherwise consecutive
-        # steps with the same SP would be indistinguishable in the archive.
-        try: _prog = (self.series_mode.get() == 'program')
-        except AttributeError: _prog = False
-        if _prog:
-            hint = (f"prog{self.series_idx+1:02d}_SP{step['sp']:.0f}"
+        prog = (self.series_mode.get() == 'program')
+        if prog:
+            # In program mode the name carries the step number - otherwise
+            # consecutive steps with the same setpoint are indistinguishable.
+            hint = (f"prog{self.series_idx + 1:02d}_SP{step['sp']:.0f}"
                     f"_R{step['rate']:.0f}_{tag}_{ts}")
         else:
             hint = f"seria_SP{step['sp']:.0f}_R{step['rate']:.0f}_{tag}_{ts}"
-        prog = False
-        try: prog = (self.series_mode.get() == 'program')
-        except AttributeError: pass
         nxt = self.series_idx + 1
+
         if prog:
             # PROGRAM: no return to base - the next step starts exactly where
-            # the previous one finished (smoothly, without STOP/START - see
-            # _series_switch_leg).
+            # this one finished, smoothly, without STOP/START.
             if nxt < len(self.series_steps) and self.connected:
                 self._series_roll_cycle(hint)
                 self.series_idx = nxt
@@ -5312,51 +2759,43 @@ class PeltierControl:
                 self.sl_sp.set(nstep['sp'])
                 cur = self.temp[-1] if self.temp else nstep['sp']
                 down = nstep['sp'] < cur - 0.5
-                if down: self.sl_rd.set(nstep['rate'])
-                else:    self.sl_ru.set(nstep['rate'])
-                self._series_switch_leg(nstep['sp'],
-                                        rd=(nstep['rate'] if down else None),
-                                        ru=(None if down else nstep['rate']))
-                self.series_leg = 'heat'      # 'heat' = the leg commanded by the step
+                (self.sl_rd if down else self.sl_ru).set(nstep['rate'])
+                self._series_switch_leg(
+                    nstep['sp'],
+                    rd=(nstep['rate'] if down else None),
+                    ru=(None if down else nstep['rate']))
+                self.series_leg = 'heat'    # 'heat' = the leg the step commands
                 self.series_phase = 'ramping'
                 self.series_phase_t0 = time.time()
                 self._series_status(
-                    f"Step {nxt+1}/{len(self.series_steps)}: "
-                    f"{'descent' if down else 'approach'} to {nstep['sp']:.1f}°C "
-                    f"@ {nstep['rate']:.0f}°C/min")
+                    f"Step {nxt + 1}/{len(self.series_steps)}: "
+                    f"{'descent' if down else 'approach'} to {nstep['sp']:.1f} °C "
+                    f"at {nstep['rate']:.0f} °C/min")
             else:
                 self.series_name_hint = hint
                 self.send("STOP")
                 self._update_run_button(False)
-                self.root.after(600, self._series_advance)
+                self.after(600, self._series_advance)
         elif abs(self.series_base_sp - step['sp']) > 0.5:
-            # SMOOTHLY: we close the heating file and immediately open the
-            # descent file, WITHOUT leaving AUTO - thanks to that the start of
-            # the descent = the end of the heating (see _series_switch_leg).
+            # Close the heating file and open the descent file immediately,
+            # WITHOUT leaving AUTO - so the descent starts where heating ended.
             self._series_roll_cycle(hint)
             self.series_leg = 'cool'
             self._series_launch_cool()
         else:
-            # Target = base, so there is no descent leg - here we really finish.
+            # Target equals base, so there is no descent leg - finish here.
             self.series_name_hint = hint
             self.send("STOP")
             self._update_run_button(False)
-            self.root.after(600, self._series_advance)
+            self.after(600, self._series_advance)
 
     def _series_end_cool_leg(self):
-        # The same sentinel guard as in _series_end_heat_leg - see the comment
-        # there. This was the ACTUAL source of the bug (reach_done stayed True
-        # for the whole 600ms without it), because every test in this series had
-        # base_sp!=SP, so it ALWAYS went through the 'cool' leg.
+        # The same sentinel guard as above - and this was the ACTUAL source of
+        # the skipping, because every test had base != setpoint and so always
+        # went through the cool leg.
         self.series_phase = 'ending'
-        # series_name_hint is already set in _series_launch_cool - the descent
-        # file is archived under the name "seria_cool_/cooltest_..." (cooling is
-        # data too - see the comment at _series_launch_cool).
         nxt = self.series_idx + 1
         if nxt < len(self.series_steps) and self.connected:
-            # There is another test - we transition SMOOTHLY, without STOP/START,
-            # so the next heating ramp starts exactly where the descent finished
-            # (see _series_switch_leg).
             self._series_roll_cycle(self.series_name_hint)
             self.series_idx = nxt
             step = self.series_steps[nxt]
@@ -5367,13 +2806,12 @@ class PeltierControl:
             self.series_phase = 'ramping'
             self.series_phase_t0 = time.time()
             self._series_status(
-                f"Test {nxt+1}/{len(self.series_steps)}: SP={step['sp']:.1f}°C "
-                f"RATE={step['rate']:.1f}°C/min - heating...")
+                f"Test {nxt + 1}/{len(self.series_steps)}: {step['sp']:.1f} °C "
+                f"at {step['rate']:.1f} °C/min — heating")
         else:
-            # Last step (or a lost connection) - here we really do stop.
             self.send("STOP")
             self._update_run_button(False)
-            self.root.after(600, self._series_advance)
+            self.after(600, self._series_advance)
 
     def _series_advance(self):
         if not self.series_running:
@@ -5386,957 +2824,780 @@ class PeltierControl:
         else:
             self._series_launch_heat(self.series_idx)
 
-    def save_cycle_as(self, tmp_path, name):
-        """Save the run under a name = the user's description (timestamp only on a duplicate)"""
-        import re as _re
-        # Keep a readable description: allow spaces, hyphens, underscores
-        clean = name.strip()
-        safe = _re.sub(r'[^\w\-\s]', '', clean).strip()
-        safe = _re.sub(r'\s+', '_', safe) or "cykl"
-        # File: prefix c_ (for searching the archive) + description
-        dest = self.log_dir / f"c_{safe}.csv"
-        # If it exists - add a timestamp so as not to overwrite
-        if dest.exists():
-            ts = datetime.now().strftime("%m%d_%H%M")
-            dest = self.log_dir / f"c_{safe}_{ts}.csv"
-        try:
-            tmp_path.rename(dest)
-            print(f"Run saved: {dest.name}")
-        except Exception as e:
-            print(f"Save error: {e}")
-        if hasattr(self, 'refresh_arch'):
-            try: self.refresh_arch()
-            except: pass
+    # ════════════════════════════════════════════════════════════════════
+    #  ARCHIVE
+    # ════════════════════════════════════════════════════════════════════
+    def _cycle_display_name(self, path):
+        s = Path(path).stem
+        if s.startswith('cykl_'):
+            s = s[5:]
+        elif s.startswith('c_'):
+            s = s[2:]
+        return s.replace('_', ' ')
 
-    def discard_cycle(self, tmp_path):
-        """Discard the run - delete the temporary file"""
-        try:
-            if tmp_path.exists(): tmp_path.unlink()
-            print("Run discarded")
-        except: pass
+    def _arch_files(self):
+        return sorted([f for f in self.log_dir.glob("*.csv")
+                       if (f.name.startswith("cykl_") or f.name.startswith("c_"))
+                       and not f.name.startswith("_tmp")],
+                      key=lambda f: f.stat().st_mtime, reverse=True)
 
-
-# ════════════════════════════════════════════════════════
-#  AUTO-CALIBRATION RANGE SELECTION DIALOG
-# ════════════════════════════════════════════════════════
-class CalRangeDialog:
-    def __init__(self, parent, app):
-        self.app = app
-        self.win = tk.Toplevel(parent)
-        self.win.title("Auto-Calibration Range")
-        self.win.configure(bg=C['bg'])
-        size_win(self.win, 560, 680, 540, 520, parent=parent)
-        self.win.transient(parent)
-        self.win.grab_set()
-
-        tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
-        # The button bar is PINNED AT THE BOTTOM OF THE WINDOW, outside the
-        # scrolling area - previously START/CANCEL were at the end of a long list
-        # in 'inner' and with a smaller window (or larger fonts) they went off
-        # screen, so "START CALIBRATION" could not be clicked.
-        self._btnbar = tk.Frame(self.win, bg=C['bg'])
-        self._btnbar.pack(side='bottom', fill='x', padx=24, pady=(0, 16))
-        # The rest of the content scrolls - this guarantees access to every field
-        # regardless of DPI and window size.
-        inner = make_scrollable(self.win, C['bg'], padx=24, pady=20)
-
-        tk.Label(inner, text="AUTO-CALIBRATION RANGE", bg=C['bg'], fg=C['text'],
-                 font=F(14, 1)).pack(anchor='w')
-        tk.Label(inner, text="Select temperature range and ramps to calibrate",
-                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 16))
-
-        # Temperature range - sliders
-        tmin0 = getattr(app, 'dev_cal_min', 50.0)
-        tmax0 = getattr(app, 'dev_cal_max', 100.0)
-
-        self.sl_tmin = SliderField(inner, "TEMP FROM", -10, 100, tmin0,
-                                   C['cyan'], "°C", 0)
-        self.sl_tmax = SliderField(inner, "TEMP TO", 0, 115, tmax0,
-                                   C['orange'], "°C", 0)
-
-        tk.Frame(inner, bg=C['border'], height=1).pack(fill='x', pady=(4, 8))
-
-        # Temperature step (info - the firmware uses every 10C)
-        tk.Label(inner, text="TEMP STEP: 10°C (fixed)", bg=C['bg'], fg=C['dim2'],
-                 font=F(9)).pack(anchor='w', pady=(0, 12))
-
-        # MAX RATE - slider (up to 80)
-        self.sl_maxrate = SliderField(inner, "MAX RATE", 5, 80, 40,
-                                      C['yellow'], "°C/min", 0,
-                                      on_change=lambda v: self._update_estimate())
-
-        # RATE STEP - choice of 5/10/20/40
-        tk.Label(inner, text="RATE STEP [°C/min]:", bg=C['bg'], fg=C['dim'],
-                 font=F(10, 1)).pack(anchor='w', pady=(8, 6))
-
-        self.rate_step = 5  # default step
-        self.step_btns = {}
-        step_frame = tk.Frame(inner, bg=C['bg'])
-        step_frame.pack(fill='x', pady=(0, 12))
-        for st in [5, 10, 20, 40]:
-            b = tk.Button(step_frame, text=f"{st}",
-                         command=lambda s=st: self._set_step(s),
-                         bg=C['bg2'], fg=C['dim'], font=F(12, 1),
-                         relief='flat', cursor='hand2', bd=0, padx=18, pady=10,
-                         activebackground=C['panel3'])
-            b.pack(side='left', padx=4, fill='x', expand=True)
-            self.step_btns[st] = b
-
-        # RECOMMENDED - the ramp list cannot be expressed with a uniform step
-        # (5, then every 10 up to 80) - this is exactly the default list from the
-        # firmware (calRamps[]). A separate button instead of trying to squeeze
-        # it into the RATE STEP above.
-        self.custom_ramps = None
-        self.btn_recommended = tk.Button(
-            inner, text="RECOMMENDED (5/10/20/30/40/50/60/70/80 °C/min)",
-            command=self._use_recommended_ramps,
-            bg=C['bg2'], fg=C['dim'], font=F(10, 1),
-            relief='flat', cursor='hand2', bd=0, padx=10, pady=8,
-            activebackground=C['panel3'])
-        self.btn_recommended.pack(fill='x', pady=(6, 0))
-
-        # Preview of the generated ramp list
-        self.ramps_preview = tk.Label(inner, text="", bg=C['bg'], fg=C['cyan'],
-                                     font=F(10))
-        self.ramps_preview.pack(anchor='w', pady=(0, 8))
-
-        # Estimated time
-        self.est_lbl = tk.Label(inner, text="", bg=C['bg'], fg=C['yellow'],
-                               font=F(10, 1))
-        self.est_lbl.pack(anchor='w', pady=(0, 12))
-        self._use_recommended_ramps()  # selected by default (instead of _set_step(10)) - it also called _update_estimate()
-
-        # Buttons - in the bar pinned at the bottom of the window (see self._btnbar)
-        bf = self._btnbar
-        mk_btn(bf, "▶ START CALIBRATION", self.start, C['purple'], fg='#fff').pack(
-            side='left', fill='x', expand=True, padx=(0, 4))
-        mk_btn_outline(bf, "CANCEL", self.win.destroy, C['dim']).pack(
-            side='left', fill='x', expand=True, padx=(4, 0))
-
-    def _set_step(self, step):
-        """Set the rate step (uniform step) and highlight the button - disables RECOMMENDED."""
-        self.custom_ramps = None
-        self.rate_step = step
-        for s, b in self.step_btns.items():
-            if s == step:
-                b.config(bg=C['cyan'], fg='#1a1c1f')
-            else:
-                b.config(bg=C['bg2'], fg=C['dim'])
-        if hasattr(self, 'btn_recommended'):
-            self.btn_recommended.config(bg=C['bg2'], fg=C['dim'])
-        self._update_estimate()
-
-    def _use_recommended_ramps(self):
-        """The default ramp list from the firmware (5, then every 10 up to 80) -
-        it cannot be expressed with a uniform step, hence a separate path from _set_step."""
-        self.custom_ramps = [5, 10, 20, 30, 40, 50, 60, 70, 80]
-        for b in self.step_btns.values():
-            b.config(bg=C['bg2'], fg=C['dim'])
-        self.btn_recommended.config(bg=C['cyan'], fg='#1a1c1f')
-        self._update_estimate()
-
-    def _gen_ramps(self):
-        """Generate the ramp list - either RECOMMENDED (custom_ramps) or a uniform
-        step from max+step. E.g. max=20 step=5 -> [5,10,15,20]"""
-        if self.custom_ramps is not None:
-            return list(self.custom_ramps)
-        try:
-            maxr = self.sl_maxrate.get()
-        except:
-            maxr = 20
-        step = self.rate_step
-        ramps = []
-        r = step
-        while r <= maxr + 0.01 and len(ramps) < 20:
-            ramps.append(int(round(r)))
-            r += step
-        if not ramps:  # when max < step, use max alone
-            ramps = [int(round(maxr))]
-        return ramps
-
-    def _update_estimate(self):
-        try:
-            tmin = self.sl_tmin.get(); tmax = self.sl_tmax.get()
-            n_temps = max(1, int((tmax - tmin) / 10) + 1)
-            ramps = self._gen_ramps()
-            n_ramps = len(ramps)
-            # Relay: about 2-4 min/temperature typically (depends on how quickly
-            # it catches the cycles - up to 10 min in the worst case). AFTER the
-            # relay, a ramping test per ramp: back-off (usually <1 min) + 60s test
-            # (run+tuning) = ~1.5 min/ramp.
-            total_tests = n_temps * (1 + n_ramps)  # relay + each ramp, per temperature
-            est_min = n_temps * (3 + n_ramps * 1.5)
-            # Preview of the ramp list
-            if hasattr(self, 'ramps_preview'):
-                self.ramps_preview.config(
-                    text=f"Ramps: {', '.join(str(r) for r in ramps)} °C/min")
-            self.est_lbl.config(text=f"≈ {n_temps} temp × (relay + {n_ramps} ramp) = "
-                                      f"{total_tests} tests · ~{est_min:.0f} min total")
-        except Exception as e:
-            print(f"est err: {e}")
-
-    def start(self):
-        tmin = self.sl_tmin.get(); tmax = self.sl_tmax.get()
-        if tmax <= tmin:
-            messagebox.showerror("Invalid range", "TEMP TO must be greater than TEMP FROM.")
+    def refresh_arch(self):
+        if not hasattr(self, 'arch_list'):
             return
-        ramps = self._gen_ramps()
-        if not ramps:
-            messagebox.showerror("No ramps", "Invalid rate settings.")
+        keep = {p for p, v in self.arch_vars.items() if v.get()}
+        self.arch_list.blockSignals(True)
+        self.arch_list.clear()
+        self.arch_vars = {}
+        files = self._arch_files()
+        if not files:
+            it = QListWidgetItem("No saved runs yet")
+            it.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.arch_list.addItem(it)
+            self.arch_list.blockSignals(False)
+            self.data_dir_row.sub.setText(str(self.log_dir))
             return
-        n_temps = int((tmax - tmin) / 10) + 1
-        total_tests = n_temps * (1 + len(ramps))
-        est_min = n_temps * (3 + len(ramps) * 1.5)
-        if not messagebox.askyesno("Start calibration",
-                f"Start auto-calibration?\n\n"
-                f"Temp range: {tmin:.0f}-{tmax:.0f}°C (step 10°C)\n"
-                f"Ramps: {', '.join(str(r) for r in ramps)} °C/min\n"
-                f"Total: {total_tests} tests (relay + {len(ramps)} ramp per temperature)\n"
-                f"Estimated: ~{est_min:.0f} min\n\n"
-                "Takes a while. Can be stopped with STOP."):
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        groups = {}
+        for f in files:
+            day = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d")
+            groups.setdefault(day, []).append(f)
+
+        i = 0
+        for day, day_files in groups.items():
+            hdr = QListWidgetItem(
+                f"{'Today' if day == today else day}   ({len(day_files)})")
+            hdr.setFlags(Qt.ItemFlag.NoItemFlags)
+            f = hdr.font()
+            f.setPointSize(max(7, self.th.pt('caption')))
+            f.setWeight(QFont.Weight.DemiBold)
+            hdr.setFont(f)
+            hdr.setForeground(QColor(self.th.solid('label2', 'card')))
+            self.arch_list.addItem(hdr)
+            for path in day_files:
+                key = str(path)
+                it = QListWidgetItem(self._cycle_display_name(path))
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(Qt.CheckState.Checked if key in keep
+                                 else Qt.CheckState.Unchecked)
+                it.setData(Qt.ItemDataRole.UserRole, key)
+                # The dot is the only thing tying a row to its curve.
+                it.setIcon(self._dot_icon(
+                    self.th[ARCH_COLOR_KEYS[i % len(ARCH_COLOR_KEYS)]]))
+                it.setToolTip(path.name)
+                self.arch_list.addItem(it)
+                self.arch_vars[key] = Var(key in keep)
+                i += 1
+        self.arch_list.blockSignals(False)
+        self.data_dir_row.sub.setText(str(self.log_dir))
+
+    def _dot_icon(self, color):
+        d = self.th.px(12)
+        px = QPixmap(d * 2, d * 2)
+        px.setDevicePixelRatio(2)
+        px.fill(Qt.GlobalColor.transparent)
+        q = QPainter(px)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        q.setPen(Qt.PenStyle.NoPen)
+        q.setBrush(QColor(color))
+        q.drawEllipse(1, 1, d - 2, d - 2)
+        q.end()
+        return QIcon(px)
+
+    def _on_arch_item(self, item):
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if key in self.arch_vars:
+            self.arch_vars[key].set(item.checkState() == Qt.CheckState.Checked)
+            self._redraw_arch()
+
+    def _set_all_checks(self, state):
+        self.arch_list.blockSignals(True)
+        for i in range(self.arch_list.count()):
+            it = self.arch_list.item(i)
+            key = it.data(Qt.ItemDataRole.UserRole)
+            if key:
+                it.setCheckState(state)
+                self.arch_vars[key].set(state == Qt.CheckState.Checked)
+        self.arch_list.blockSignals(False)
+        self._redraw_arch()
+
+    def _arch_select_all(self):
+        self._set_all_checks(Qt.CheckState.Checked)
+
+    def _arch_clear_sel(self):
+        self._set_all_checks(Qt.CheckState.Unchecked)
+
+    def _delete_selected(self):
+        it = self.arch_list.currentItem()
+        key = it.data(Qt.ItemDataRole.UserRole) if it else None
+        if not key:
+            core.info(self, "Nothing selected", "Click a run in the list first.")
             return
-        self.app.start_autocal(tmin, tmax, ramps)
-        self.win.destroy()
+        name = self._cycle_display_name(Path(key))
+        if core.ask(self, "Delete this run?", f"{name}\n\nThis cannot be undone."):
+            try:
+                Path(key).unlink()
+                self.refresh_arch()
+                self._redraw_arch()
+            except Exception as e:
+                core.error(self, "Delete error", str(e))
 
-class CalibrationWindow:
-    # Phases of one step (order = the sequence in the firmware): relay first
-    # measures the base Kp/Ki/Kd for the temperature, then rampprep/ramptest run
-    # in a loop for every ramp from calRamps (they tune the heating branch per ramp).
-    PHASES = [('heating', '① Heating'), ('stabil', '② Stabilization'),
-              ('relay', '③ Relay measurement'), ('rampprep', '④ Back-off'),
-              ('ramptest', '⑤ Ramp test')]
-    def __init__(self, parent, app):
-        self.app = app
-        self.win = tk.Toplevel(parent)
-        self.win.title("Calibration progress")
-        self.win.configure(bg=C['bg'])
-        size_win(self.win, 640, 780, 600, 560, parent=parent)
-        self.win.transient(parent)
+    def _on_xmode_change(self, i):
+        self.arch_xmode.set(['t0', 'abs', 'pc', 'ramp', 'temp'][i])
+        en = self.arch_xmode.get() == 'temp'
+        self.sl_tref.setEnabled(en)
+        self.lbl_tref.setEnabled(en)
+        self._redraw_arch()
 
-        tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
-        inner = tk.Frame(self.win, bg=C['bg'])
-        inner.pack(fill='both', expand=True, padx=20, pady=16)
+    def _on_tref(self, v):
+        self.arch_tref.set(v)
+        self.lbl_tref.setText(f"{v:.1f} °C")
+        if self.arch_xmode.get() == 'temp':
+            self._redraw_arch()
 
-        tk.Label(inner, text="CALIBRATION PROGRESS", bg=C['bg'], fg=C['text'],
-                 font=F(14, 1)).pack(anchor='w')
-        tk.Label(inner, text="Relay autotuning — one test per temperature (fills all ramps)",
-                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 10))
-
-        # Progress bar (counted in temperatures)
-        self.prog_frame = tk.Frame(inner, bg=C['bg2'], height=SC(30))
-        self.prog_frame.pack(fill='x', pady=(0, 10))
-        self.prog_frame.pack_propagate(False)
-        self.prog_bar = tk.Frame(self.prog_frame, bg=C['purple'], height=SC(30))
-        self.prog_bar.place(x=0, y=0, relheight=1, relwidth=0)
-        self.prog_text = tk.Label(self.prog_frame, text="0 / 0 temperatures", bg=C['bg2'],
-                                  fg=C['text'], font=F(11, 1))
-        self.prog_text.place(relx=0.5, rely=0.5, anchor='center')
-
-        # Current step
-        info = tk.Frame(inner, bg=C['panel'])
-        info.pack(fill='x', pady=(0, 10))
-        ii = tk.Frame(info, bg=C['panel'])
-        ii.pack(fill='x', padx=14, pady=12)
-
-        row1 = tk.Frame(ii, bg=C['panel']); row1.pack(fill='x', pady=2)
-        tk.Label(row1, text="NOW:", bg=C['panel'], fg=C['dim2'],
-                 font=F(9), width=11, anchor='w').pack(side='left')
-        self.lbl_now = tk.Label(row1, text="—", bg=C['panel'], fg=C['orange'],
-                                font=F(12, 1), anchor='w')
-        self.lbl_now.pack(side='left')
-
-        # Phase indicator: heating -> stabilization -> relay
-        phase_row = tk.Frame(ii, bg=C['panel']); phase_row.pack(fill='x', pady=(8, 4))
-        tk.Label(phase_row, text="PHASE:", bg=C['panel'], fg=C['dim2'],
-                 font=F(9), width=11, anchor='w').pack(side='left')
-        self.phase_lbls = {}
-        for key, label in self.PHASES:
-            l = tk.Label(phase_row, text=label, bg=C['bg2'], fg=C['dim2'],
-                         font=F(9), padx=8, pady=4)
-            l.pack(side='left', padx=(0, 4))
-            self.phase_lbls[key] = l
-
-        row2 = tk.Frame(ii, bg=C['panel']); row2.pack(fill='x', pady=2)
-        tk.Label(row2, text="NEXT:", bg=C['panel'], fg=C['dim2'],
-                 font=F(9), width=11, anchor='w').pack(side='left')
-        self.lbl_next = tk.Label(row2, text="—", bg=C['panel'], fg=C['cyan'],
-                                 font=F(11), anchor='w')
-        self.lbl_next.pack(side='left')
-
-        row3 = tk.Frame(ii, bg=C['panel']); row3.pack(fill='x', pady=2)
-        tk.Label(row3, text="REMAINING:", bg=C['panel'], fg=C['dim2'],
-                 font=F(9), width=11, anchor='w').pack(side='left')
-        self.lbl_eta = tk.Label(row3, text="—", bg=C['panel'], fg=C['yellow'],
-                                font=F(11, 1), anchor='w')
-        self.lbl_eta.pack(side='left')
-
-        # Warnings: points where the relay test did not catch oscillation and
-        # got base values instead of actually measured ones (visible
-        # only here - previously this fact went ONLY to the raw
-        # serial console as "RELAY FAIL - bazowe")
-        self.lbl_warn = tk.Label(inner, text="", bg=C['bg'], fg=C['red'],
-                                 font=F(9), anchor='w', justify='left',
-                                 wraplength=580)
-        self.lbl_warn.pack(anchor='w', pady=(0, 6))
-
-        # List of temperatures to calibrate
-        tk.Label(inner, text="TEMPERATURES", bg=C['bg'], fg=C['dim'],
-                 font=F(10, 1)).pack(anchor='w', pady=(4, 4))
-
-        list_wrap = tk.Frame(inner, bg=C['bg2'])
-        list_wrap.pack(fill='both', expand=True)
-        sb = tk.Scrollbar(list_wrap)
-        sb.pack(side='right', fill='y')
-        self.canvas = tk.Canvas(list_wrap, bg=C['bg2'], highlightthickness=0,
-                               yscrollcommand=sb.set)
-        self.canvas.pack(side='left', fill='both', expand=True)
-        sb.config(command=self.canvas.yview)
-        self.steps_frame = tk.Frame(self.canvas, bg=C['bg2'])
-        self.canvas.create_window((0, 0), window=self.steps_frame, anchor='nw')
-        self.steps_frame.bind('<Configure>',
-            lambda e: self.canvas.config(scrollregion=self.canvas.bbox('all')))
-
-        mk_btn_outline(inner, "■ ABORT CALIBRATION", self.abort, C['red']).pack(
-            fill='x', pady=(12, 0))
-
-        self.step_widgets = []
-        self.refresh()
-
-    def _step_label(self, t, r):
-        """Readable step label. Safe for relay, where r is a string
-        (the old {r:.0f} formatting raised an exception and the list never built)."""
+    # ── loading ─────────────────────────────────────────────────────────
+    def _cycle_settings(self, path):
+        """Target, ramp and gains as recorded in the file."""
         try:
-            if isinstance(r, str):     # relay mode: one test per temperature
-                return f"{t:.0f}°C"
-            return f"{t:.0f}°C  @  {r:.0f}°C/min"
+            with open(path, 'r', encoding='utf-8') as f:
+                rows = [csv_row(r) for r in csv.DictReader(f)]
         except Exception:
-            return f"{t}"
-
-    def refresh(self):
-        app = self.app
-        total = app.cal_total or len(app.cal_plan)
-        cur = app.cal_current
-        phase = getattr(app, 'cal_phase', None)
-
-        # Progress bar - computed so it does NOT jump to 100% the moment
-        # the last point is only just starting (see _cal_progress_fraction:
-        # cur/total did not distinguish that from "really finished").
-        frac = app._cal_progress_fraction()
-        self.prog_bar.place_configure(relwidth=min(1.0, frac))
-        self.prog_text.config(text=f"{min(cur, total)} / {total} temperatures")
-
-        # NOW
-        if app.cal_cur_temp is not None:
-            tnum = f"   ({cur}/{total})" if cur else ""
-            rtxt = ""
-            if phase in ('rampprep', 'ramptest') and isinstance(app.cal_cur_ramp, (int, float)):
-                rtxt = f"   @ {app.cal_cur_ramp:.0f}°C/min"
-            self.lbl_now.config(text=f"{app.cal_cur_temp:.0f}°C{tnum}{rtxt}")
-        else:
-            self.lbl_now.config(text="— (waiting for device)")
-
-        # Highlight the active phase
-        for key, _ in self.PHASES:
-            if key == phase:
-                self.phase_lbls[key].config(bg=C['orange'], fg='#1a1c1f')
-            else:
-                self.phase_lbls[key].config(bg=C['bg2'], fg=C['dim2'])
-
-        # NEXT temperature
-        if 0 < cur < len(app.cal_plan):
-            nt, nr = app.cal_plan[cur]
-            self.lbl_next.config(text=self._step_label(nt, nr))
-        elif cur >= len(app.cal_plan) and len(app.cal_plan) > 0:
-            self.lbl_next.config(text="(last)")
-        else:
-            self.lbl_next.config(text="—")
-
-        # ETA - "COMPLETED" only when the calibration has REALLY finished
-        # (cal_running=False), not when the last point has only just started.
-        if not app.cal_running and cur >= total and total > 0:
-            self.lbl_eta.config(text="COMPLETED ✓")
-        else:
-            eta = app._cal_eta()
-            if eta is None:
-                self.lbl_eta.config(text="—")
-            elif eta < 1:
-                # avoid the misleading "0 min 0 s" when it is really still working
-                self.lbl_eta.config(text="finalizing…")
-            else:
-                m = int(eta // 60); s = int(eta % 60)
-                self.lbl_eta.config(text=f"~{m} min {s} s")
-
-        # Warnings about points with a failed relay test (base values)
-        warns = getattr(app, 'cal_warnings', [])
-        lines = []
-        if warns:
-            def _wtxt(w):
-                t, cycles, amp = w
-                if amp is not None and amp >= 140:
-                    return f"{t:.0f}°C (even max. excitation power did not help)"
-                return f"{t:.0f}°C"
-            temps_txt = ", ".join(_wtxt(w) for w in warns)
-            lines.append(f"⚠ Relay test did not catch oscillation for: {temps_txt} — "
-                         f"base values (10.0/0.30/0.80) were used instead of actually measured ones.")
-        # Warnings about individual ramps that did not get below the tracking
-        # error threshold (ramp test AFTER relay - the relay for that temperature
-        # itself succeeded, its result stays for that ramp - this is NOT
-        # the same as above, hence a separate, less alarming line).
-        rwarns = getattr(app, 'cal_ramp_warnings', [])
-        if rwarns:
-            def _rwtxt(w):
-                t, r, err = w
-                rtxt = f"{r:.0f}°C/min" if r is not None else "?"
-                etxt = f", error {err:.1f}°C" if err is not None else ""
-                return f"{t:.0f}°C @ {rtxt}{etxt}"
-            lines.append("⚠ Ramp test did not bring the ASP tracking error below threshold for: "
-                         + ", ".join(_rwtxt(w) for w in rwarns)
-                         + " — the base profile from relay (still actually measured) stays for those ramps.")
-        self.lbl_warn.config(text="\n".join(lines))
-
-        # Temperature list - build once, then update statuses
-        if len(self.step_widgets) != len(app.cal_plan):
-            for w in self.steps_frame.winfo_children():
-                w.destroy()
-            self.step_widgets = []
-            for i, (t, r) in enumerate(app.cal_plan):
-                row = tk.Frame(self.steps_frame, bg=C['bg2'])
-                row.pack(fill='x', pady=1)
-                bar = tk.Frame(row, bg=C['bg2'], width=4)
-                bar.pack(side='left', fill='y')
-                num = tk.Label(row, text=f"{i+1:2d}", bg=C['bg2'], fg=C['dim2'],
-                              font=F(9), width=4, anchor='w')
-                num.pack(side='left')
-                txt = tk.Label(row, text=self._step_label(t, r),
-                              bg=C['bg2'], fg=C['dim'], font=F(10), anchor='w')
-                txt.pack(side='left', fill='x', expand=True, padx=(2, 0))
-                stat = tk.Label(row, text="", bg=C['bg2'], fg=C['dim2'],
-                               font=F(9), anchor='e', width=18)
-                stat.pack(side='right')
-                self.step_widgets.append((bar, num, txt, stat))
-
-        # Statuses + colors
-        phase_txt = {'heating': '→ heating', 'stabil': '~ stabilization',
-                     'relay': '◇ relay measurement'}
-        warn_temps = {round(w[0]) for w in getattr(app, 'cal_warnings', [])}
-        for i, (bar, num, txt, stat) in enumerate(self.step_widgets):
-            step_no = i + 1
-            step_temp = app.cal_plan[i][0] if i < len(app.cal_plan) else None
-            failed = step_temp is not None and round(step_temp) in warn_temps
-            if step_no < cur:
-                if failed:
-                    bar.config(bg=C['red']); txt.config(fg=C['dim2'])
-                    num.config(fg=C['red']); stat.config(text="⚠ base (fail)", fg=C['red'])
-                else:
-                    bar.config(bg=C['green']); txt.config(fg=C['dim2'])
-                    num.config(fg=C['green']); stat.config(text="✓ done", fg=C['green'])
-            elif step_no == cur:
-                bar.config(bg=C['orange']); txt.config(fg=C['text'])
-                num.config(fg=C['orange'])
-                stat.config(text=phase_txt.get(phase, "● now"), fg=C['orange'])
-                try: self.canvas.yview_moveto(max(0, (i-3))/max(1, len(self.step_widgets)))
-                except: pass
-            else:
-                bar.config(bg=C['bg2']); txt.config(fg=C['dim'])
-                num.config(fg=C['dim2']); stat.config(text="pending", fg=C['dim2'])
-
-    def abort(self):
-        if messagebox.askyesno("Abort?", "Abort calibration?"):
-            self.app.send("AUTOCALSTOP")
-            self.app.send("STOP")
-            self.app.cal_running = False
-            self.win.destroy()
-
-
-# ════════════════════════════════════════════════════════
-#  DIAGNOSTICS WINDOW - log of all firmware events + active alarms
-# ════════════════════════════════════════════════════════
-class DiagnosticsWindow:
-    """Shows everything the firmware sends over Serial, not just the
-    CSV telemetry: error codes (ERR:) decoded into a readable description,
-    calibration warnings (CALWARN) and every other text line (e.g.
-    'Flash: zapisano.', 'AUTOCAL START') that the app used to drop
-    silently. This makes catching and reporting errors easier, because
-    you no longer need to attach a separate Serial Monitor (which cannot
-    be done in parallel with the app on the same COM port anyway)."""
-    LEVEL_COLOR = {'ERR': 'red', 'WARN': 'orange', 'INFO': 'dim'}
-
-    def __init__(self, parent, app):
-        self.app = app
-        self.win = tk.Toplevel(parent)
-        self.win.title("Diagnostics")
-        self.win.configure(bg=C['bg'])
-        size_win(self.win, 640, 560, 480, 360, parent=parent)
-        self.win.transient(parent)
-        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
-        inner = tk.Frame(self.win, bg=C['bg'])
-        inner.pack(fill='both', expand=True, padx=20, pady=16)
-
-        tk.Label(inner, text="DIAGNOSTICS", bg=C['bg'], fg=C['text'],
-                 font=F(14, 1)).pack(anchor='w')
-        tk.Label(inner, text="All events and errors reported by the firmware",
-                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 12))
-
-        # Active alarms banner (visible only when err_active is not empty)
-        self.active_frame = tk.Frame(inner, bg=C['bg2'])
-        self.active_frame.pack(fill='x', pady=(0, 12))
-
-        # Log - Text with color tags per level
-        log_wrap = tk.Frame(inner, bg=C['bg2'])
-        log_wrap.pack(fill='both', expand=True)
-        sb = tk.Scrollbar(log_wrap)
-        sb.pack(side='right', fill='y')
-        self.text = tk.Text(log_wrap, bg=C['bg2'], fg=C['dim'], font=F(9),
-                             relief='flat', bd=0, wrap='word', state='disabled',
-                             yscrollcommand=sb.set, padx=10, pady=8)
-        self.text.pack(side='left', fill='both', expand=True)
-        sb.config(command=self.text.yview)
-        self.text.tag_config('ERR', foreground=C['red'])
-        self.text.tag_config('WARN', foreground=C['orange'])
-        self.text.tag_config('INFO', foreground=C['dim'])
-        self.text.tag_config('ts', foreground=C['dim2'])
-
-        btn_row = tk.Frame(inner, bg=C['bg'])
-        btn_row.pack(fill='x', pady=(12, 0))
-        mk_btn(btn_row, "SAVE TO FILE", self.export_log, C['cyan']).pack(side='left')
-        mk_btn_outline(btn_row, "CLEAR", self.clear_log, C['dim']).pack(side='left', padx=(8, 0))
-        mk_btn_outline(btn_row, "CLOSE", self._on_close, C['red']).pack(side='right')
-
-        self.refresh_active()
-        self.reload_log()
-
-    def refresh_active(self):
-        for w in self.active_frame.winfo_children():
-            w.destroy()
-        if not self.app.err_active:
-            tk.Label(self.active_frame, text="No active alarms.", bg=C['bg2'],
-                     fg=C['green'], font=F(9), anchor='w').pack(
-                     fill='x', padx=10, pady=8)
-            return
-        for code, text in self.app.err_active.items():
-            row = tk.Frame(self.active_frame, bg=C['bg2'])
-            row.pack(fill='x')
-            tk.Frame(row, bg=C['red'], width=4).pack(side='left', fill='y')
-            tk.Label(row, text=f"⚠ [{code}] {text}", bg=C['bg2'], fg=C['red'],
-                     font=F(9, 1), anchor='w', justify='left',
-                     wraplength=560).pack(side='left', fill='x', expand=True, padx=8, pady=6)
-
-    def reload_log(self):
-        self.text.config(state='normal')
-        self.text.delete('1.0', 'end')
-        for entry in self.app.diag_log:
-            self._insert_entry(entry)
-        self.text.config(state='disabled')
-        self.text.see('end')
-
-    def append_entry(self, entry):
-        """Called from app._log_diag() when the window is open - appends live
-        instead of waiting for reload_log()."""
+            return None
+        valid = [r for r in rows
+                 if (r.get('time_s') or '').replace('.', '').replace('-', '').isdigit()]
+        if not valid:
+            return None
+        s = {}
         try:
-            self.text.config(state='normal')
-            self._insert_entry(entry)
-            self.text.config(state='disabled')
-            self.text.see('end')
+            sps = [float(r['setpoint_target']) for r in valid
+                   if r.get('setpoint_target')]
+            s['target'] = max(set(sps), key=sps.count) if sps else None
+        except Exception:
+            s['target'] = None
+        try:
+            s['kp'] = float(valid[0].get('Kp', 0))
+            s['ki'] = float(valid[0].get('Ki', 0))
+            s['kd'] = float(valid[0].get('Kd', 0))
+        except Exception:
+            s['kp'] = s['ki'] = s['kd'] = None
+        # The ramp is estimated from the slope of the active setpoint at the
+        # start - which is the commanded rate, not the achieved one.
+        try:
+            t0 = float(valid[0]['time_s'])
+            sa0 = float(valid[0]['setpoint_active'])
+            ramp = None
+            for r in valid:
+                tt = float(r['time_s'])
+                if tt - t0 >= 5:
+                    dt_min = (tt - t0) / 60.0
+                    if dt_min > 0:
+                        ramp = abs(float(r['setpoint_active']) - sa0) / dt_min
+                    break
+            s['ramp'] = ramp
+        except Exception:
+            s['ramp'] = None
+        return s
+
+    def _load_cycle_data(self, path):
+        """(t, temp, target, pwm) from a run file, comment tolerant."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = [csv_row(r) for r in csv.DictReader(f)]
+        except Exception:
+            return None
+        t, temp, spt, pwm, temp2, sa_list, pc_raw = [], [], [], [], [], [], []
+        for r in data:
+            cz = r.get('time_s', '')
+            if not cz or cz.startswith('#'):
+                continue
+            try:
+                tt = float(cz)
+                tm = float(r.get('temperature_C', 'nan'))
+                sp = float(r.get('setpoint_target', 'nan'))
+            except (ValueError, TypeError):
+                continue
+            t.append(tt); temp.append(tm); spt.append(sp)
+            try:
+                sa_list.append(float(r.get('setpoint_active', 'nan')))
+            except Exception:
+                sa_list.append(None)
+            try:
+                pwm.append(float(r.get('PWM_%', r.get('PWM', 0))))
+            except Exception:
+                pwm.append(0)
+            try:
+                v = r.get('temperature2_C', '')
+                temp2.append(float(v) if v else None)
+            except Exception:
+                temp2.append(None)
+            pc_raw.append(r.get('pc_time', '') or '')
+        if not t:
+            return None
+        self._last_temp2 = temp2
+        self._last_sa = sa_list
+        self._last_pc = self._pc_seconds(pc_raw, t, path)
+        return t, temp, spt, pwm
+
+    def _pc_seconds(self, pc_raw, t, path):
+        """The PC clock column as epoch seconds. Old files have no such column,
+        so the axis is rebuilt from the file's modification time: mtime is the
+        moment of CLOSING, so start = mtime - run length."""
+        out, ok = [], False
+        for sraw in pc_raw:
+            v = None
+            if sraw:
+                for fmt, n in (("%Y-%m-%d %H:%M:%S.%f", 23),
+                               ("%Y-%m-%d %H:%M:%S", 19)):
+                    try:
+                        v = datetime.strptime(sraw[:n], fmt).timestamp()
+                        ok = True
+                        break
+                    except Exception:
+                        v = None
+            out.append(v)
+        if ok:
+            base = next((i for i, v in enumerate(out) if v is not None), None)
+            if base is not None:
+                t0 = out[base] - t[base]
+                out = [v if v is not None else t0 + t[i]
+                       for i, v in enumerate(out)]
+            return out
+        try:
+            end = Path(path).stat().st_mtime
+            t0 = end - (t[-1] - t[0])
+            return [t0 + (x - t[0]) for x in t]
+        except Exception:
+            return [None] * len(t)
+
+    def _compute_stats(self, data):
+        t, temp, spt, pwm = data
+        st = {}
+        st['tmin'] = min(temp)
+        st['tmax'] = max(temp)
+        st['duration'] = t[-1] - t[0] if len(t) > 1 else 0
+        st['target'] = spt[-1] if spt else 0
+
+        idx_max = temp.index(st['tmax'])
+        rise_time = t[idx_max] - t[0] if idx_max > 0 else 0
+        st['avg_rise'] = ((st['tmax'] - temp[0]) / (rise_time / 60.0)
+                          if rise_time > 5 else 0)
+
+        target = st['target']
+        st['overshoot'] = max(0, st['tmax'] - target) if target else 0
+
+        # Settling = the first sample after which it STAYS within ±1 °C
+        st['settle_time'] = None
+        if target:
+            for i, tm in enumerate(temp):
+                if abs(tm - target) <= 1.0:
+                    rest = temp[i:]
+                    if sum(1 for x in rest if abs(x - target) <= 1.0) >= len(rest) * 0.8:
+                        st['settle_time'] = t[i] - t[0]
+                        break
+
+        n = len(temp)
+        tail = temp[int(n * 0.8):] if n > 5 else temp
+        st['steady_error'] = (statistics.mean(abs(x - target) for x in tail)
+                              if target and tail else 0)
+        devs = [abs(temp[i] - spt[i]) for i in range(len(temp))]
+        st['max_dev'] = max(devs) if devs else 0
+        # Noise in the settled tail is a measure of MEASUREMENT quality, not of
+        # control quality - it is the thermocouple and its wiring.
+        st['noise_std'] = statistics.stdev(tail) if len(tail) > 2 else 0
+        return st
+
+    def _arch_t_offset(self, t, temp, mode, tref):
+        """The x-axis zero for one run, per the selected alignment."""
+        if mode == 'abs':
+            return 0.0
+        if mode == 'temp':
+            # The FIRST crossing of tref, interpolated between samples, so runs
+            # that started from different temperatures overlay at the same
+            # THERMAL point rather than the same time point.
+            for i in range(1, len(temp)):
+                a, b = temp[i - 1], temp[i]
+                if (a - tref) * (b - tref) <= 0 and a != b:
+                    f = (tref - a) / (b - a)
+                    return t[i - 1] + f * (t[i] - t[i - 1])
+                if a == tref:
+                    return t[i - 1]
+            return t[0]
+        if mode == 'ramp':
+            # Zero = where the ramp REALLY starts, detected from the active
+            # setpoint: while it stands still we are still pre-start. Aligns
+            # runs with different run-ups before the actual ramp.
+            sa = self._last_sa or []
+            for i in range(1, min(len(sa), len(t))):
+                if (sa[i] is not None and sa[0] is not None
+                        and abs(sa[i] - sa[0]) > 0.05):
+                    return t[i]
+            for i in range(1, len(temp)):
+                if abs(temp[i] - temp[0]) > 0.3:
+                    return t[i]
+            return t[0]
+        return t[0]                                    # 't0'
+
+    def _redraw_arch(self):
+        if not hasattr(self, 'ax_a'):
+            return
+        cs = self.chart_a.cs
+        selected = [p for p, v in self.arch_vars.items() if v.get()]
+        self.ax_a.clear()
+        # The PWM axis is created on demand; the old one is removed on every
+        # redraw or they would pile up.
+        if self._ax_pwm is not None:
+            try:
+                self._ax_pwm.remove()
+            except Exception:
+                pass
+            self._ax_pwm = None
+
+        mode = self.arch_xmode.get()
+        show = {k: v.get() for k, v in self.arch_show.items()}
+        tref = self.arch_tref.get()
+
+        if not selected:
+            self.ax_a.text(0.5, 0.5, "Pick one or more runs on the left",
+                           ha='center', va='center', color=cs['dim2'],
+                           fontsize=11, transform=self.ax_a.transAxes)
+            style_axes(self.ax_a, cs, grid=False)
+            self.ax_a.set_xticks([]); self.ax_a.set_yticks([])
+            self.chart_a.nav.restore()
+            self.chart_a.draw()
+            self.arch_settings_lbl.setText("")
+            self.arch_title.setText("drag · scroll · right-click")
+            return
+
+        files = self._arch_files()
+        file_order = {str(f): i for i, f in enumerate(files)}
+        multi = len(selected) > 1
+
+        series = []
+        for path in selected:
+            d = self._load_cycle_data(path)
+            if not d:
+                continue
+            t, temp, spt, pwm = d
+            series.append(dict(path=path, t=t, temp=temp, spt=spt, pwm=pwm,
+                               sa=list(self._last_sa or []),
+                               t2=list(self._last_temp2 or []),
+                               pc=list(self._last_pc or [])))
+        if not series:
+            self.chart_a.draw()
+            return
+        # Order = the order of the list on the left. It matters for the
+        # difference mode: the reference must be the trace the user sees first.
+        series.sort(key=lambda z: file_order.get(z['path'], 10 ** 6))
+
+        if mode == 'pc':
+            # Common axis = the PC clock. Zero comes from the EARLIEST run, so
+            # the numbers stay small while the labels show the real time of day.
+            starts = [s['pc'][0] for s in series if s['pc'] and s['pc'][0] is not None]
+            self._pc_zero = min(starts) if starts else 0.0
+            for s in series:
+                s['off'] = 0.0
+        else:
+            for s in series:
+                s['off'] = self._arch_t_offset(s['t'], s['temp'], mode, tref)
+
+        spans = []
+        for s in series:
+            if mode == 'pc' and s['pc'] and s['pc'][0] is not None:
+                spans.append(s['pc'][-1] - s['pc'][0])
+            else:
+                spans.append(s['t'][-1] - s['t'][0])
+        use_min = (max(spans) if spans else 0) > 180
+        tdiv = 60.0 if use_min else 1.0
+
+        # ── comparing runs against each other ───────────────────────────
+        delta_mode = bool(self.arch_delta.get() and len(series) > 1)
+        ref = series[0] if delta_mode else None
+        ref_x, ref_name = None, ""
+        if delta_mode:
+            ref_name = self._cycle_display_name(Path(ref['path']))
+            if mode == 'pc' and ref['pc'] and ref['pc'][0] is not None:
+                ref_x = [((v or 0) - self._pc_zero) / tdiv for v in ref['pc']]
+            else:
+                ref_x = [(x - ref['off']) / tdiv for x in ref['t']]
+            # In difference mode the setpoints only clutter the picture.
+            show = dict(show); show['sa'] = False; show['st'] = False
+
+        def _interp(xs, ys, x):
+            if not xs:
+                return 0.0
+            if x <= xs[0]:
+                return ys[0]
+            if x >= xs[-1]:
+                return ys[-1]
+            lo, hi = 0, len(xs) - 1
+            while lo < hi - 1:
+                mid = (lo + hi) // 2
+                if xs[mid] <= x:
+                    lo = mid
+                else:
+                    hi = mid
+            dx = xs[hi] - xs[lo]
+            if dx == 0:
+                return ys[lo]
+            return ys[lo] + (x - xs[lo]) / dx * (ys[hi] - ys[lo])
+
+        ax2 = None
+        for s in series:
+            ci = file_order.get(s['path'], 0) % len(ARCH_COLOR_KEYS)
+            col = cs[ARCH_COLOR_KEYS[ci]]
+            if mode == 'pc' and s['pc'] and s['pc'][0] is not None:
+                tx = [((v or 0) - self._pc_zero) / tdiv for v in s['pc']]
+            else:
+                tx = [(x - s['off']) / tdiv for x in s['t']]
+            name = self._cycle_display_name(Path(s['path']))
+            base = f"{name} · " if multi else ""
+
+            if show.get('st'):
+                self.ax_a.plot(tx, s['spt'], color=cs['orange'], lw=1.2, ls='--',
+                               alpha=0.55,
+                               label=(base + 'target') if not multi else None)
+            if show.get('sa') and s['sa'] and any(v is not None for v in s['sa']):
+                xs = [tx[i] for i in range(min(len(s['sa']), len(tx)))
+                      if s['sa'][i] is not None]
+                ys = [v for v in s['sa'][:len(tx)] if v is not None]
+                if ys:
+                    self.ax_a.plot(xs, ys, color=(cs['cyan'] if not multi else col),
+                                   lw=1.1, ls=':', alpha=0.8,
+                                   label=(base + 'setpoint') if not multi else None)
+            if show.get('temp'):
+                if delta_mode and ref is not None:
+                    if s is ref:
+                        self.ax_a.axhline(0, color=cs['dim2'], lw=1.0, ls='--',
+                                          alpha=0.7)
+                        continue
+                    dy = [s['temp'][i] - _interp(ref_x, ref['temp'], tx[i])
+                          for i in range(len(tx))]
+                    self.ax_a.plot(tx, dy, color=col, lw=1.8,
+                                   label=f"{name} − {ref_name}")
+                else:
+                    self.ax_a.plot(tx, s['temp'], color=col,
+                                   lw=(2 if not multi else 1.8),
+                                   label=(name if multi else 'temperature'))
+            if show.get('t2') and s['t2'] and any(v is not None for v in s['t2']):
+                xs = [tx[i] for i in range(min(len(s['t2']), len(tx)))
+                      if s['t2'][i] is not None]
+                ys = [v for v in s['t2'][:len(tx)] if v is not None]
+                if ys:
+                    self.ax_a.plot(xs, ys, color=cs['purple'], lw=1.5, alpha=0.85,
+                                   label=(base + 'probe 2'))
+            if show.get('pwm'):
+                if ax2 is None:
+                    ax2 = self.ax_a.twinx()
+                    self._ax_pwm = ax2
+                    ax2.tick_params(colors=cs['dim'], labelsize=8, length=0)
+                    for sp in ax2.spines.values():
+                        sp.set_visible(False)
+                    ax2.text(0.995, 0.955, 'power %', transform=ax2.transAxes,
+                             ha='right', va='top', color=cs['dim2'], fontsize=8)
+                ax2.plot(tx, s['pwm'], color=col, lw=0.9, ls='-.', alpha=0.5)
+
+        if mode == 'temp':
+            self.ax_a.axhline(tref, color=cs['dim2'], lw=0.8, ls='--', alpha=0.6)
+            self.ax_a.axvline(0, color=cs['dim2'], lw=0.8, ls='--', alpha=0.6)
+
+        if mode == 'pc':
+            import matplotlib.ticker as mt
+            z = getattr(self, '_pc_zero', 0.0)
+
+            def _fmt(v, _pos):
+                try:
+                    return datetime.fromtimestamp(z + v * tdiv).strftime("%H:%M:%S")
+                except Exception:
+                    return ""
+            self.ax_a.xaxis.set_major_formatter(mt.FuncFormatter(_fmt))
+
+        unit = 'min' if use_min else 's'
+        note = {'t0': '0 = start of the run', 'abs': "the file's own time",
+                'ramp': '0 = start of the ramp',
+                'temp': f'0 = crossing {tref:.1f} °C',
+                'pc': 'wall clock'}.get(mode, '')
+        style_axes(self.ax_a, cs,
+                   xunit=('h:min:s' if mode == 'pc' else unit),
+                   yunit=(f'ΔT vs {ref_name} [°C]' if delta_mode
+                          else 'temperature [°C]'))
+        if note:
+            self.ax_a.text(0.008, 0.885, note, transform=self.ax_a.transAxes,
+                           ha='left', va='top', color=cs['dim2'], fontsize=8)
+        style_legend(self.ax_a, cs, loc='best')
+
+        # Headline: statistics for one run, or a count when comparing.
+        if not multi:
+            d = self._load_cycle_data(selected[0])
+            if d:
+                t, temp, _s, _p = d
+                dur = t[-1] - t[0] if len(t) > 1 else 0
+                idx_max = temp.index(max(temp))
+                rise = t[idx_max] - t[0] if idx_max > 0 else 0
+                avg = (max(temp) - temp[0]) / (rise / 60.0) if rise > 5 else 0
+                self.arch_title.setText(
+                    f"{min(temp):.1f}–{max(temp):.1f} °C · {core.fmt_hms(dur)} "
+                    f"· avg rise {avg:.2f} °C/min")
+        else:
+            self.arch_title.setText(f"comparing {len(selected)} runs")
+
+        self.chart_a.nav.restore()
+        self.chart_a.draw()
+
+        if not multi:
+            cset = self._cycle_settings(selected[0])
+            if cset:
+                def fmt(v, suf=''):
+                    return f"{v:.1f}{suf}" if v is not None else "?"
+                self.arch_settings_lbl.setText(
+                    f"target {fmt(cset['target'], ' °C')}   ·   ramp "
+                    f"~{fmt(cset['ramp'], ' °C/min')}   ·   Kp {fmt(cset['kp'])}  "
+                    f"Ki {fmt(cset['ki'])}  Kd {fmt(cset['kd'])}")
+            else:
+                self.arch_settings_lbl.setText("")
+        else:
+            self.arch_settings_lbl.setText(
+                f"{len(selected)} runs selected — settings are shown for a "
+                "single selection")
+
+    # ── archive actions ─────────────────────────────────────────────────
+    def _selected_arch_path(self):
+        for p, v in self.arch_vars.items():
+            if v.get():
+                return Path(p)
+        return None
+
+    def show_arch_stats(self):
+        path = self._selected_arch_path()
+        if not path:
+            core.info(self, "Nothing selected", "Tick a run in the list first.")
+            return
+        data = self._load_cycle_data(path)
+        if not data:
+            core.error(self, "Unreadable", "Could not load that run.")
+            return
+        StatsDialog(self, self.th, self._cycle_display_name(path),
+                    self._compute_stats(data)).exec()
+
+    def export_arch_csv(self):
+        """One selected - an ordinary save-as. More than one - pick a folder
+        and copy them all under their original names."""
+        import shutil
+        sel = [Path(p) for p, v in self.arch_vars.items() if v.get()]
+        if not sel:
+            core.info(self, "Nothing selected", "Tick a run in the list first.")
+            return
+        try:
+            if len(sel) == 1:
+                dest = core.save_path(self, "Save measurement CSV", sel[0].name,
+                                      "CSV (*.csv)", self.log_dir)
+                if not dest:
+                    return
+                shutil.copy(sel[0], dest)
+                core.info(self, "Saved", dest)
+            else:
+                folder = core.choose_dir(self, f"Where to put {len(sel)} files?",
+                                         self.log_dir)
+                if not folder:
+                    return
+                done, failed = 0, []
+                for f in sel:
+                    try:
+                        shutil.copy(f, Path(folder) / f.name)
+                        done += 1
+                    except Exception as e:
+                        failed.append(f"{f.name}: {e}")
+                msg = f"{done} of {len(sel)} files copied to\n{folder}"
+                if failed:
+                    msg += "\n\nFailed:\n" + "\n".join(failed[:5])
+                core.info(self, "Exported", msg)
+        except Exception as e:
+            core.error(self, "Export error", str(e))
+
+    def save_arch_chart(self):
+        if not any(v.get() for v in self.arch_vars.values()):
+            core.info(self, "Nothing selected", "Tick at least one run first.")
+            return
+        dest = core.save_path(self, "Save chart", "comparison.png",
+                              "PNG image (*.png);;PDF (*.pdf);;SVG (*.svg)",
+                              self.log_dir)
+        if not dest:
+            return
+        try:
+            # ALWAYS exported on white - the chart is rebuilt once in the print
+            # palette, saved, then rebuilt in the screen palette, so what is on
+            # screen is untouched and what lands in the file is printable.
+            self.chart_a.export(dest, size=(9.5, 5.4))
+            core.info(self, "Saved", dest)
+        except Exception as e:
+            core.error(self, "Save error", str(e))
+
+    def export_arch_pdf(self):
+        path = self._selected_arch_path()
+        if not path:
+            core.info(self, "Nothing selected", "Tick a run in the list first.")
+            return
+        data = self._load_cycle_data(path)
+        if not data:
+            core.error(self, "Unreadable", "Could not load that run.")
+            return
+        dest = core.save_path(self, "Save PDF report", f"{path.stem}_report.pdf",
+                              "PDF report (*.pdf)", self.log_dir)
+        if not dest:
+            return
+        try:
+            self._build_pdf_report(path, data, dest)
+            core.info(self, "Report saved", dest)
+        except Exception as e:
+            core.error(self, "PDF error", str(e))
+
+    def _build_pdf_report(self, path, data, dest):
+        """An A4 report built with matplotlib alone - no extra dependency, and
+        it is on white by construction."""
+        from matplotlib.backends.backend_pdf import PdfPages
+        from matplotlib.figure import Figure
+
+        t, temp, spt, pwm = data
+        st = self._compute_stats(data)
+        t0 = t[0]
+        tx = [x - t0 for x in t]
+
+        with PdfPages(dest) as pdf:
+            fig = Figure(figsize=(8.27, 11.69))            # A4 portrait
+            fig.patch.set_facecolor('white')
+            fig.text(0.5, 0.96, f"{APP_NAME} — run report", ha='center',
+                     fontsize=16, fontweight='bold')
+            fig.text(0.5, 0.935,
+                     f"{self._cycle_display_name(path)}  ·  generated "
+                     f"{datetime.now():%Y-%m-%d %H:%M}",
+                     ha='center', fontsize=9, color='gray')
+
+            ax1 = fig.add_axes([0.1, 0.55, 0.82, 0.32])
+            ax1.plot(tx, spt, color='#D2691E', lw=1.2, ls='--', label='target',
+                     alpha=0.75)
+            ax1.plot(tx, temp, color='#1F6FB4', lw=1.8, label='temperature')
+            ax1.set_xlabel('time [s]', fontsize=9)
+            ax1.set_ylabel('temperature [°C]', fontsize=9)
+            ax1.legend(fontsize=9, loc='best')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_title('Temperature profile', fontsize=11, loc='left')
+
+            ax2 = fig.add_axes([0.1, 0.40, 0.82, 0.10])
+            ax2.fill_between(tx, pwm, color='#2E7D32', alpha=0.5)
+            ax2.set_xlabel('time [s]', fontsize=8)
+            ax2.set_ylabel('power [%]', fontsize=8)
+            ax2.grid(True, alpha=0.3)
+
+            settle = (f"{st['settle_time']:.0f} s"
+                      if st['settle_time'] is not None else "not reached")
+            lines = [("STATISTICS", ""),
+                     ("Temperature range", f"{st['tmin']:.1f} – {st['tmax']:.1f} °C"),
+                     ("Target", f"{st['target']:.1f} °C"),
+                     ("Duration", core.fmt_hms(st['duration'])),
+                     ("Average rise rate", f"{st['avg_rise']:.2f} °C/min"),
+                     ("Overshoot", f"{st['overshoot']:.2f} °C"),
+                     ("Settling time (±1 °C)", settle),
+                     ("Steady-state error", f"{st['steady_error']:.3f} °C"),
+                     ("Max deviation from ramp", f"{st['max_dev']:.2f} °C"),
+                     ("Noise σ", f"±{st['noise_std']:.3f} °C")]
+            y = 0.32
+            for label, val in lines:
+                if not val:
+                    fig.text(0.1, y, label, fontsize=11, fontweight='bold')
+                else:
+                    fig.text(0.12, y, label, fontsize=9, color='#333333')
+                    fig.text(0.55, y, val, fontsize=9, fontweight='bold')
+                y -= 0.025
+            pdf.savefig(fig)
+
+    # ── data folder ─────────────────────────────────────────────────────
+    def _set_data_dir(self, newdir):
+        newdir = Path(newdir)
+        if newdir == self.log_dir:
+            return
+        # Not while a run is being written: the temporary file is already open
+        # in the old folder and archiving would go nowhere.
+        if self.cyc_on:
+            core.warn(self, "Measurement in progress",
+                      "I will not change the folder while a run is being "
+                      "saved. Stop the measurement and try again.")
+            return
+        try:
+            newdir.mkdir(parents=True, exist_ok=True)
+            probe = newdir / ".lachi_write_test"
+            probe.write_text("ok", encoding='utf-8')
+            probe.unlink()
+        except Exception as e:
+            core.error(self, "Data folder", f"I cannot write to\n{newdir}\n\n{e}")
+            return
+        self.log_dir = newdir
+        self._save_setting('data_dir', str(newdir))
+        self.refresh_arch()
+        self._redraw_arch()
+
+    def choose_data_dir(self):
+        p = core.choose_dir(self, "Folder for measurement data", self.log_dir)
+        if p:
+            self._set_data_dir(p)
+
+    def create_data_dir(self):
+        parent = core.choose_dir(self, "Where to create the new folder?",
+                                 self.log_dir)
+        if not parent:
+            return
+        name = core.ask_text(self, "New folder", "Folder name:",
+                             datetime.now().strftime("Measurements_%Y-%m-%d"))
+        if not name:
+            return
+        safe = re.sub(r'[<>:"/\\|?*]', '_', name).strip().strip('.')
+        if not safe:
+            core.warn(self, "New folder", "That name is empty.")
+            return
+        self._set_data_dir(Path(parent) / safe)
+
+    def open_log_folder(self):
+        if not core.reveal(self.log_dir):
+            core.info(self, "Data folder", str(self.log_dir))
+
+    # ════════════════════════════════════════════════════════════════════
+    #  SHUTDOWN
+    # ════════════════════════════════════════════════════════════════════
+    def closeEvent(self, e):
+        # Always hand the system back its right to sleep - otherwise the lock
+        # would outlive the closed program until logout.
+        try:
+            self._wake_lock(False)
         except Exception:
             pass
-        self.refresh_active()
-
-    def _insert_entry(self, entry):
-        ts, level, text = entry
-        tstr = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-        self.text.insert('end', f"[{tstr}] ", 'ts')
-        self.text.insert('end', f"{level:<4} ", level)
-        self.text.insert('end', f"{text}\n", level)
-
-    def clear_log(self):
-        self.app.diag_log = []
-        self.reload_log()
-
-    def export_log(self):
         try:
-            fn = self.app.log_dir / f"diagnostyka_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            with open(fn, 'w', encoding='utf-8') as f:
-                for ts, level, text in self.app.diag_log:
-                    tstr = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-                    f.write(f"[{tstr}] {level:<4} {text}\n")
-            messagebox.showinfo("Saved", f"Log saved:\n{fn}")
-        except Exception as e:
-            messagebox.showerror("Save error", str(e))
-
-    def _on_close(self):
-        self.app.diag_win = None
-        self.win.destroy()
-
-
-# ════════════════════════════════════════════════════════
-#  PRESETS WINDOW (savable sets of settings)
-# ════════════════════════════════════════════════════════
-class PresetWindow:
-    def __init__(self, parent, app):
-        self.app = app
-        self.win = tk.Toplevel(parent)
-        self.win.title("Presets")
-        self.win.configure(bg=C['bg'])
-        size_win(self.win, 520, 560, 460, 420, parent=parent)
-        self.win.transient(parent)
-
-        tk.Frame(self.win, bg=C['green'], height=4).pack(fill='x')
-        inner = tk.Frame(self.win, bg=C['bg'])
-        inner.pack(fill='both', expand=True, padx=24, pady=20)
-
-        tk.Label(inner, text="PRESETS", bg=C['bg'], fg=C['text'],
-                 font=F(14, 1)).pack(anchor='w')
-        tk.Label(inner, text="Save & load complete settings (setpoint, ramps, PID, fan)",
-                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(2, 16))
-
-        # Save a new preset
-        save_box = tk.Frame(inner, bg=C['bg2'])
-        save_box.pack(fill='x', pady=(0, 16))
-        si = tk.Frame(save_box, bg=C['bg2'])
-        si.pack(fill='x', padx=12, pady=10)
-        tk.Label(si, text="Save current settings as:", bg=C['bg2'], fg=C['dim'],
-                 font=F(9)).pack(anchor='w', pady=(0, 4))
-        erow = tk.Frame(si, bg=C['bg2'])
-        erow.pack(fill='x')
-        self.name_entry = tk.Entry(erow, bg=C['bg'], fg=C['text'], font=F(11),
-                                   relief='flat', bd=0, insertbackground=C['green'],
-                                   highlightthickness=2, highlightbackground=C['green'])
-        self.name_entry.pack(side='left', fill='x', expand=True, ipady=5, padx=(0, 8))
-        self.name_entry.insert(0, "My preset")
-        self.name_entry.bind('<Return>', lambda e: self.save_preset())
-        mk_btn(erow, "SAVE", self.save_preset, C['green']).pack(side='right')
-
-        # List of saved presets
-        tk.Label(inner, text="SAVED PRESETS", bg=C['bg'], fg=C['dim'],
-                 font=F(10, 1)).pack(anchor='w', pady=(0, 6))
-        list_wrap = tk.Frame(inner, bg=C['bg2'])
-        list_wrap.pack(fill='both', expand=True)
-        psb = tk.Scrollbar(list_wrap)
-        psb.pack(side='right', fill='y')
-        self.canvas = tk.Canvas(list_wrap, bg=C['bg2'], highlightthickness=0,
-                               yscrollcommand=psb.set)
-        self.canvas.pack(side='left', fill='both', expand=True)
-        psb.config(command=self.canvas.yview)
-        self.items = tk.Frame(self.canvas, bg=C['bg2'])
-        self.canvas.create_window((0, 0), window=self.items, anchor='nw')
-        self.items.bind('<Configure>',
-            lambda e: self.canvas.config(scrollregion=self.canvas.bbox('all')))
-
-        self.refresh_list()
-
-    def refresh_list(self):
-        for w in self.items.winfo_children():
-            w.destroy()
-        presets = self.app._load_presets()
-        if not presets:
-            tk.Label(self.items, text="No presets yet.\nSave current settings above.",
-                     bg=C['bg2'], fg=C['dim2'], font=F(9), justify='left').pack(
-                     anchor='w', padx=12, pady=12)
-            return
-        for name, settings in presets.items():
-            row = tk.Frame(self.items, bg=C['bg2'])
-            row.pack(fill='x', pady=2, padx=4)
-            info = tk.Frame(row, bg=C['bg2'])
-            info.pack(side='left', fill='x', expand=True)
-            tk.Label(info, text=name, bg=C['bg2'], fg=C['text'],
-                     font=F(10, 1), anchor='w').pack(anchor='w')
-            # Short description of the settings
-            desc = f"SP {settings.get('sp','?')}°C · ↑{settings.get('ru','?')} ↓{settings.get('rd','?')}°C/min · fan {settings.get('fan','?')}%"
-            tk.Label(info, text=desc, bg=C['bg2'], fg=C['dim2'],
-                     font=F(8), anchor='w').pack(anchor='w')
-            # Buttons
-            mk_btn(row, "LOAD", lambda n=name: self.load_preset(n), C['green']).pack(
-                side='left', padx=(4, 2))
-            mk_btn_outline(row, "DEL", lambda n=name: self.del_preset(n), C['red']).pack(
-                side='left', padx=(2, 0))
-
-    def save_preset(self):
-        name = self.name_entry.get().strip()
-        if not name:
-            messagebox.showinfo("Name required", "Enter a preset name.")
-            return
-        presets = self.app._load_presets()
-        if name in presets:
-            if not messagebox.askyesno("Overwrite?", f"Preset '{name}' exists. Overwrite?"):
-                return
-        presets[name] = self.app._gather_settings()
-        if self.app._save_presets(presets):
-            self.refresh_list()
-            messagebox.showinfo("Saved", f"Preset '{name}' saved.")
-
-    def load_preset(self, name):
-        presets = self.app._load_presets()
-        if name in presets:
-            self.app.apply_preset(presets[name])
-            messagebox.showinfo("Loaded", f"Preset '{name}' applied.")
-            self.win.destroy()
-
-    def del_preset(self, name):
-        if messagebox.askyesno("Delete?", f"Delete preset '{name}'?"):
-            presets = self.app._load_presets()
-            presets.pop(name, None)
-            self.app._save_presets(presets)
-            self.refresh_list()
-
-
-# ════════════════════════════════════════════════════════
-#  CYCLE SAVE DIALOG
-# ════════════════════════════════════════════════════════
-class SaveCycleDialog:
-    def __init__(self, parent, app, tmp_path):
-        self.app = app
-        self.tmp_path = tmp_path
-        self.win = tk.Toplevel(parent)
-        self.win.title("Save cycle")
-        self.win.configure(bg=C['bg'])
-        size_win(self.win, 440, 230, 400, 200, parent=parent)
-        self.win.transient(parent)
-        self.win.grab_set()  # modal
-
-        tk.Frame(self.win, bg=C['green'], height=4).pack(fill='x')
-        inner = tk.Frame(self.win, bg=C['bg'])
-        inner.pack(fill='both', expand=True, padx=24, pady=20)
-
-        tk.Label(inner, text="SAVE CYCLE TO ARCHIVE", bg=C['bg'], fg=C['text'],
-                 font=F(13, 1)).pack(anchor='w')
-
-        # Info on the number of samples
-        rows = getattr(app, 'cyc_rows', 0)
-        tk.Label(inner, text=f"Recorded {rows} data samples",
-                 bg=C['bg'], fg=C['dim'], font=F(9)).pack(anchor='w', pady=(4, 16))
-
-        tk.Label(inner, text="Cycle name:", bg=C['bg'], fg=C['dim'],
-                 font=F(10)).pack(anchor='w')
-        self.entry = tk.Entry(inner, bg=C['bg2'], fg=C['text'],
-                              font=F(12), relief='flat', bd=0,
-                              insertbackground=C['green'],
-                              highlightthickness=2, highlightbackground=C['green'],
-                              highlightcolor=_lighten(C['green'], 0.2))
-        self.entry.pack(fill='x', ipady=6, pady=(4, 16))
-        # Default name
-        default = datetime.now().strftime("test_%H%M")
-        self.entry.insert(0, default)
-        self.entry.select_range(0, 'end')
-        self.entry.focus()
-        self.entry.bind('<Return>', lambda e: self.save())
-
-        # Buttons
-        bf = tk.Frame(inner, bg=C['bg'])
-        bf.pack(fill='x')
-        mk_btn(bf, "SAVE", self.save, C['green']).pack(side='left', fill='x',
-                                                          expand=True, padx=(0, 4))
-        mk_btn_outline(bf, "DISCARD", self.discard, C['red']).pack(side='left',
-                                                          fill='x', expand=True, padx=(4, 0))
-
-        self.win.protocol("WM_DELETE_WINDOW", self.save)  # closing = save
-
-    def save(self):
-        name = self.entry.get().strip()
-        if not name:
-            name = datetime.now().strftime("cykl_%H%M")
-        self.app.save_cycle_as(self.tmp_path, name)
-        self.win.destroy()
-
-    def discard(self):
-        if messagebox.askyesno("Discard?",
-                "Discard this cycle?\nData will be permanently deleted."):
-            self.app.discard_cycle(self.tmp_path)
-            self.win.destroy()
-
-
-# ════════════════════════════════════════════════════════
-#  MULTI-STEP PROFILES WINDOW
-# ════════════════════════════════════════════════════════
-class ProfileWindow:
-    def __init__(self, parent, app):
-        self.app = app
-        self.win = tk.Toplevel(parent)
-        self.win.title("Multi-step profiles")
-        self.win.configure(bg=C['bg'])
-        size_win(self.win, 520, 480, 440, 360, parent=parent)
-        self.win.transient(parent)
-
-        tk.Frame(self.win, bg=C['purple'], height=4).pack(fill='x')
-        hd = tk.Frame(self.win, bg=C['bg'])
-        hd.pack(fill='x', padx=16, pady=12)
-        tk.Label(hd, text="MULTI-STEP PROFILES", bg=C['bg'], fg=C['text'],
-                 font=F(12, 1)).pack(side='left')
-
-        # Step table
-        self.rows_frame = tk.Frame(self.win, bg=C['bg'])
-        self.rows_frame.pack(fill='both', expand=True, padx=16)
-
-        # Headers
-        h = tk.Frame(self.rows_frame, bg=C['bg'])
-        h.pack(fill='x', pady=(0, 4))
-        for txt, w in [("#", 3), ("TEMP °C", 10), ("RATE", 8), ("TIME min", 10), ("", 6)]:
-            tk.Label(h, text=txt, bg=C['bg'], fg=C['dim2'],
-                     font=F(9), width=w, anchor='w').pack(side='left')
-
-        self.steps_container = tk.Frame(self.rows_frame, bg=C['bg'])
-        self.steps_container.pack(fill='both', expand=True)
-
-        # Add form
-        addf = tk.Frame(self.win, bg=C['panel'])
-        addf.pack(fill='x', padx=16, pady=12)
-        tk.Frame(addf, bg=C['green'], height=3).pack(fill='x')
-        ai = tk.Frame(addf, bg=C['panel'])
-        ai.pack(fill='x', padx=12, pady=10)
-        tk.Label(ai, text="ADD STEP:", bg=C['panel'], fg=C['dim'],
-                 font=F(9)).pack(side='left', padx=(0, 8))
-        self.e_temp = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['orange'],
-                               font=F(10), justify='center', relief='flat',
-                               highlightthickness=1, highlightbackground=C['border'])
-        self.e_temp.pack(side='left', padx=2); self.e_temp.insert(0, "40")
-        self.e_ramp = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['yellow'],
-                               font=F(10), justify='center', relief='flat',
-                               highlightthickness=1, highlightbackground=C['border'])
-        self.e_ramp.pack(side='left', padx=2); self.e_ramp.insert(0, "2.0")
-        self.e_time = tk.Entry(ai, width=6, bg=C['bg2'], fg=C['dim'],
-                               font=F(10), justify='center', relief='flat',
-                               highlightthickness=1, highlightbackground=C['border'])
-        self.e_time.pack(side='left', padx=2); self.e_time.insert(0, "10")
-        mk_btn(ai, "+ ADD", self.add_step, C['green']).pack(side='left', padx=(8, 0))
-
-        # Run
-        rf = tk.Frame(self.win, bg=C['bg'])
-        rf.pack(fill='x', padx=16, pady=(0, 12))
-        mk_btn(rf, "▶ RUN PROFILE", self.run_profile, C['purple'], fg='#fff').pack(
-            fill='x')
-
-        self.refresh_steps()
-
-    def add_step(self):
-        try:
-            temp = float(self.e_temp.get().replace(',', '.'))
-            ramp = float(self.e_ramp.get().replace(',', '.'))
-            tmin = float(self.e_time.get().replace(',', '.'))
-            self.app.profile_steps.append({'temp': temp, 'ramp': ramp, 'time': tmin})
-            self.refresh_steps()
-        except ValueError:
-            messagebox.showerror("Error", "Enter valid numbers.")
-
-    def del_step(self, idx):
-        if 0 <= idx < len(self.app.profile_steps):
-            self.app.profile_steps.pop(idx)
-            self.refresh_steps()
-
-    def refresh_steps(self):
-        for w in self.steps_container.winfo_children():
-            w.destroy()
-        for i, s in enumerate(self.app.profile_steps):
-            r = tk.Frame(self.steps_container, bg=C['bg2'])
-            r.pack(fill='x', pady=2)
-            tk.Frame(r, bg=C['orange'], width=4).pack(side='left', fill='y')
-            tk.Label(r, text=str(i+1), bg=C['bg2'], fg=C['text'],
-                     font=F(10, 1), width=3, anchor='w').pack(side='left', padx=(6,0))
-            tk.Label(r, text=f"{s['temp']:.0f}", bg=C['bg2'], fg=C['orange'],
-                     font=F(10), width=10, anchor='w').pack(side='left')
-            tk.Label(r, text=f"{s['ramp']:.1f}", bg=C['bg2'], fg=C['yellow'],
-                     font=F(10), width=8, anchor='w').pack(side='left')
-            tk.Label(r, text=f"{s['time']:.0f}", bg=C['bg2'], fg=C['dim'],
-                     font=F(10), width=10, anchor='w').pack(side='left')
-            tk.Button(r, text="DEL", command=lambda idx=i: self.del_step(idx),
-                      bg=C['bg2'], fg=C['red'], font=F(8, 1),
-                      relief='flat', cursor='hand2', bd=0,
-                      activebackground=C['panel3']).pack(side='left', padx=4)
-
-    def run_profile(self):
-        """Run the profile - send the steps sequentially with a delay"""
-        if not self.app.connected:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
-            return
-        if not self.app.profile_steps:
-            messagebox.showinfo("Empty profile", "Add at least one step.")
-            return
-        if not messagebox.askyesno("Run profile",
-                f"Run profile with {len(self.app.profile_steps)} steps?\n"
-                "Steps will run sequentially."):
-            return
-        threading.Thread(target=self._run_profile_thread, daemon=True).start()
-        self.win.destroy()
-
-    def _run_profile_thread(self):
-        """Thread that executes the profile"""
-        for i, s in enumerate(self.app.profile_steps):
-            self.app.send(f"SP:{s['temp']:.1f}")
-            self.app.send(f"RU:{s['ramp']:.1f}")
-            self.app.send(f"RD:{s['ramp']:.1f}")
-            if i == 0:
-                time.sleep(0.1)
-                self.app.send("START")
-            # Wait out the step time (time in minutes)
-            time.sleep(max(1, s['time'] * 60))
-        # After the profile - stop
-        self.app.send("STOP")
-        print("Profile finished")
-
-
-# ════════════════════════════════════════════════════════
-#  MAIN
-# ════════════════════════════════════════════════════════
-def _enable_dpi_awareness():
-    """Enable DPI awareness on Windows - eliminates blurry text at 125%/150% scaling."""
-    if sys.platform != 'win32':
-        return 1.0
-    try:
-        import ctypes
-        # Per-Monitor DPI Aware v2 (Windows 10 1703+) - best sharpness
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            self.disconnect()
         except Exception:
-            # Fallback for older Windows
-            ctypes.windll.user32.SetProcessDPIAware()
-        # Read the actual scaling
-        try:
-            hdc = ctypes.windll.user32.GetDC(0)
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
-            ctypes.windll.user32.ReleaseDC(0, hdc)
-            return dpi / 96.0
-        except Exception:
-            return 1.0
-    except Exception:
-        return 1.0
+            pass
+        e.accept()
 
 
 def main():
-    # IMPORTANT: DPI awareness BEFORE creating the window - gives sharp text
-    scale = _enable_dpi_awareness()
+    # High-DPI: Qt6 scales by itself, but rounding the device pixel ratio makes
+    # a 150% display land on a half-integer factor and everything goes soft.
+    # PassThrough keeps the fractional factor and the text stays sharp.
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
-    # Set the global font multiplier from DPI (sharp AND readable)
-    global FS
-    if scale and scale > 1.05:
-        FS = scale  # e.g. 1.25 for 125%, 1.5 for 150%
-    else:
-        FS = 1.0
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
 
-    root = tk.Tk()
+    # Inter if it is shipped beside the app; otherwise the stack in theme.py
+    # falls through to the platform's own UI font.
+    from PyQt6.QtGui import QFontDatabase
+    assets = Path(__file__).with_name('lachi') / 'assets'
+    if assets.is_dir():
+        for f in assets.glob('*.[ot]tf'):
+            QFontDatabase.addApplicationFont(str(f))
 
-    # REMOVED: root.tk.call('tk','scaling', scale)
-    # That was a SECOND, independent scaling stacked on top of FS - and the two fought.
-    # Tk converts a font size (given positive = in POINTS) into pixels
-    # through its own 'tk scaling' factor. The code set it to dpi/96
-    # (e.g. 1.5), while the Windows default is 96/72 = 1.333 - and it
-    # SIMULTANEOUSLY multiplied every font size by FS=1.5. The result was
-    # ~1.69x instead of 1.5x, and INCONSISTENTLY across widgets (ttk versus
-    # plain tk), because not every widget goes through the same path.
-    # Now ONE multiplier remains: FS - fonts via fsz(), pixels via
-    # SC()/size_win(). The ttk.Notebook tab font is set explicitly in
-    # _build_styles() anyway, so nothing is lost here.
+    win = Lachi()
+    app.setStyleSheet(win.th.qss())
+    win.show()
+    sys.exit(app.exec())
 
-    app = PeltierControl(root)
 
-    def on_close():
-        # Always hand the system back its right to sleep - otherwise the lock
-        # would outlive the closed program until logout (see _wake_lock).
-        try: app._wake_lock(False)
-        except Exception: pass
-        app.disconnect()
-        root.destroy()
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.mainloop()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
