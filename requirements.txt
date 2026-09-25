@@ -1,6 +1,8 @@
-# Zaleznosci PeltierControl
-# tkinter jest wbudowany w Pythona (Windows/macOS) - nie wymaga instalacji
-# Na Linux: sudo apt install python3-tk
-
+# LACHI — Peltier bench
+#
+# The old Tkinter build (peltier_control.py) needs only the first two lines;
+# Tkinter ships with Python. PyQt6 is what the new interface (lachi_app.py)
+# is built on.
 pyserial>=3.5
-matplotlib>=3.5
+matplotlib>=3.7
+PyQt6>=6.5
